@@ -1,0 +1,119 @@
+import * as v from 'valibot'
+
+import { IS_BROWSER } from '@open-pencil/core/constants'
+import {
+  DESIGN_JSX_ELEMENTS,
+  DESIGN_JSX_HELPERS,
+  transformDesignJSXProgram,
+  type DesignJSXProgram
+} from '@open-pencil/design-jsx'
+import { errorMessage } from '@open-pencil/std/errors'
+
+import { sandboxDocument } from '@/app/code/sandbox/document'
+import frameScript from '@/app/code/sandbox/frame.ts?script-file'
+import {
+  SANDBOX_READY,
+  SANDBOX_RUN,
+  sandboxFrameMessageSchema,
+  type SandboxRunRequest
+} from '@/app/code/sandbox/schema'
+import {
+  DESIGN_JSX_DEFAULT_READY_TIMEOUT_MS,
+  DESIGN_JSX_DEFAULT_TIMEOUT_MS,
+  DESIGN_JSX_MAX_SOURCE_BYTES,
+  resolveDesignJSXValidationLimits,
+  type DesignJSXSandboxLimits,
+  type DesignJSXSandboxResult
+} from '@/app/code/sandbox/types'
+import { validateDesignJSXOutput } from '@/app/code/sandbox/validate'
+
+function sourceByteLength(source: string): number {
+  return new TextEncoder().encode(source).byteLength
+}
+
+export async function evaluateDesignJSX(
+  source: string,
+  limits: DesignJSXSandboxLimits = {}
+): Promise<DesignJSXSandboxResult> {
+  if (!IS_BROWSER) {
+    return { ok: false, error: 'Design JSX execution requires a browser.' }
+  }
+  const sourceBytes = limits.sourceBytes ?? DESIGN_JSX_MAX_SOURCE_BYTES
+  if (sourceByteLength(source) > sourceBytes) {
+    return { ok: false, error: 'Design JSX source is too large.' }
+  }
+
+  let program: DesignJSXProgram
+  try {
+    program = transformDesignJSXProgram(source)
+  } catch (error) {
+    return { ok: false, error: errorMessage(error) }
+  }
+
+  const validationLimits = resolveDesignJSXValidationLimits(limits)
+  const iframe = document.createElement('iframe')
+  iframe.hidden = true
+  iframe.setAttribute('sandbox', 'allow-scripts')
+  iframe.srcdoc = sandboxDocument(frameScript, document.baseURI)
+  document.body.append(iframe)
+
+  return new Promise((resolve) => {
+    const id = crypto.randomUUID()
+    const timeoutMs = limits.timeoutMs ?? DESIGN_JSX_DEFAULT_TIMEOUT_MS
+    const readyTimeoutMs = limits.readyTimeoutMs ?? DESIGN_JSX_DEFAULT_READY_TIMEOUT_MS
+    let settled = false
+    let timer: ReturnType<typeof setTimeout>
+
+    const finish = (result: DesignJSXSandboxResult) => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      window.removeEventListener('message', onMessage)
+      iframe.remove()
+      // eslint-disable-next-line promise/no-multiple-resolved -- settled guard makes completion single-shot
+      resolve(result)
+    }
+    const onMessage = (event: MessageEvent<unknown>) => {
+      if (event.source !== iframe.contentWindow || event.origin !== 'null') return
+      const parsed = v.safeParse(sandboxFrameMessageSchema, event.data)
+      if (!parsed.success) return
+      const message = parsed.output
+      if (message.type === SANDBOX_READY) {
+        clearTimeout(timer)
+        // eslint-disable-next-line promise/no-multiple-resolved -- finish has a settled guard
+        timer = setTimeout(
+          () => finish({ ok: false, error: 'Design JSX execution timed out.' }),
+          timeoutMs
+        )
+        const request: SandboxRunRequest = {
+          id,
+          code: program.code,
+          elements: Object.fromEntries(
+            DESIGN_JSX_ELEMENTS.map(({ name, runtimeType }) => [name, runtimeType])
+          ),
+          helpers: DESIGN_JSX_HELPERS.map(({ name }) => name),
+          limits: validationLimits
+        }
+        iframe.contentWindow?.postMessage({ type: SANDBOX_RUN, ...request }, '*')
+        return
+      }
+      if (message.id !== id) return
+      if (!message.ok) {
+        finish({ ok: false, error: message.error })
+        return
+      }
+      try {
+        const { collections } = message
+        const roots = validateDesignJSXOutput(message.value, validationLimits, collections)
+        finish({ ok: true, roots, collections, lineOffset: program.lineOffset })
+      } catch (error) {
+        finish({ ok: false, error: errorMessage(error) })
+      }
+    }
+    timer = setTimeout(
+      () => finish({ ok: false, error: 'Design JSX sandbox did not become ready.' }),
+      readyTimeoutMs
+    )
+    window.addEventListener('message', onMessage)
+  })
+}

@@ -1,0 +1,33 @@
+import type { Canvas } from '@open-pencil/canvaskit'
+import type { SceneGraph } from '@open-pencil/scene-graph'
+
+import { drawNodeHighlightRect } from '#core/canvas/overlays/highlight'
+import type { SkiaRenderer } from '#core/canvas/renderer/skia'
+import {
+  AI_ACTIVE_COLOR,
+  AI_DONE_COLOR,
+  AI_PULSE_PERIOD_MS,
+  AI_DONE_DURATION_MS
+} from '#core/constants'
+
+export function drawAIOverlays(r: SkiaRenderer, canvas: Canvas, graph: SceneGraph): void {
+  const now = performance.now()
+
+  for (const nodeId of r.feedback.aiActive) {
+    const phase = (now % AI_PULSE_PERIOD_MS) / AI_PULSE_PERIOD_MS
+    const opacity = 0.3 + 0.5 * (0.5 + 0.5 * Math.sin(phase * Math.PI * 2))
+    drawNodeHighlightRect(r, canvas, graph, nodeId, AI_ACTIVE_COLOR, opacity)
+  }
+
+  for (let i = r.feedback.aiDone.length - 1; i >= 0; i--) {
+    const flash = r.feedback.aiDone[i]
+    const elapsed = now - flash.startTime
+    if (elapsed > AI_DONE_DURATION_MS) {
+      r.feedback.aiDone.splice(i, 1)
+      continue
+    }
+    const t = elapsed / AI_DONE_DURATION_MS
+    const opacity = t < 0.3 ? t / 0.3 : 1 - (t - 0.3) / 0.7
+    drawNodeHighlightRect(r, canvas, graph, flash.nodeId, AI_DONE_COLOR, opacity)
+  }
+}

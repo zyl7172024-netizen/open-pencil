@@ -1,0 +1,106 @@
+export * from './vectorize'
+export * from './handle-selection'
+export { freehandNetwork, simplifyFreehand } from './freehand'
+
+export {
+  breakAtVertex,
+  computeAccurateBounds,
+  deleteVectorParts,
+  deleteVertex,
+  findAllHandles,
+  findOppositeHandle,
+  mirrorHandle,
+  nearestPointOnNetwork,
+  removeVertex,
+  splitSegmentAt
+} from './bezier'
+
+import type { CanvasKit, Path } from '@open-pencil/canvaskit'
+import type { VectorNetwork, VectorRegion, WindingRule } from '@open-pencil/scene-graph'
+import { GeometryCommand, readGeometryBlob } from '@open-pencil/scene-graph/geometry'
+import { addOpenSegmentsToPath, addRegionToPath } from '@open-pencil/scene-graph/paths'
+export { vectorNetworkToCenterlinePath, fitCircleArc, isClosedThinCrescent } from './centerline'
+export { regenerateFillGeometry } from './fill-geometry'
+export { regionAtPoint, regionHatchPeriod, regionVertexIndices } from './regions/hit'
+export { vectorChangesFromPagePath, type VectorPathChanges } from './placement'
+
+/**
+ * Fill types go on the detached `Path`: CanvasKit 0.41's `PathBuilder.setFillType` returns an
+ * undeleted copy of the builder, which leaks about 860 bytes per call.
+ */
+function fillType(ck: CanvasKit, windingRule: WindingRule) {
+  return windingRule === 'EVENODD' ? ck.FillType.EvenOdd : ck.FillType.Winding
+}
+
+/** One region of `network` as a path with the region's fill rule. */
+export function regionPath(
+  ck: CanvasKit,
+  network: Pick<VectorNetwork, 'vertices' | 'segments'>,
+  region: Pick<VectorRegion, 'loops' | 'windingRule'>
+): Path {
+  const builder = new ck.PathBuilder()
+  addRegionToPath(builder, region, network.segments, network.vertices)
+  const path = builder.detachAndDelete()
+  path.setFillType(fillType(ck, region.windingRule))
+  return path
+}
+
+/** A vector network's paths; `cornerRadius` rounds open corners that set no radius of their own. */
+export function vectorNetworkToPath(
+  ck: CanvasKit,
+  network: VectorNetwork,
+  cornerRadius = 0
+): Path[] {
+  const { vertices, segments, regions } = network
+
+  if (regions.length > 0) {
+    const paths: Path[] = []
+    const regionSegmentIndexes = new Set<number>()
+    for (const region of regions) {
+      for (const loop of region.loops) for (const index of loop) regionSegmentIndexes.add(index)
+      paths.push(regionPath(ck, network, region))
+    }
+
+    const openSegments = segments.filter((_, index) => !regionSegmentIndexes.has(index))
+    if (openSegments.length > 0) {
+      const openPath = new ck.PathBuilder()
+      addOpenSegmentsToPath(openPath, openSegments, vertices, cornerRadius)
+      paths.push(openPath.detachAndDelete())
+    }
+    return paths
+  }
+
+  const path = new ck.PathBuilder()
+  addOpenSegmentsToPath(path, segments, vertices, cornerRadius)
+  return [path.detachAndDelete()]
+}
+
+export function geometryBlobToPath(
+  ck: CanvasKit,
+  blob: Uint8Array,
+  windingRule: WindingRule
+): Path {
+  const path = new ck.PathBuilder()
+  if (!(blob.buffer instanceof ArrayBuffer)) return path.detachAndDelete()
+  readGeometryBlob(blob, (command, c) => {
+    if (command === GeometryCommand.CLOSE) path.close()
+    else if (command === GeometryCommand.MOVE) path.moveTo(c[0], c[1])
+    else if (command === GeometryCommand.LINE) path.lineTo(c[0], c[1])
+    else if (command === GeometryCommand.QUAD) path.quadTo(c[0], c[1], c[2], c[3])
+    else path.cubicTo(c[0], c[1], c[2], c[3], c[4], c[5])
+  })
+  const result = path.detachAndDelete()
+  result.setFillType(fillType(ck, windingRule))
+  return result
+}
+export {
+  cubicExtrema,
+  isLineSegment,
+  nearestPointOnCubic,
+  segmentToAbsolute,
+  splitCubicAt,
+  type CubicPoints,
+  type NearestResult,
+  type NetworkNearestResult
+} from './curve-math'
+export { extractSubNetwork, findConnectedComponents } from './connectivity'

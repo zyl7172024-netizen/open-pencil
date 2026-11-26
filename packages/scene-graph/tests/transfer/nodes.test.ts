@@ -1,0 +1,68 @@
+import { expect, test } from 'bun:test'
+
+import { SceneGraph } from '@open-pencil/scene-graph'
+import { variableModeOverrideField } from '@open-pencil/scene-graph/instances/overrides'
+import { prepareNodeTransfer, type NodeTransferReferences } from '@open-pencil/scene-graph/transfer'
+
+const references = (): NodeTransferReferences => ({
+  nodes: new Map([['component', 'new-component']]),
+  variables: new Map([['token', 'new-token']]),
+  collections: new Map([['set', 'new-set']]),
+  modes: new Map([['mode', 'new-mode']]),
+  styles: new Map([['style', 'new-style']]),
+  properties: new Map([
+    ['swap', 'new-swap'],
+    ['text', 'new-text']
+  ]),
+  propertyTypes: new Map([
+    ['swap', 'INSTANCE_SWAP'],
+    ['text', 'TEXT']
+  ])
+})
+
+test('node preparation remaps typed runtime references but preserves source identities and text', () => {
+  const graph = new SceneGraph()
+  const node = graph.createNode('INSTANCE', graph.getPages()[0].id, {
+    componentId: 'component',
+    text: 'component',
+    fillStyleId: 'style',
+    boundVariables: { paddingLeft: 'token' },
+    variableModes: { set: 'mode' },
+    componentPropertyAssignments: { swap: 'component', text: 'component' },
+    componentPropertyDefinitions: [
+      { id: 'swap', name: 'Swap', type: 'INSTANCE_SWAP', defaultValue: 'component' }
+    ]
+  })
+  node.source.id = 'component'
+  const before = structuredClone(node)
+  const result = prepareNodeTransfer(node, references())
+  expect(result.componentId).toBe('new-component')
+  expect(result.text).toBe('component')
+  expect(result.source?.id).toBe('component')
+  expect(result.fillStyleId).toBe('new-style')
+  expect(result.boundVariables).toEqual({ paddingLeft: 'new-token' })
+  expect(result.variableModes).toEqual({ 'new-set': 'new-mode' })
+  expect(result.componentPropertyAssignments).toEqual({
+    'new-swap': 'new-component',
+    'new-text': 'component'
+  })
+  expect(result.componentPropertyDefinitions?.[0].defaultValue).toBe('new-component')
+  expect(node).toEqual(before)
+  expect(result.source).not.toBe(node.source)
+})
+
+test('node preparation fails on missing runtime references before destination mutation', () => {
+  const graph = new SceneGraph()
+  const node = graph.createNode('INSTANCE', graph.getPages()[0].id, { componentId: 'missing' })
+  expect(() => prepareNodeTransfer(node, references())).toThrow('Missing node transfer mapping')
+})
+
+test('node preparation remaps the collection a mode override is keyed by', () => {
+  const graph = new SceneGraph()
+  const node = graph.createNode('INSTANCE', graph.getPages()[0].id, { componentId: 'component' })
+  node.instanceOverrides.self.set(variableModeOverrideField('set'), true)
+  const result = prepareNodeTransfer(node, references())
+  expect(result.instanceOverrides?.self).toEqual(
+    new Map<string, unknown>([[variableModeOverrideField('new-set'), true]])
+  )
+})

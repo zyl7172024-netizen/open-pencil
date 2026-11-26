@@ -1,0 +1,525 @@
+import { describe, expect, test } from 'bun:test'
+
+import {
+  cloudDeploymentConfigSchema,
+  cloudDiscoveryFromConfig,
+  parseCloudDeploymentConfig,
+  parseCloudDeploymentTOML
+} from '#cloud/server'
+import { parse as parseTOML } from 'smol-toml'
+import * as v from 'valibot'
+
+const minimalSource = `
+schema_version = 2
+
+[deployment]
+mode = "self-hosted"
+public_url = "https://cloud.example.com"
+trusted_origins = ["https://app.example.com"]
+
+[authentication.enrollment]
+mode = "approval"
+notification_emails = ["admin@example.com"]
+
+[authentication.mfa]
+required_for_admins = true
+totp = true
+recovery_codes = true
+trusted_device_lifetime_days = 7
+
+[authentication.passkeys]
+enabled = true
+rp_name = "Example Cloud"
+
+[authentication.email_password]
+enabled = true
+sign_up = false
+minimum_password_length = 16
+maximum_password_length = 120
+verification_link_lifetime_minutes = 30
+password_reset_link_lifetime_minutes = 45
+compromised_password_check = true
+
+[authentication.captcha]
+provider = "cloudflare-turnstile"
+site_key = "public-turnstile-site-key"
+allowed_hostnames = ["cloud.example.com"]
+
+[authentication.providers.google]
+
+[email]
+transport = "smtp"
+from = "cloud@example.com"
+
+[email.smtp]
+host = "smtp.example.com"
+port = 465
+secure = true
+
+[object_storage]
+endpoint = "https://objects.example.com"
+region = "us-east-1"
+bucket = "openpencil"
+`
+
+const environment = {
+  DATABASE_URL: 'postgresql://user:password@database/openpencil',
+  BETTER_AUTH_SECRET: 'auth-secret-at-least-32-characters-long',
+  TURNSTILE_SECRET_KEY: 'turnstile-secret',
+  GOOGLE_CLIENT_ID: 'google-public-client-id',
+  GOOGLE_CLIENT_SECRET: 'google-secret',
+  OPENPENCIL_CLOUD_SMTP_USER: 'smtp-user',
+  OPENPENCIL_CLOUD_SMTP_PASSWORD: 'smtp-password',
+  S3_ACCESS_KEY_ID: 'access-key',
+  S3_SECRET_ACCESS_KEY: 'secret-key'
+}
+
+const completeSource = `${minimalSource.replace(
+  'trusted_origins = ["https://app.example.com"]',
+  'trusted_origins = ["https://app.example.com"]\nindexing = "allow"\nlocal_editor = false'
+)}
+maximum_upload_bytes = 104857600
+
+[collaboration]
+maximum_message_bytes = 524288
+maximum_connections_per_room = 250
+
+[documents]
+retention_days = 14
+purge_grace_days = 0
+
+[authentication.trusted_proxies]
+headers = ["cf-connecting-ip"]
+addresses = ["192.0.2.10"]
+
+[object_storage.credentials.session_token]
+from_env = "CUSTOM_SESSION_TOKEN"
+
+[workers.email]
+batch_size = 20
+interval_ms = 15000
+lease_ms = 120000
+maximum_attempts = 3
+
+[workers.cleanup]
+enabled = false
+batch_size = 40
+interval_ms = 45000
+lease_ms = 180000
+`
+
+describe('Cloud TOML deployment configuration', () => {
+  test('lets other sites embed documents only where the deployment enables it', () => {
+    const embedding = (table: string) =>
+      parseCloudDeploymentTOML(
+        minimalSource.replace(
+          'trusted_origins = ["https://app.example.com"]',
+          `trusted_origins = ["https://app.example.com"]\n${table}`
+        ),
+        environment
+      )
+    expect(embedding('embedding = { enabled = true }')).toMatchObject({
+      embeddingEnabled: true,
+      embeddingOrigins: []
+    })
+    expect(
+      embedding('embedding = { enabled = true, allowed_origins = ["https://wiki.example"] }')
+    ).toMatchObject({ embeddingEnabled: true, embeddingOrigins: ['https://wiki.example'] })
+    expect(() => embedding('embedding = { enabled = true, origins = [] }')).toThrow()
+  })
+
+  test('reads GitHub’s client secret from GITHUB_CLIENT_SECRET', () => {
+    const source = minimalSource.replace(
+      '[authentication.providers.google]',
+      '[authentication.providers.google]\n\n[authentication.providers.github]\nclient_id = "Iv-client"'
+    )
+    expect(
+      parseCloudDeploymentTOML(source, {
+        ...environment,
+        GITHUB_CLIENT_SECRET: 'github-secret'
+      })
+    ).toMatchObject({ githubClientId: 'Iv-client', githubClientSecret: 'github-secret' })
+    expect(() => parseCloudDeploymentTOML(source, environment)).toThrow()
+  })
+
+  test('uses conventional secret references without TOML boilerplate', () => {
+    expect(parseCloudDeploymentTOML(minimalSource, environment)).toMatchObject({
+      deployment: 'self-hosted',
+      databaseURL: environment.DATABASE_URL,
+      authSecret: environment.BETTER_AUTH_SECRET,
+      enrollmentMode: 'approval',
+      enrollmentAdminNotificationEmails: ['admin@example.com'],
+      localEditor: true,
+      embeddingEnabled: false,
+      embeddingOrigins: [],
+      emailPasswordEnabled: true,
+      emailPasswordSignUpEnabled: false,
+      emailPasswordMinimumLength: 16,
+      emailPasswordMaximumLength: 120,
+      emailVerificationExpiresIn: 1800,
+      passwordResetExpiresIn: 2700,
+      compromisedPasswordCheck: true,
+      deploymentAdminMFARequired: true,
+      totpEnabled: true,
+      passkeysEnabled: true,
+      recoveryCodesEnabled: true,
+      mfaTrustedDeviceDays: 7,
+      passkeyRPName: 'Example Cloud',
+      captchaProvider: 'cloudflare-turnstile',
+      captchaSiteKey: 'public-turnstile-site-key',
+      captchaSecretKey: 'turnstile-secret',
+      captchaAllowedHostnames: ['cloud.example.com'],
+      googleClientId: 'google-public-client-id',
+      googleClientSecret: environment.GOOGLE_CLIENT_SECRET,
+      s3AccessKeyId: environment.S3_ACCESS_KEY_ID,
+      s3SecretAccessKey: environment.S3_SECRET_ACCESS_KEY
+    })
+  })
+
+  test('normalizes complete operational and storage policy', () => {
+    const config = parseCloudDeploymentTOML(completeSource, {
+      ...environment,
+      CUSTOM_SESSION_TOKEN: 'session-token'
+    })
+    expect(config).toMatchObject({
+      indexingPolicy: 'allow',
+      localEditor: false,
+      authTrustedIPHeaders: ['cf-connecting-ip'],
+      authTrustedProxies: ['192.0.2.10'],
+      s3SessionToken: 'session-token',
+      emailBatchSize: 20,
+      emailIntervalMs: 15_000,
+      emailLeaseDurationMs: 120_000,
+      emailMaximumAttempts: 3,
+      cleanupEnabled: false,
+      cleanupBatchSize: 40,
+      cleanupIntervalMs: 45_000,
+      cleanupLeaseDurationMs: 180_000,
+      documentRetentionMs: 14 * 86_400_000,
+      documentPurgeGraceMs: 0,
+      technicalLimits: {
+        maximumUploadBytes: 104857600,
+        maximumCollaborationMessageBytes: 524288,
+        maximumConnectionsPerRoom: 250
+      }
+    })
+  })
+
+  test('lists the server for editors from a minimum version, and only when configured', () => {
+    const unlisted = cloudDiscoveryFromConfig(parseCloudDeploymentTOML(minimalSource, environment))
+    expect(unlisted.listing).toBeUndefined()
+
+    const listedSource = minimalSource.replace(
+      'trusted_origins = ["https://app.example.com"]',
+      'trusted_origins = ["https://app.example.com"]\nlisting = { minimum_editor_version = "0.14.0" }'
+    )
+    const listed = cloudDiscoveryFromConfig(parseCloudDeploymentTOML(listedSource, environment))
+    expect(listed.listing).toEqual({ minimumEditorVersion: '0.14.0' })
+
+    expect(() =>
+      parseCloudDeploymentTOML(listedSource.replace('"0.14.0"', '"soon"'), environment)
+    ).toThrow()
+  })
+
+  test('advertises the operator’s name, logo, and help link, only web addresses', () => {
+    expect(
+      cloudDiscoveryFromConfig(parseCloudDeploymentTOML(minimalSource, environment)).branding
+    ).toBeUndefined()
+    const branded = `${minimalSource}
+[deployment.branding]
+name = "Acme Design"
+logo_url = "https://acme.example/logo.svg"
+help_url = "https://acme.example/help"
+`
+    expect(
+      cloudDiscoveryFromConfig(parseCloudDeploymentTOML(branded, environment)).branding
+    ).toEqual({
+      name: 'Acme Design',
+      logoURL: 'https://acme.example/logo.svg',
+      helpURL: 'https://acme.example/help'
+    })
+    expect(() =>
+      parseCloudDeploymentTOML(
+        branded.replace('https://acme.example/help', 'data:text/html,hi'),
+        environment
+      )
+    ).toThrow()
+  })
+
+  test('advertises the oldest editor it works with, only when configured', () => {
+    const open = cloudDiscoveryFromConfig(parseCloudDeploymentTOML(minimalSource, environment))
+    expect(open.minimumEditorVersion).toBeUndefined()
+
+    const source = minimalSource.replace(
+      'trusted_origins = ["https://app.example.com"]',
+      'trusted_origins = ["https://app.example.com"]\nminimum_editor_version = "0.17.0"'
+    )
+    const gated = cloudDiscoveryFromConfig(parseCloudDeploymentTOML(source, environment))
+    expect(gated.minimumEditorVersion).toBe('0.17.0')
+  })
+
+  test('reads the operator’s legal links and advertises them in discovery', () => {
+    expect(parseCloudDeploymentTOML(minimalSource, environment).legal).toBeUndefined()
+    const source = `${minimalSource}
+[legal]
+terms_url = "https://example.com/terms"
+privacy_url = "https://example.com/privacy"
+terms_version = "2026-11-15"
+require_acceptance = true
+abuse_email = "abuse@example.com"
+minimum_age = 16
+`
+    const legal = {
+      termsURL: 'https://example.com/terms',
+      privacyURL: 'https://example.com/privacy',
+      termsVersion: '2026-11-15',
+      requireAcceptance: true,
+      abuseEmail: 'abuse@example.com',
+      minimumAge: 16
+    }
+    const config = parseCloudDeploymentTOML(source, environment)
+    expect(config.legal).toEqual(legal)
+    expect(cloudDiscoveryFromConfig(config).legal).toEqual(legal)
+    expect(() =>
+      parseCloudDeploymentTOML(source.replace('terms_version = "2026-11-15"\n', ''), environment)
+    ).toThrow('terms_version')
+  })
+
+  test('names a community workspace only when one is configured, and advertises it', () => {
+    const plain = parseCloudDeploymentTOML(minimalSource, environment)
+    expect(plain.community).toBeUndefined()
+    expect(cloudDiscoveryFromConfig(plain).community).toBeUndefined()
+    const workspace = '0f6b1c1e-6a8e-4b8e-9a4f-3c2d1e0f9a8b'
+    const source = `${minimalSource}
+[community]
+workspace = "${workspace}"
+`
+    const config = parseCloudDeploymentTOML(source, environment)
+    expect(config.community).toEqual({ workspaceId: workspace })
+    // Editors read it to keep the gallery out of where they save on their own.
+    expect(cloudDiscoveryFromConfig(config).community).toEqual({ workspaceId: workspace })
+    expect(() =>
+      parseCloudDeploymentTOML(source.replace(workspace, 'community'), environment)
+    ).toThrow()
+  })
+
+  test('names the gallery document editors open as their tour, by its ID', () => {
+    const workspace = '0f6b1c1e-6a8e-4b8e-9a4f-3c2d1e0f9a8b'
+    const tour = '7c6939c0-dedc-4fbe-80b2-80919621de10'
+    const source = `${minimalSource}
+[community]
+workspace = "${workspace}"
+tour = "${tour}"
+`
+    const config = parseCloudDeploymentTOML(source, environment)
+    expect(cloudDiscoveryFromConfig(config).community).toEqual({
+      workspaceId: workspace,
+      tourDocumentId: tour
+    })
+    expect(() => parseCloudDeploymentTOML(source.replace(tour, 'tour'), environment)).toThrow()
+  })
+
+  test('keeps deleted files under a prefix only when one is configured', () => {
+    expect(parseCloudDeploymentTOML(minimalSource, environment).s3DeletedPrefix).toBeUndefined()
+    const keeping = (prefix: string) =>
+      minimalSource.replace('[object_storage]', `[object_storage]\ndeleted_prefix = "${prefix}"`)
+    expect(parseCloudDeploymentTOML(keeping('deleted/'), environment).s3DeletedPrefix).toBe(
+      'deleted/'
+    )
+    for (const prefix of ['deleted', '/deleted/', 'Deleted/', 'a/b/', 'documents/']) {
+      expect(() => parseCloudDeploymentTOML(keeping(prefix), environment)).toThrow()
+    }
+  })
+
+  test('reports server errors only when error tracking is configured', () => {
+    expect(parseCloudDeploymentTOML(minimalSource, environment).errorTracking).toBeUndefined()
+
+    const tracked = `${minimalSource}
+[error_tracking]
+provider = "posthog"
+`
+    expect(() => parseCloudDeploymentTOML(tracked, environment)).toThrow('POSTHOG_PROJECT_API_KEY')
+    expect(
+      parseCloudDeploymentTOML(tracked, { ...environment, POSTHOG_PROJECT_API_KEY: 'phc_test' })
+        .errorTracking
+    ).toEqual({
+      provider: 'posthog',
+      host: 'https://eu.i.posthog.com',
+      projectAPIKey: 'phc_test',
+      includeIds: false
+    })
+
+    const inline = tracked.replace(
+      'provider = "posthog"',
+      'provider = "posthog"\nhost = "https://eu.i.posthog.com"\nproject_api_key = "phc_inline"'
+    )
+    expect(parseCloudDeploymentTOML(inline, environment).errorTracking).toEqual({
+      provider: 'posthog',
+      host: 'https://eu.i.posthog.com',
+      projectAPIKey: 'phc_inline',
+      includeIds: false
+    })
+    expect(
+      parseCloudDeploymentTOML(
+        inline.replace('provider = "posthog"', 'provider = "posthog"\ninclude_ids = true'),
+        environment
+      ).errorTracking?.includeIds
+    ).toBe(true)
+  })
+
+  test('advertises services and billing only when configured', () => {
+    const plain = cloudDiscoveryFromConfig(parseCloudDeploymentTOML(minimalSource, environment))
+    expect(plain.services).toBeUndefined()
+    expect(plain.billing).toBeUndefined()
+
+    const source = `${minimalSource}
+[services]
+endpoint = "https://services.example.com"
+token_lifetime_minutes = 5
+
+[billing]
+endpoint = "https://billing.example.com"
+
+[internal_api]
+`
+    const withSecrets = {
+      ...environment,
+      OPENPENCIL_CLOUD_SERVICES_SIGNING_KEY: 'signing-key-pem',
+      OPENPENCIL_CLOUD_SERVICE_TOKEN: 'service-token-with-at-least-32-characters'
+    }
+    const config = parseCloudDeploymentTOML(source, withSecrets)
+    expect(config).toMatchObject({
+      servicesEndpoint: 'https://services.example.com',
+      servicesSigningKey: 'signing-key-pem',
+      servicesTokenLifetimeSeconds: 300,
+      billingEndpoint: 'https://billing.example.com',
+      internalServiceToken: 'service-token-with-at-least-32-characters'
+    })
+    const discovery = cloudDiscoveryFromConfig(config)
+    expect(discovery.services).toEqual({
+      endpoint: 'https://services.example.com',
+      contractVersion: '1'
+    })
+    expect(discovery.billing).toEqual({
+      endpoint: 'https://billing.example.com',
+      contractVersion: '1',
+      // Without default entitlements, an account without a plan has no limit and no services.
+      freePlan: { storageBytes: null, services: false, monthlyCredits: null }
+    })
+
+    expect(() => parseCloudDeploymentTOML(source, environment)).toThrow(
+      'OPENPENCIL_CLOUD_SERVICES_SIGNING_KEY'
+    )
+    expect(() =>
+      parseCloudDeploymentTOML(`${source}\n[entitlements]\nsource = "static"\n`, withSecrets)
+    ).toThrow('static entitlements')
+    // Billing signs with the services' key and sets plans through the internal API.
+    const billingOnly = `${minimalSource}\n[billing]\nendpoint = "https://billing.example.com"\n`
+    expect(() => parseCloudDeploymentTOML(billingOnly, withSecrets)).toThrow('signing key')
+  })
+
+  test("advertises the free plan billing's pricing compares with, from the default entitlements", () => {
+    const withSecrets = {
+      ...environment,
+      OPENPENCIL_CLOUD_SERVICES_SIGNING_KEY: 'signing-key-pem',
+      OPENPENCIL_CLOUD_SERVICE_TOKEN: 'service-token-with-at-least-32-characters'
+    }
+    const source = (services: string) => `${minimalSource}
+[services]
+endpoint = "https://services.example.com"
+
+[billing]
+endpoint = "https://billing.example.com"
+
+[internal_api]
+
+[entitlements]
+source = "database"
+storage = { maximum_bytes = 314572800 }
+services = ${services}
+`
+    const freePlan = (services: string) =>
+      cloudDiscoveryFromConfig(parseCloudDeploymentTOML(source(services), withSecrets)).billing
+        ?.freePlan
+    expect(freePlan('{ enabled = false }')).toEqual({
+      storageBytes: 314572800,
+      services: false,
+      monthlyCredits: null
+    })
+    expect(freePlan('{ enabled = true, monthly_credit_allowance = 100 }')).toEqual({
+      storageBytes: 314572800,
+      services: true,
+      monthlyCredits: 100
+    })
+    // Services without an allowance have no monthly limit, which is not the same as none.
+    expect(freePlan('{ enabled = true }')).toEqual({
+      storageBytes: 314572800,
+      services: true,
+      monthlyCredits: null
+    })
+  })
+
+  test('reads a relay URL override and requires a WebSocket scheme', () => {
+    const relay = (url: string) =>
+      parseCloudDeploymentTOML(
+        `${minimalSource}\n[collaboration]\nrelay_url = "${url}"\n`,
+        environment
+      )
+    expect(relay('wss://relay.example.com/api/collaboration/relay').relayURL).toBe(
+      'wss://relay.example.com/api/collaboration/relay'
+    )
+    expect(() => relay('https://relay.example.com')).toThrow()
+    expect(parseCloudDeploymentTOML(minimalSource, environment).relayURL).toBeUndefined()
+  })
+
+  test('refuses keys it does not know rather than leaving their settings at defaults', () => {
+    const renamed = minimalSource.replace(
+      '[authentication.enrollment]\nmode = "approval"',
+      '[authentication]\nenrollment_mode = "approval"\n\n[authentication.enrollment]'
+    )
+    expect(renamed).not.toBe(minimalSource)
+    expect(() => parseCloudDeploymentTOML(renamed, environment)).toThrow()
+    expect(() =>
+      parseCloudDeploymentTOML(`${minimalSource}\n[technical_limits]\n`, environment)
+    ).toThrow()
+  })
+
+  test('supports explicit secret-reference names', () => {
+    const input = parseTOML(minimalSource)
+    const parsed = v.parse(cloudDeploymentConfigSchema, input)
+    const custom = {
+      ...parsed,
+      authentication: {
+        ...parsed.authentication,
+        secret: { from_env: 'CUSTOM_AUTH_SECRET' }
+      }
+    }
+    expect(
+      parseCloudDeploymentConfig(custom, {
+        ...environment,
+        CUSTOM_AUTH_SECRET: 'custom-auth-secret-at-least-32-characters'
+      }).authSecret
+    ).toBe('custom-auth-secret-at-least-32-characters')
+  })
+
+  test('reports missing reference names without exposing values', () => {
+    expect(() => parseCloudDeploymentTOML(minimalSource, {})).toThrow(
+      'Required secret binding is unavailable: DATABASE_URL'
+    )
+  })
+
+  test('rejects unsupported schema versions', () => {
+    expect(() =>
+      parseCloudDeploymentTOML(
+        minimalSource.replace('schema_version = 2', 'schema_version = 1'),
+        environment
+      )
+    ).toThrow()
+    expect(() =>
+      parseCloudDeploymentTOML(
+        minimalSource.replace('schema_version = 2', 'schema_version = 3'),
+        environment
+      )
+    ).toThrow()
+  })
+})

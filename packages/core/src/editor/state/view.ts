@@ -1,0 +1,74 @@
+import { createGuideOverlayState } from '#core/canvas/guides/types'
+import { CANVAS_BG_COLOR } from '#core/constants'
+import type { EditorState, EditorViewState } from '#core/editor/types'
+
+export function createDefaultEditorViewState(pageId: string): EditorViewState {
+  return {
+    currentPageId: pageId,
+    selectedIds: new Set<string>(),
+    marquee: null,
+    snapGuides: [],
+    snapTargets: { points: [] },
+    guides: createGuideOverlayState(),
+    rotationPreview: null,
+    dropTargetId: null,
+    layoutInsertIndicator: null,
+    hoveredNodeId: null,
+    scaleAnchor: { x: 0.5, y: 0.5 },
+    transforming: false,
+    measurementMode: 'off',
+    editingTextId: null,
+    renamingLabelId: null,
+    penState: null,
+    penCursorX: null,
+    penCursorY: null,
+    pencilState: null,
+    autoLayoutHover: null,
+    shapeHandleHover: null,
+    connectorTarget: null,
+    panX: 0,
+    pageColor: { ...CANVAS_BG_COLOR },
+    panY: 0,
+    zoom: 1,
+    navigation: { phase: 'idle', generation: 0, lastInputAt: 0 },
+    renderVersion: 0,
+    textSelectionVersion: 0,
+    enteredContainerId: null,
+    nodeEditState: null,
+    cursorCanvasX: null,
+    cursorCanvasY: null,
+    canvasView: { id: 'edit' }
+  }
+}
+
+export function copyEditorViewState(source: EditorViewState): EditorViewState {
+  return {
+    ...source,
+    selectedIds: new Set(source.selectedIds),
+    marquee: structuredClone(source.marquee),
+    snapGuides: structuredClone(source.snapGuides),
+    snapTargets: structuredClone(source.snapTargets),
+    guides: structuredClone(source.guides),
+    rotationPreview: structuredClone(source.rotationPreview),
+    layoutInsertIndicator: structuredClone(source.layoutInsertIndicator),
+    penState: structuredClone(source.penState),
+    pencilState: structuredClone(source.pencilState),
+    autoLayoutHover: structuredClone(source.autoLayoutHover),
+    shapeHandleHover: structuredClone(source.shapeHandleHover),
+    connectorTarget: structuredClone(source.connectorTarget),
+    pageColor: { ...source.pageColor },
+    scaleAnchor: { ...source.scaleAnchor },
+    navigation: { ...source.navigation },
+    nodeEditState: structuredClone(source.nodeEditState),
+    canvasView: { ...source.canvasView }
+  }
+}
+
+export function pickEditorViewState(state: EditorState): EditorViewState {
+  const defaults = createDefaultEditorViewState(state.currentPageId)
+  const view = {} as EditorViewState
+  for (const key of Object.keys(defaults) as Array<keyof EditorViewState>) {
+    Reflect.set(view, key, state[key])
+  }
+  return copyEditorViewState(view)
+}

@@ -1,0 +1,303 @@
+<script setup lang="ts">
+import { computed, ref } from 'vue'
+
+import type { Fill, SceneNode, Stroke } from '@open-pencil/scene-graph'
+import { colorToHexRaw } from '@open-pencil/scene-graph/color'
+import { SIDE_STROKE_TYPES } from '@open-pencil/scene-graph/node-defaults'
+import type { Color } from '@open-pencil/scene-graph/primitives'
+import { useColorBindingProvider } from '@open-pencil/vue/controls/binding-provider'
+import { applySolidStrokeColor, applyStrokePaint } from '@open-pencil/vue/controls/color-model'
+import { MIXED, useNodeProps } from '@open-pencil/vue/controls/node-props'
+import { useOkHCL } from '@open-pencil/vue/controls/okhcl'
+import { useStrokeControls } from '@open-pencil/vue/controls/stroke'
+import {
+  BindableValueRoot,
+  type BindableValueActions
+} from '@open-pencil/vue/primitives/BindableValue'
+
+import FillPicker from '@/components/fill-picker/FillPicker.vue'
+import NumberField from '@/components/inputs/NumberField.vue'
+import PaintField from '@/components/inputs/PaintField.vue'
+import VariableBindingPicker from '@/components/properties/binding/VariableBindingPicker.vue'
+import PropertyItemRow from '@/components/properties/item-list/PropertyItemRow.vue'
+import {
+  applyPaintMutation,
+  cancelPaintMutation,
+  commitPaintMutation,
+  paintBindingTargets
+} from '@/components/properties/paint/binding'
+import DeletedVariableMark from '@/components/properties/paint/DeletedVariableMark.vue'
+import { useGradientEditing } from '@/components/properties/paint/gradient-edit'
+import { createStrokeOkhclAdapter } from '@/components/properties/paint/okhcl'
+import PaintValue from '@/components/properties/paint/PaintValue.vue'
+import PropertyListRoot from '@/components/properties/PropertyListRoot.vue'
+import { useSharedStylePicker } from '@/components/properties/shared-style/useSharedStylePicker'
+import IconButton from '@/components/ui/button/IconButton.vue'
+import Tip from '@/components/ui/overlay/Tip.vue'
+import PanelSection from '@/components/ui/panel/PanelSection.vue'
+import AppSelect from '@/components/ui/select/AppSelect.vue'
+const {
+  visible: stylesVisible,
+  hasStyle,
+  value: styleValue,
+  options: styleOptions,
+  update: updateStyle
+} = useSharedStylePicker('stroke')
+
+import { useMessages } from '@open-pencil/vue/i18n'
+
+import StrokeSettingsPopover from './StrokeSettingsPopover.vue'
+
+const strokeCtx = useStrokeControls()
+const { advancedActive } = strokeCtx
+const { nodes: selectedNodes } = useNodeProps()
+/** Empty when the layers align their strokes differently, so the field reads Mixed. */
+const alignValue = computed(() => {
+  const align = strokeCtx.currentAlign()
+  return align === MIXED ? '' : align
+})
+const colorProvider = useColorBindingProvider()
+const okhcl = useOkHCL()
+const gradients = useGradientEditing()
+
+/** Opening a paint's picker shows its gradient handles on the canvas; closing commits the edit. */
+function onPickerOpenChange(
+  nodeIds: readonly string[],
+  index: number,
+  open: boolean,
+  binding: BindableValueActions<Color>
+) {
+  gradients.setOpen(gradients.target(nodeIds, 'strokes', index), open)
+  if (!open) commitPaintMutation(binding)
+}
+const panels = useMessages('panels')
+const common = useMessages('common')
+const expandedSides = ref(false)
+/** Figma strokes each side apart only on rectangles, frames, components, and instances. */
+const sidesOffered = computed(
+  () =>
+    selectedNodes.value.length > 0 &&
+    selectedNodes.value.every((node) => SIDE_STROKE_TYPES.has(node.type))
+)
+const sidesShown = computed(() => sidesOffered.value && expandedSides.value)
+
+/** A bound variable colours the swatch, but only a solid stroke has one colour to replace. */
+function displayStroke(stroke: Stroke, resolvedColor: Color | undefined): Fill {
+  return stroke.type === 'SOLID' && resolvedColor ? { ...stroke, color: resolvedColor } : stroke
+}
+
+function updateStrokePaint(
+  binding: BindableValueActions<Color>,
+  flush: () => void,
+  stroke: Stroke,
+  paint: Fill,
+  update: (stroke: Stroke) => void
+) {
+  applyPaintMutation(binding, flush, () => update(applyStrokePaint(stroke, paint)))
+}
+
+function updateStrokeColor(
+  binding: BindableValueActions<Color>,
+  flush: () => void,
+  color: Color,
+  patch: (changes: Partial<Stroke>) => void,
+  commit: boolean
+) {
+  if (!applyPaintMutation(binding, flush, () => patch(applySolidStrokeColor(color)))) return
+  if (commit) commitPaintMutation(binding)
+}
+
+/** Opening the sides gives every layer its own weight per side; closing strokes all sides again. */
+function onToggleSides(nodes: readonly SceneNode[]) {
+  const next = !expandedSides.value
+  expandedSides.value = next
+  if (next && nodes.some((node) => !node.independentStrokeWeights)) strokeCtx.selectSide('CUSTOM')
+  else if (!next && nodes.some((node) => node.independentStrokeWeights)) strokeCtx.selectSide('ALL')
+}
+</script>
+
+<template>
+  <PropertyListRoot
+    v-slot="{ items, isMixed, activeNode, selectedNodeIds, flush, actions }"
+    prop-key="strokes"
+    :label="panels.stroke"
+  >
+    <PanelSection :label="panels.stroke" :empty="!isMixed && items.length === 0">
+      <template #actions>
+        <AppSelect
+          v-if="stylesVisible && !hasStyle"
+          :model-value="styleValue"
+          :options="styleOptions"
+          @update:model-value="updateStyle"
+        >
+          <template #trigger>
+            <IconButton :label="panels.strokeStyle" data-property="stroke-style"
+              ><icon-lucide-layout-grid class="size-3.5"
+            /></IconButton>
+          </template>
+        </AppSelect>
+        <IconButton :label="panels.addStroke" @click="actions.add(strokeCtx.defaultStroke)">
+          <icon-lucide-plus class="size-3.5" />
+        </IconButton>
+      </template>
+
+      <AppSelect
+        v-if="stylesVisible && hasStyle"
+        :model-value="styleValue"
+        :options="styleOptions"
+        :label="panels.strokeStyle"
+        data-property="stroke-style"
+        class="mb-1.5"
+        @update:model-value="updateStyle"
+      />
+
+      <p v-if="isMixed" class="text-2xs text-muted">{{ panels.mixedStrokesHelp }}</p>
+
+      <PropertyItemRow
+        v-for="(stroke, index) in items"
+        :key="`${index}:${stroke.visible ? 'visible' : 'hidden'}`"
+        prop-key="strokes"
+        :index="index"
+        :visibility-label="panels.toggleVisibility"
+        :remove-label="panels.removeStroke"
+      >
+        <BindableValueRoot
+          v-slot="binding"
+          :provider="colorProvider"
+          :targets="paintBindingTargets(selectedNodeIds, 'strokes', index)"
+          :value="stroke.color"
+          batch-label="Change stroke color"
+        >
+          <PaintField
+            :opacity="stroke.opacity"
+            :opacity-label="panels.opacity"
+            @update:opacity="actions.patch(index, { opacity: $event })"
+          >
+            <template #preview>
+              <DeletedVariableMark
+                v-if="binding.variable?.deleted"
+                :label="panels.variableDeleted"
+              />
+              <FillPicker
+                v-else
+                :label="panels.stroke"
+                :fill="displayStroke(stroke, binding.resolvedValue)"
+                :okhcl="
+                  createStrokeOkhclAdapter(okhcl, activeNode, index, (update) =>
+                    applyPaintMutation(binding.actions, flush, update)
+                  )
+                "
+                :layer-size="selectedNodeIds.length === 1 ? activeNode : null"
+                :keep-open="gradients.pressesHandle"
+                :active-stop="gradients.stop(gradients.target(selectedNodeIds, 'strokes', index))"
+                @update:active-stop="
+                  gradients.setStop(gradients.target(selectedNodeIds, 'strokes', index), $event)
+                "
+                @update="
+                  updateStrokePaint(binding.actions, flush, stroke, $event, (next) =>
+                    actions.update(index, next)
+                  )
+                "
+                @open-change="onPickerOpenChange(selectedNodeIds, index, $event, binding.actions)"
+                @commit="commitPaintMutation(binding.actions)"
+                @cancel="cancelPaintMutation(binding.actions)"
+              />
+            </template>
+
+            <template #value>
+              <PaintValue
+                v-if="stroke.type === 'SOLID'"
+                :color="stroke.color"
+                :resolved-color="binding.resolvedValue"
+                :variable-name="binding.variable?.name ?? binding.bindingId"
+                :unavailable-label="
+                  binding.state === 'unresolved' ? panels.unresolvedVariable : undefined
+                "
+                :label="panels.stroke"
+                @update="
+                  updateStrokeColor(
+                    binding.actions,
+                    flush,
+                    $event,
+                    (changes) => actions.patch(index, changes),
+                    true
+                  )
+                "
+              />
+            </template>
+
+            <template #binding>
+              <VariableBindingPicker
+                :trigger-label="panels.applyVariable"
+                :search-placeholder="common.search"
+                :empty-label="panels.noVariablesFound"
+                :detach-label="panels.detachVariable"
+                :create-label="
+                  panels.createColorVariable({ value: `#${colorToHexRaw(stroke.color)}` })
+                "
+                :create-name-placeholder="panels.variableName"
+                :create-submit-label="panels.create"
+              />
+            </template>
+          </PaintField>
+        </BindableValueRoot>
+      </PropertyItemRow>
+
+      <div v-if="!isMixed && items.length > 0" class="mt-1 flex items-center gap-1.5">
+        <AppSelect
+          :label="panels.strokeType"
+          :ui="{ trigger: 'w-22 flex-none' }"
+          :model-value="alignValue"
+          :placeholder="panels.mixed"
+          :options="strokeCtx.alignOptions"
+          data-property="stroke-align"
+          @update:model-value="strokeCtx.updateAlign($event as Stroke['align'])"
+        />
+        <Tip :label="panels.strokeWeight">
+          <NumberField
+            v-if="!sidesShown"
+            class="flex-1"
+            icon="W"
+            :model-value="items[0]?.weight ?? 1"
+            :min="0"
+            data-property="stroke-weight"
+            @update:model-value="actions.patch(0, { weight: $event })"
+          />
+        </Tip>
+        <StrokeSettingsPopover
+          v-if="advancedActive"
+          :stroke="items[0]"
+          @patch="actions.patch(0, $event)"
+        />
+        <IconButton
+          v-if="sidesOffered"
+          :label="panels.strokeSides"
+          size="xs"
+          class="size-6.5 shrink-0"
+          :active="expandedSides"
+          data-property="stroke-sides"
+          @click="onToggleSides(selectedNodes)"
+        >
+          <icon-lucide-layout-grid class="size-3.5" />
+        </IconButton>
+      </div>
+
+      <StrokeSettingsPopover v-if="isMixed && advancedActive" />
+
+      <div
+        v-if="!isMixed && items.length > 0 && sidesShown"
+        class="mt-1.5 grid grid-cols-2 gap-1.5"
+      >
+        <NumberField
+          v-for="side in strokeCtx.borderSides"
+          :key="side"
+          :label="side[0].toUpperCase()"
+          :model-value="strokeCtx.borderWeight(side)"
+          :min="0"
+          :data-property="`stroke-${side}-weight`"
+          @update:model-value="strokeCtx.updateBorderWeight(side, $event)"
+        />
+      </div>
+    </PanelSection>
+  </PropertyListRoot>
+</template>

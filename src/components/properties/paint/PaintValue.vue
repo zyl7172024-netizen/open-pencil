@@ -1,0 +1,44 @@
+<script setup lang="ts">
+import { computed } from 'vue'
+
+import type { Color } from '@open-pencil/scene-graph/primitives'
+import { useColorModel } from '@open-pencil/vue/controls/color-model'
+import { inputValue } from '@open-pencil/vue/shared/dom-events'
+
+import { BindingPill } from '@/components/ui/binding'
+
+const { color, resolvedColor, variableName, unavailableLabel, label } = defineProps<{
+  color: Color
+  resolvedColor?: Color
+  unavailableLabel?: string
+  variableName?: string
+  label: string
+}>()
+const emit = defineEmits<{ update: [color: Color] }>()
+
+const displayColor = computed(() => resolvedColor ?? color)
+const model = useColorModel({
+  color: displayColor,
+  onUpdate: (updated) => emit('update', updated)
+})
+const tooltip = computed(() => (variableName ? `${variableName} · #${model.hex.value}` : undefined))
+</script>
+
+<template>
+  <BindingPill
+    v-if="variableName || unavailableLabel"
+    class="min-w-0 flex-1"
+    :label="variableName ?? unavailableLabel ?? label"
+    :unresolved="!!unavailableLabel"
+    :tooltip="unavailableLabel ?? tooltip"
+  />
+  <input
+    v-else
+    :aria-label="label"
+    data-property="color-hex"
+    class="min-w-0 flex-1 border-none bg-transparent font-mono text-2xs text-surface outline-none"
+    :value="model.hex.value"
+    maxlength="6"
+    @change="model.updateHex(inputValue($event))"
+  />
+</template>

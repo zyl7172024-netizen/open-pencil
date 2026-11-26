@@ -1,0 +1,83 @@
+export { CODEGEN_PROMPT } from './prompts'
+
+export { getComponentCatalog, registerComponentCatalog } from './component-catalog'
+export type {
+  ComponentCatalog,
+  ComponentCatalogInsertInput,
+  ComponentCatalogLibraryAsset
+} from './component-catalog'
+export { ALL_TOOLS, CORE_TOOLS, EXTENDED_TOOLS } from './registry'
+export { exportImage } from './vector'
+export {
+  defineTool,
+  nodeToResult,
+  nodeSummary,
+  requireNode,
+  NodeNotFoundError,
+  toolChangesDocument,
+  toolFailure
+} from './schema'
+export type { ToolDef, ToolExecution, ToolCapability } from './schema'
+export {
+  isAtomicTool,
+  isToolExposed,
+  toolInputFor,
+  parseToolArgs,
+  type ToolInterface,
+  type ToolExposure
+} from './schema'
+export {
+  jsonSchemaTarget,
+  toolJSONSchema,
+  toolNumber,
+  toolNumberSchema,
+  toolStandardJSONSchema
+} from './schema'
+export type { JSONSchemaTarget } from './schema'
+export { toolsToAI, buildDebugLog } from './ai-adapter'
+export type {
+  ToolLogEntry,
+  ToolDebugLog,
+  AIAdapterOptions,
+  ModelImage,
+  StepBudget
+} from './ai-adapter'
+export {
+  calcClusterConfidence,
+  compileScript,
+  diffDocuments,
+  diffPageLayersJSX,
+  wrapEvalCode
+} from './analyze'
+export type { DocumentDiff, DocumentDiffOptions, LayerJSXChange } from './analyze'
+export {
+  VALID_OVERLAP_CATEGORIES,
+  VALID_OVERLAP_SCOPES,
+  VALID_OVERLAP_SEVERITIES,
+  parseOverlapCategories,
+  parseOverlapScope,
+  parseOverlapSeverity
+} from './analyze/overlaps/params'
+export { setPexelsAPIKey, setUnsplashAccessKey } from './stock-photo'
+export {
+  MAX_WEB_SEARCH_QUERY_LENGTH,
+  MAX_WEB_SEARCH_RESULTS,
+  setWebSearchProvider,
+  WebSearchRefusedError,
+  type WebSearchProvider,
+  type WebSearchResult
+} from './web-search'
+export { importMermaid, importSVG } from './create'
+export { arrangeNodes } from './structure'
+export {
+  checkStockPhotoKey,
+  getStockPhotoProvider,
+  getStockPhotoProviders,
+  registerStockPhotoProvider,
+  setActiveStockPhotoProvider,
+  type StockPhotoKeyCheck,
+  type StockPhotoOrientation,
+  type StockPhotoProvider,
+  type StockPhotoResult,
+  type StockPhotoSearchOptions
+} from './stock-photo/providers'

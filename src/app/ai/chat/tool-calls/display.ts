@@ -1,0 +1,182 @@
+import { getToolName, isToolUIPart } from 'ai'
+import type { UIDataTypes, UIMessagePart, UITools } from 'ai'
+import { isEmptyObject } from 'es-toolkit'
+import { isValid } from 'js-base64'
+import * as v from 'valibot'
+
+import { searchResponseSchema, type SearchResult } from '@open-pencil/cloud/contract'
+import { isRecord } from '@open-pencil/std/records'
+
+export type ChatMessagePart = UIMessagePart<UIDataTypes, UITools>
+export type ToolCallPart = Extract<ChatMessagePart, { toolCallId: string }>
+
+// `mcp__<server>__`. The server name may hold single underscores, as Pi writes `open-pencil` as
+// `open_pencil`, so the prefix ends at the first double one.
+const MCP_PREFIX = /^mcp__.+?__/
+const SUMMARY_LENGTH = 60
+const IMAGE_MEDIA_TYPES = new Set(['image/png', 'image/jpeg', 'image/webp'])
+
+function truncate(text: string): string {
+  const line = text.trim().split('\n')[0]?.trim() ?? ''
+  return line.length > SUMMARY_LENGTH ? `${line.slice(0, SUMMARY_LENGTH - 1)}…` : line
+}
+
+export function toolName(part: ToolCallPart): string {
+  return getToolName(part).replace(MCP_PREFIX, '')
+}
+
+export function toolDisplayName(part: ToolCallPart): string {
+  return toolName(part)
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, (c) => c.toUpperCase())
+}
+
+/** The root element's opening tag, which may still be streaming in. */
+const ROOT_TAG = /<([A-Z][\w.]*)([^>]*)/
+
+/** The element and name a JSX source opens with, such as `Frame "Pricing"`. */
+function jsxSummary(jsx: string): string {
+  const root = ROOT_TAG.exec(jsx)
+  if (!root) return ''
+  const [, element, attributes = ''] = root
+  // Only the root's own attributes: a child's name must not label the root.
+  const name = /\bname=["'{]+([^"'}]+)/.exec(attributes)?.[1]
+  return name ? `${element} “${truncate(name)}”` : element
+}
+
+const SUMMARY_FIELDS = ['name', 'query', 'text', 'question', 'path', 'id'] as const
+
+/** A one-line description of what a call does, read from its (possibly partial) input. */
+export function toolSummary(part: ToolCallPart): string {
+  const input = part.input
+  if (!isRecord(input)) return ''
+  if (typeof input.jsx === 'string') return jsxSummary(input.jsx)
+  if (typeof input.code === 'string') return truncate(input.code)
+  if (Array.isArray(input.ids) && input.ids.length > 1) return `${input.ids.length} nodes`
+  for (const field of SUMMARY_FIELDS) {
+    const value = input[field]
+    if (typeof value === 'string' && value.trim()) return truncate(value)
+  }
+  return ''
+}
+
+function stringIds(value: unknown): string[] {
+  if (typeof value === 'string') return [value]
+  if (!Array.isArray(value)) return []
+  return value.flatMap((item) => {
+    if (typeof item === 'string') return [item]
+    return isRecord(item) && typeof item.id === 'string' ? [item.id] : []
+  })
+}
+
+/** Nodes a call targeted or produced, for chips that bring them into view. */
+export function toolNodeIds(part: ToolCallPart): string[] {
+  const ids = new Set<string>()
+  const { input } = part
+  if (isRecord(input)) {
+    for (const key of ['id', 'ids', 'replace_id', 'parent_id', 'parentId']) {
+      for (const id of stringIds(input[key])) ids.add(id)
+    }
+  }
+  if (part.state === 'output-available' && isRecord(part.output)) {
+    const { output } = part
+    for (const key of ['id', 'ids', 'selection', 'results', 'created', 'clones']) {
+      for (const id of stringIds(output[key])) ids.add(id)
+    }
+    // A deleted node has nothing left to bring into view.
+    for (const id of stringIds(output.deleted)) ids.delete(id)
+  }
+  return [...ids]
+}
+
+export function toolErrorText(part: ToolCallPart): string | null {
+  if (part.state === 'output-error') return part.errorText
+  if (part.state !== 'output-available' || !isRecord(part.output)) return null
+  const { error } = part.output
+  return typeof error === 'string' ? error : null
+}
+
+/** An image the tool returned for the model, such as `export_image`, as a data URL. */
+export function toolImage(part: ToolCallPart): string | null {
+  if (part.state !== 'output-available' || !isRecord(part.output)) return null
+  const { base64, mimeType } = part.output
+  if (typeof base64 !== 'string' || typeof mimeType !== 'string') return null
+  if (!IMAGE_MEDIA_TYPES.has(mimeType) || !isValid(base64)) return null
+  return `data:${mimeType};base64,${base64}`
+}
+
+const searchOutputSchema = v.union([
+  searchResponseSchema,
+  // Through OpenPencil's MCP server, as an agent such as Claude Code receives it.
+  v.pipe(
+    v.object({ content: v.tuple([v.object({ type: v.literal('text'), text: v.string() })]) }),
+    v.transform((output) => output.content[0].text),
+    v.parseJson(),
+    searchResponseSchema
+  )
+])
+
+/** The pages a `search_web` call found, to show as sources rather than JSON. */
+export function toolWebResults(part: ToolCallPart): SearchResult[] | null {
+  if (part.state !== 'output-available' || toolName(part) !== 'search_web') return null
+  const found = v.safeParse(searchOutputSchema, part.output)
+  return found.success ? found.output.results : null
+}
+
+/** Output with large binary payloads elided, for display as JSON. */
+export function displayedToolOutput(part: ToolCallPart): unknown {
+  if (part.state !== 'output-available') return undefined
+  const { output } = part
+  if (!isRecord(output) || typeof output.base64 !== 'string') return output
+  return { ...output, base64: `<${output.base64.length} base64 characters>` }
+}
+
+/** The source a call writes, shown highlighted instead of as a JSON string. */
+export function toolSource(
+  part: ToolCallPart
+): { code: string; language: 'design-jsx' | 'javascript' } | null {
+  const input = part.input
+  if (!isRecord(input)) return null
+  if (typeof input.jsx === 'string') return { code: input.jsx, language: 'design-jsx' }
+  if (typeof input.code === 'string') return { code: input.code, language: 'javascript' }
+  return null
+}
+
+/** Whether a call has input worth showing: source, or at least one argument. */
+export function toolHasInput(part: ToolCallPart): boolean {
+  return toolSource(part) !== null || (isRecord(part.input) && !isEmptyObject(part.input))
+}
+
+export type MessagePartGroup =
+  | { kind: 'part'; part: ChatMessagePart; index: number }
+  | { kind: 'tools'; parts: { part: ToolCallPart; index: number }[] }
+  | { kind: 'compaction'; index: number; compaction: number }
+
+/**
+ * Consecutive tool calls form one group, so a long run can collapse into a single row. Each
+ * compaction within the reply, before a step in `compactedSteps`, sits between groups and names
+ * its place in that list.
+ */
+export function groupMessageParts(
+  parts: readonly ChatMessagePart[],
+  compactedSteps: readonly number[] = []
+): MessagePartGroup[] {
+  const groups: MessagePartGroup[] = []
+  let step = 0
+  parts.forEach((part, index) => {
+    // Step boundaries are not rendered, so they must not split a run of calls.
+    if (part.type === 'step-start') {
+      const compaction = compactedSteps.indexOf(step++)
+      if (compaction !== -1) groups.push({ kind: 'compaction', index, compaction })
+      return
+    }
+    if (!isToolUIPart(part)) {
+      groups.push({ kind: 'part', part, index })
+      return
+    }
+    const last = groups.at(-1)
+    if (last?.kind === 'tools') last.parts.push({ part, index })
+    else groups.push({ kind: 'tools', parts: [{ part, index }] })
+  })
+  return groups
+}

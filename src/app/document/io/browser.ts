@@ -1,0 +1,36 @@
+import { nextShownFrame } from '@open-pencil/vue/shared/frame'
+
+/** How long a download's link stays after its click: long enough for the browser to start it. */
+const DOWNLOAD_LINK_LIFETIME_MS = 100
+
+export function resolveBrowserFileURL(path: string): URL {
+  const url = new URL(path, window.location.href)
+  url.hash = ''
+  return url
+}
+
+type ViewportEditor = {
+  zoomToFit: () => void
+}
+
+/** Fits the page once the canvas has its size; `signal` stops waiting for it. */
+export async function fitPageToViewport(editor: ViewportEditor, signal?: AbortSignal) {
+  await nextShownFrame({ signal })
+  editor.zoomToFit()
+}
+
+export function downloadBlob(data: Uint8Array | Blob, filename: string, mime: string) {
+  // A copy, not `data.buffer`: a view would download the whole buffer it looks into.
+  const blob = data instanceof Blob ? data : new Blob([data.slice()], { type: mime })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.style.display = 'none'
+  document.body.appendChild(a)
+  a.click()
+  setTimeout(() => {
+    document.body.removeChild(a)
+    URL.revokeObjectURL(url)
+  }, DOWNLOAD_LINK_LIFETIME_MS)
+}

@@ -1,0 +1,9 @@
+/** Who works on a page: a dot per person, a sparkle per agent, then "+N". */
+export default {
+  slots: {
+    root: 'flex shrink-0 items-center gap-1',
+    person: 'size-2 rounded-full',
+    agent: 'size-3',
+    overflow: 'text-4xs leading-none text-muted'
+  }
+} as const

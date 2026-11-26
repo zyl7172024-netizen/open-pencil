@@ -1,0 +1,259 @@
+<script setup lang="ts">
+import type { Fill, SceneNode } from '@open-pencil/scene-graph'
+import { colorToHexRaw } from '@open-pencil/scene-graph/color'
+import type { Color } from '@open-pencil/scene-graph/primitives'
+import { shaderOfPaint } from '@open-pencil/scene-graph/shaders'
+import { useColorBindingProvider } from '@open-pencil/vue/controls/binding-provider'
+import { useFillControls } from '@open-pencil/vue/controls/fill'
+import { useOkHCL } from '@open-pencil/vue/controls/okhcl'
+import { useMessages } from '@open-pencil/vue/i18n'
+import {
+  BindableValueRoot,
+  type BindableValueActions
+} from '@open-pencil/vue/primitives/BindableValue'
+
+import { useEditorStore } from '@/app/editor/active-store'
+import FillPicker from '@/components/fill-picker/FillPicker.vue'
+import PaintField from '@/components/inputs/PaintField.vue'
+import VariableBindingPicker from '@/components/properties/binding/VariableBindingPicker.vue'
+import {
+  commitDiscretePropertyListChange,
+  useBlendModeGroups
+} from '@/components/properties/blend-mode/use'
+import { fillLabel } from '@/components/properties/fill-label'
+import PropertyItemRow from '@/components/properties/item-list/PropertyItemRow.vue'
+import {
+  applyPaintMutation,
+  cancelPaintMutation,
+  commitPaintMutation,
+  paintBindingTargets
+} from '@/components/properties/paint/binding'
+import DeletedVariableMark from '@/components/properties/paint/DeletedVariableMark.vue'
+import { useGradientEditing } from '@/components/properties/paint/gradient-edit'
+import { createFillOkhclAdapter } from '@/components/properties/paint/okhcl'
+import PaintValue from '@/components/properties/paint/PaintValue.vue'
+import PropertyListRoot from '@/components/properties/PropertyListRoot.vue'
+import { useSharedStylePicker } from '@/components/properties/shared-style/useSharedStylePicker'
+import IconButton from '@/components/ui/button/IconButton.vue'
+import PanelFieldGroup from '@/components/ui/panel/PanelFieldGroup.vue'
+import PanelSection from '@/components/ui/panel/PanelSection.vue'
+import AppSelect from '@/components/ui/select/AppSelect.vue'
+
+const fillCtx = useFillControls()
+const store = useEditorStore()
+const okhcl = useOkHCL()
+const gradients = useGradientEditing()
+
+/** Opening a paint's picker shows its gradient handles on the canvas; closing commits the edit. */
+function onPickerOpenChange(
+  nodeIds: readonly string[],
+  index: number,
+  open: boolean,
+  binding: BindableValueActions<Color>
+) {
+  gradients.setOpen(gradients.target(nodeIds, 'fills', index), open)
+  if (!open) commitPaintMutation(binding)
+}
+const colorProvider = useColorBindingProvider()
+const panels = useMessages('panels')
+const common = useMessages('common')
+const blendModeGroups = useBlendModeGroups()
+const {
+  visible: stylesVisible,
+  hasStyle,
+  value: styleValue,
+  options: styleOptions,
+  update: updateStyle
+} = useSharedStylePicker('fill')
+
+/** The shader a fill of the layer the panel shows draws, if it draws one. */
+function fillShader(node: SceneNode | null, fill: Fill) {
+  return node ? shaderOfPaint(node, fill) : null
+}
+
+function displayFill(fill: Fill, resolvedColor: Color | undefined): Fill {
+  return fill.type === 'SOLID' && resolvedColor ? { ...fill, color: resolvedColor } : fill
+}
+
+function updatePickerFill(
+  binding: BindableValueActions<Color>,
+  flush: () => void,
+  nextFill: Fill,
+  update: (fill: Fill) => void
+) {
+  applyPaintMutation(binding, flush, () => update(nextFill))
+}
+
+/**
+ * A shader joins the picker's paint edit, so a drag in its colour is one step. It replaces the
+ * paint, so a binding that refuses the edit, such as an unresolved one, does not stop it: the
+ * shader is then written as a step of its own.
+ */
+function updateShader(binding: BindableValueActions<Color>, flush: () => void, write: () => void) {
+  if (!applyPaintMutation(binding, flush, write)) write()
+}
+
+function updateSolidColor(
+  binding: BindableValueActions<Color>,
+  flush: () => void,
+  fill: Fill,
+  color: Color,
+  update: (fill: Fill) => void
+) {
+  if (fill.type !== 'SOLID') return
+  if (applyPaintMutation(binding, flush, () => update({ ...fill, color })))
+    commitPaintMutation(binding)
+}
+</script>
+
+<template>
+  <PropertyListRoot
+    v-slot="{ items, isMixed, activeNode, selectedNodeIds, flush, actions }"
+    prop-key="fills"
+    :label="panels.fill"
+  >
+    <PanelSection :label="panels.fill" :empty="!isMixed && items.length === 0">
+      <template #actions>
+        <AppSelect
+          v-if="stylesVisible && !hasStyle"
+          :model-value="styleValue"
+          :options="styleOptions"
+          @update:model-value="updateStyle"
+        >
+          <template #trigger>
+            <IconButton :label="panels.fillStyle" data-property="fill-style"
+              ><icon-lucide-layout-grid class="size-3.5"
+            /></IconButton>
+          </template>
+        </AppSelect>
+        <IconButton :label="panels.addFill" @click="actions.add({ ...fillCtx.defaultFill })">
+          <icon-lucide-plus class="size-3.5" />
+        </IconButton>
+      </template>
+
+      <AppSelect
+        v-if="stylesVisible && hasStyle"
+        :model-value="styleValue"
+        :options="styleOptions"
+        :label="panels.fillStyle"
+        data-property="fill-style"
+        class="mb-1.5"
+        @update:model-value="updateStyle"
+      />
+
+      <p v-if="isMixed" class="text-2xs text-muted">{{ panels.mixedFillsHelp }}</p>
+
+      <div v-for="(fill, index) in items" :key="`${index}:${fill.visible ? 'visible' : 'hidden'}`">
+        <PropertyItemRow
+          class="items-start"
+          prop-key="fills"
+          :index="index"
+          :visibility-label="panels.toggleVisibility"
+          :remove-label="panels.removeFill"
+        >
+          <BindableValueRoot
+            v-slot="binding"
+            :provider="colorProvider"
+            :targets="paintBindingTargets(selectedNodeIds, 'fills', index)"
+            :value="fill.color"
+            batch-label="Change fill color"
+          >
+            <PaintField
+              class="w-full flex-none"
+              :opacity="fill.opacity"
+              :opacity-label="panels.opacity"
+              @update:opacity="actions.patch(index, { opacity: $event })"
+            >
+              <template #preview>
+                <DeletedVariableMark
+                  v-if="binding.variable?.deleted"
+                  :label="panels.variableDeleted"
+                />
+                <FillPicker
+                  v-else
+                  :fill="displayFill(fill, binding.resolvedValue)"
+                  :okhcl="
+                    createFillOkhclAdapter(okhcl, activeNode, index, (update) =>
+                      applyPaintMutation(binding.actions, flush, update)
+                    )
+                  "
+                  :shader="fillShader(activeNode, fill)"
+                  :layer-size="selectedNodeIds.length === 1 ? activeNode : null"
+                  :keep-open="gradients.pressesHandle"
+                  :active-stop="gradients.stop(gradients.target(selectedNodeIds, 'fills', index))"
+                  @update:active-stop="
+                    gradients.setStop(gradients.target(selectedNodeIds, 'fills', index), $event)
+                  "
+                  @update="
+                    updatePickerFill(binding.actions, flush, $event, (next) =>
+                      actions.update(index, next)
+                    )
+                  "
+                  @update-shader="
+                    updateShader(binding.actions, flush, () =>
+                      store.setShaderPaint(selectedNodeIds, 'fills', index, $event)
+                    )
+                  "
+                  @open-change="onPickerOpenChange(selectedNodeIds, index, $event, binding.actions)"
+                  @commit="commitPaintMutation(binding.actions)"
+                  @cancel="cancelPaintMutation(binding.actions)"
+                />
+              </template>
+
+              <template #value>
+                <PaintValue
+                  v-if="fill.type === 'SOLID'"
+                  :color="fill.color"
+                  :resolved-color="binding.resolvedValue"
+                  :variable-name="binding.variable?.name ?? binding.bindingId"
+                  :unavailable-label="
+                    binding.state === 'unresolved' ? panels.unresolvedVariable : undefined
+                  "
+                  :label="panels.fill"
+                  @update="
+                    updateSolidColor(binding.actions, flush, fill, $event, (next) =>
+                      actions.update(index, next)
+                    )
+                  "
+                />
+                <span v-else class="min-w-0 flex-1 truncate font-mono text-xs text-surface">
+                  {{ fillLabel(fill, undefined, fillShader(activeNode, fill)) }}
+                </span>
+              </template>
+
+              <template v-if="fill.type === 'SOLID'" #binding>
+                <VariableBindingPicker
+                  :trigger-label="panels.applyVariable"
+                  :search-placeholder="common.search"
+                  :empty-label="panels.noVariablesFound"
+                  :detach-label="panels.detachVariable"
+                  :create-label="
+                    panels.createColorVariable({ value: `#${colorToHexRaw(fill.color)}` })
+                  "
+                  :create-name-placeholder="panels.variableName"
+                  :create-submit-label="panels.create"
+                />
+              </template>
+            </PaintField>
+          </BindableValueRoot>
+
+          <template #details>
+            <PanelFieldGroup :label="panels.blendMode">
+              <AppSelect
+                :model-value="fill.blendMode ?? 'NORMAL'"
+                :groups="blendModeGroups"
+                :label="panels.blendMode"
+                data-property="fill-blend-mode"
+                @update:model-value="
+                  commitDiscretePropertyListChange(flush, () =>
+                    actions.patch(index, { blendMode: $event as Fill['blendMode'] })
+                  )
+                "
+              />
+            </PanelFieldGroup>
+          </template>
+        </PropertyItemRow>
+      </div>
+    </PanelSection>
+  </PropertyListRoot>
+</template>

@@ -1,0 +1,429 @@
+import { sumBy } from 'es-toolkit'
+
+import type { SceneGraph, SceneNode } from '@open-pencil/scene-graph'
+import Matrix from '@open-pencil/scene-graph/matrix'
+import { clipsChildren } from '@open-pencil/scene-graph/node-defaults'
+import type { Rect, Vector } from '@open-pencil/scene-graph/primitives'
+
+import { groupMarks, marksOverlap } from '#core/canvas/marks/group'
+import {
+  ISSUE_EDGE_ARROW,
+  ISSUE_EDGE_MERGE_GAP,
+  ISSUE_MARKER_GAP,
+  ISSUE_MARKER_HEIGHT,
+  ISSUE_MARKER_MAX_COUNT,
+  ISSUE_MARKER_MIN_TARGET,
+  ISSUE_MARKER_OFFSET,
+  ISSUE_MARKER_PADDING_X,
+  ISSUE_MARKER_RING_WIDTH,
+  ISSUE_MARKER_VIEWPORT_INSET
+} from '#core/constants'
+import {
+  createSceneGeometry,
+  type RotationPreview,
+  type SceneGeometry,
+  type ViewportTransform
+} from '#core/geometry'
+import { worldXToScreen, worldYToScreen } from '#core/geometry/viewport'
+
+import type { DesignIssueMarker, DesignIssueSeverity, PlacedIssueMarker } from './types'
+
+export interface IssueMarkerView extends ViewportTransform {
+  width: number
+  height: number
+  /** Space taken by chrome along the top and left edges, such as rulers. */
+  insetTop: number
+  insetLeft: number
+}
+
+/** What places markers in the document, which pan and zoom leave alone. */
+export interface IssueMarkerStageOptions {
+  pageId: string
+  /** Layers whose markers would cover an active edit, such as the text being typed. */
+  suppressedIds?: ReadonlySet<string>
+  preview?: RotationPreview | null
+}
+
+/** What places staged markers on the screen. */
+export interface IssueMarkerPlacementOptions {
+  view: IssueMarkerView
+  measureText: (text: string) => number
+  /** Screen rectangles of UI floating over the canvas, such as a toolbar, to keep pins clear of. */
+  obstacles?: readonly Rect[]
+}
+
+export type IssueMarkerLayoutOptions = IssueMarkerStageOptions & IssueMarkerPlacementOptions
+
+/** A marked layer as staged in world space, from which each frame places its marker. */
+export interface StagedIssueMarker {
+  marker: DesignIssueMarker
+  /**
+   * The world boxes a marker may attach to: the layer's, then each ancestor's up to the one under
+   * the page, each clipped by the clipping layers above it and left out where clipped away.
+   */
+  targets: readonly Rect[]
+}
+
+const SEVERITY_RANK: Record<DesignIssueSeverity, number> = { error: 3, warning: 2, info: 1 }
+
+export function issueSeverityRank(severity: DesignIssueSeverity): number {
+  return SEVERITY_RANK[severity]
+}
+
+export function issueMarkerLabel(count: number): string {
+  if (count <= 1) return '!'
+  return count > ISSUE_MARKER_MAX_COUNT ? `${ISSUE_MARKER_MAX_COUNT}+` : String(count)
+}
+
+export function issueMarkerWidth(count: number, measureText: (text: string) => number): number {
+  const textWidth = measureText(issueMarkerLabel(count))
+  return Math.max(ISSUE_MARKER_HEIGHT, Math.ceil(textWidth + ISSUE_MARKER_PADDING_X * 2))
+}
+
+function intersect(a: Rect, b: Rect): Rect | null {
+  const x = Math.max(a.x, b.x)
+  const y = Math.max(a.y, b.y)
+  const right = Math.min(a.x + a.width, b.x + b.width)
+  const bottom = Math.min(a.y + a.height, b.y + b.height)
+  if (right < x || bottom < y) return null
+  return { x, y, width: right - x, height: bottom - y }
+}
+
+/** The axis-aligned world box of a layer's rotated rectangle. */
+function worldBounds(node: SceneNode, geometry: SceneGeometry): Rect {
+  const points = Matrix.mapPoints(geometry.worldMatrix(node), [
+    0,
+    0,
+    node.width,
+    0,
+    node.width,
+    node.height,
+    0,
+    node.height
+  ])
+  let minX = Infinity
+  let minY = Infinity
+  let maxX = -Infinity
+  let maxY = -Infinity
+  for (let index = 0; index < points.length; index += 2) {
+    minX = Math.min(minX, points[index])
+    maxX = Math.max(maxX, points[index])
+    minY = Math.min(minY, points[index + 1])
+    maxY = Math.max(maxY, points[index + 1])
+  }
+  return { x: minX, y: minY, width: maxX - minX, height: maxY - minY }
+}
+
+/** A world box on the screen; the viewport pans and scales, so boxes stay axis-aligned. */
+function toScreen(rect: Rect, view: ViewportTransform): Rect {
+  return {
+    x: worldXToScreen(view, rect.x),
+    y: worldYToScreen(view, rect.y),
+    width: rect.width * view.zoom,
+    height: rect.height * view.zoom
+  }
+}
+
+/**
+ * The world boxes a layer's marker may attach to, or null when the layer should not be marked.
+ *
+ * Hidden and clipped-out layers stay listed in the panel but get no marker, so a marker never
+ * points at empty canvas. Clipping is by axis-aligned boxes, which the viewport keeps, so what
+ * shows is settled here once and projected per frame.
+ */
+function stageTargets(
+  graph: SceneGraph,
+  node: SceneNode,
+  pageId: string,
+  geometry: SceneGeometry
+): Rect[] | null {
+  const chain: SceneNode[] = []
+  let current: SceneNode | undefined = node
+  while (current) {
+    if (!current.visible) return null
+    chain.push(current)
+    if (current.parentId === pageId) break
+    current = current.parentId ? graph.getNode(current.parentId) : undefined
+  }
+  if (!current) return null
+
+  // Clip each layer's bounds by the clipping ancestors above it, walking top-down. A clipping
+  // layer that is entirely clipped away hides everything inside it.
+  const visible = Array.from<Rect | null>({ length: chain.length })
+  let clip: Rect | null = null
+  for (let index = chain.length - 1; index >= 0; index--) {
+    const layer = chain[index]
+    const bounds = worldBounds(layer, geometry)
+    const clipped: Rect | null = clip ? intersect(bounds, clip) : bounds
+    visible[index] = clipped
+    if (!clipsChildren(layer)) continue
+    if (!clipped) return null
+    clip = clipped
+  }
+  if (!visible[0]) return null
+  return visible.filter((bounds): bounds is Rect => bounds !== null)
+}
+
+/**
+ * Stages the markers' layers in world space: what each marker may attach to, with hidden,
+ * clipped-away, and suppressed layers left out. Pan and zoom change none of it, so a canvas keeps
+ * the stage until the document or the markers change.
+ */
+export function stageIssueMarkers(
+  graph: SceneGraph,
+  markers: readonly DesignIssueMarker[],
+  options: IssueMarkerStageOptions
+): StagedIssueMarker[] {
+  const { pageId, suppressedIds } = options
+  const geometry = createSceneGeometry(graph, options.preview)
+  const staged: StagedIssueMarker[] = []
+  for (const marker of markers) {
+    if (marker.count <= 0 || suppressedIds?.has(marker.nodeId)) continue
+    const node = graph.getNode(marker.nodeId)
+    if (!node) continue
+    const targets = stageTargets(graph, node, pageId, geometry)
+    if (targets) staged.push({ marker, targets })
+  }
+  return staged
+}
+
+/**
+ * The screen rectangle a staged marker attaches to. A layer too small to point at on screen
+ * hands its marker to the nearest ancestor that is large enough, so zoomed-out designs gather
+ * markers at frame corners instead of scattering them over detail that cannot be seen.
+ */
+function markerTarget(targets: readonly Rect[], view: ViewportTransform): Rect {
+  const last = targets[targets.length - 1]
+  for (const bounds of targets) {
+    if (Math.max(bounds.width, bounds.height) * view.zoom >= ISSUE_MARKER_MIN_TARGET)
+      return toScreen(bounds, view)
+  }
+  return toScreen(last, view)
+}
+
+interface Candidate {
+  marker: DesignIssueMarker
+  anchor: Vector
+}
+
+/**
+ * The marker for issues merged into one, led by the first: its layers in order, its severity, and
+ * the issues they all count.
+ */
+function mergedMarker(
+  items: readonly { marker: DesignIssueMarker }[],
+  key: string,
+  rect: Rect,
+  anchor: Vector
+): PlacedIssueMarker {
+  return {
+    key,
+    nodeIds: items.map((item) => item.marker.nodeId),
+    severity: items[0].marker.severity,
+    count: sumBy(items, (item) => item.marker.count),
+    rect,
+    anchor
+  }
+}
+
+interface EdgeCandidate {
+  marker: DesignIssueMarker
+  /** Where the ray toward the layer leaves the viewport. */
+  point: Vector
+  direction: Vector
+  distance: number
+}
+
+/**
+ * Where the ray from the viewport center toward a layer leaves `area`, so an off-screen issue
+ * is pinned in its own direction, on a side or in a corner.
+ */
+function edgePoint(
+  area: Rect,
+  target: Vector
+): { point: Vector; direction: Vector; distance: number } {
+  const center = { x: area.x + area.width / 2, y: area.y + area.height / 2 }
+  const dx = target.x - center.x
+  const dy = target.y - center.y
+  const distance = Math.hypot(dx, dy) || 1
+  const direction = { x: dx / distance, y: dy / distance }
+  const tx = direction.x === 0 ? Infinity : area.width / 2 / Math.abs(direction.x)
+  const ty = direction.y === 0 ? Infinity : area.height / 2 / Math.abs(direction.y)
+  const t = Math.min(tx, ty)
+  return {
+    point: { x: center.x + direction.x * t, y: center.y + direction.y * t },
+    direction,
+    distance
+  }
+}
+
+/** Slides a pin along the edge it sits on until it no longer covers floating UI. */
+function avoidObstacles(rect: Rect, area: Rect, obstacles: readonly Rect[]): Rect {
+  let placed = rect
+  for (const obstacle of obstacles) {
+    if (!marksOverlap(placed, obstacle, ISSUE_MARKER_GAP)) continue
+    const onHorizontalEdge =
+      placed.y <= area.y + 1 || placed.y + placed.height >= area.y + area.height - 1
+    if (onHorizontalEdge) {
+      const left = obstacle.x - ISSUE_MARKER_GAP - placed.width
+      const right = obstacle.x + obstacle.width + ISSUE_MARKER_GAP
+      const x =
+        Math.abs(left - placed.x) <= Math.abs(right - placed.x) && left >= area.x
+          ? left
+          : Math.min(right, area.x + area.width - placed.width)
+      placed = { ...placed, x }
+    } else {
+      const above = obstacle.y - ISSUE_MARKER_GAP - placed.height
+      const below = obstacle.y + obstacle.height + ISSUE_MARKER_GAP
+      const y =
+        Math.abs(above - placed.y) <= Math.abs(below - placed.y) && above >= area.y
+          ? above
+          : Math.min(below, area.y + area.height - placed.height)
+      placed = { ...placed, y }
+    }
+  }
+  return placed
+}
+
+/**
+ * Pins issues outside the viewport to its edge, in their direction. Pins near each other along
+ * the edge merge, keeping the most severe; each lists its layers most severe first, then
+ * nearest, so following a pin reaches the closest issue of the severity it shows.
+ */
+function layoutEdgePins(
+  candidates: EdgeCandidate[],
+  area: Rect,
+  obstacles: readonly Rect[],
+  measureText: (text: string) => number
+): PlacedIssueMarker[] {
+  candidates.sort(
+    (a, b) =>
+      SEVERITY_RANK[b.marker.severity] - SEVERITY_RANK[a.marker.severity] || a.distance - b.distance
+  )
+  const rectAt = (point: Vector, count: number): Rect => {
+    const width = issueMarkerWidth(count, measureText)
+    const x = Math.min(Math.max(point.x - width / 2, area.x), area.x + area.width - width)
+    const y = Math.min(
+      Math.max(point.y - ISSUE_MARKER_HEIGHT / 2, area.y),
+      area.y + area.height - ISSUE_MARKER_HEIGHT
+    )
+    const rect = { x: Math.round(x), y: Math.round(y), width, height: ISSUE_MARKER_HEIGHT }
+    return avoidObstacles(rect, area, obstacles)
+  }
+  const groups = groupMarks(
+    candidates.map((candidate) => ({
+      item: candidate,
+      rect: rectAt(candidate.point, candidate.marker.count)
+    })),
+    ISSUE_EDGE_MERGE_GAP,
+    (items) =>
+      rectAt(
+        items[0].point,
+        sumBy(items, (item) => item.marker.count)
+      )
+  )
+  // Candidates arrive most severe first, then nearest, so each pin lists its layers that way.
+  return groups.map(({ items, rect }) => ({
+    ...mergedMarker(items, `edge:${items[0].marker.nodeId}`, rect, items[0].point),
+    direction: items[0].direction
+  }))
+}
+
+/**
+ * Places one marker at the outer top-right corner of each staged layer, then merges markers that
+ * would overlap. Merging keeps the position of the most severe marker, so the canvas never shows
+ * a warning on top of an error it hides.
+ */
+export function placeIssueMarkers(
+  staged: readonly StagedIssueMarker[],
+  options: IssueMarkerPlacementOptions
+): PlacedIssueMarker[] {
+  const { view, measureText } = options
+  const viewport: Rect = {
+    x: view.insetLeft,
+    y: view.insetTop,
+    width: Math.max(0, view.width - view.insetLeft),
+    height: Math.max(0, view.height - view.insetTop)
+  }
+
+  const candidates: Candidate[] = []
+  const edgeCandidates: EdgeCandidate[] = []
+  // Edge pins keep room between themselves and the edge for the chevron they point with.
+  const edgeInset = ISSUE_MARKER_VIEWPORT_INSET + ISSUE_EDGE_ARROW + ISSUE_MARKER_RING_WIDTH * 2
+  const edgeArea: Rect = {
+    x: viewport.x + edgeInset,
+    y: viewport.y + edgeInset,
+    width: Math.max(0, viewport.width - edgeInset * 2),
+    height: Math.max(0, viewport.height - edgeInset * 2)
+  }
+  for (const { marker, targets } of staged) {
+    const bounds = markerTarget(targets, view)
+    if (intersect(bounds, viewport)) {
+      candidates.push({ marker, anchor: { x: bounds.x + bounds.width, y: bounds.y } })
+      continue
+    }
+    const center = { x: bounds.x + bounds.width / 2, y: bounds.y + bounds.height / 2 }
+    edgeCandidates.push({ marker, ...edgePoint(edgeArea, center) })
+  }
+
+  candidates.sort(
+    (a, b) =>
+      SEVERITY_RANK[b.marker.severity] - SEVERITY_RANK[a.marker.severity] ||
+      a.anchor.y - b.anchor.y ||
+      b.anchor.x - a.anchor.x
+  )
+
+  const minX = viewport.x + ISSUE_MARKER_VIEWPORT_INSET
+  const minY = viewport.y + ISSUE_MARKER_VIEWPORT_INSET
+  const maxRight = view.width - ISSUE_MARKER_VIEWPORT_INSET
+  const maxBottom = view.height - ISSUE_MARKER_VIEWPORT_INSET
+
+  function rectAt(anchor: Vector, count: number): Rect {
+    const width = issueMarkerWidth(count, measureText)
+    const x = Math.min(Math.max(anchor.x + ISSUE_MARKER_OFFSET, minX), maxRight - width)
+    const y = Math.min(
+      Math.max(anchor.y - ISSUE_MARKER_OFFSET - ISSUE_MARKER_HEIGHT, minY),
+      maxBottom - ISSUE_MARKER_HEIGHT
+    )
+    return { x: Math.round(x), y: Math.round(y), width, height: ISSUE_MARKER_HEIGHT }
+  }
+
+  const placed = groupMarks(
+    candidates.map((candidate) => ({
+      item: candidate,
+      rect: rectAt(candidate.anchor, candidate.marker.count)
+    })),
+    ISSUE_MARKER_GAP,
+    (items) =>
+      rectAt(
+        items[0].anchor,
+        sumBy(items, (item) => item.marker.count)
+      )
+  ).map(({ items, rect }) => mergedMarker(items, items[0].marker.nodeId, rect, items[0].anchor))
+  const edgePins = layoutEdgePins(edgeCandidates, edgeArea, options.obstacles ?? [], measureText)
+  return [...placed, ...edgePins]
+}
+
+/** Stages and places markers in one go, for a layout that is not kept between frames. */
+export function layoutIssueMarkers(
+  graph: SceneGraph,
+  markers: readonly DesignIssueMarker[],
+  options: IssueMarkerLayoutOptions
+): PlacedIssueMarker[] {
+  return placeIssueMarkers(stageIssueMarkers(graph, markers, options), options)
+}
+
+/** Topmost marker under a screen point; markers placed first are drawn on top. */
+export function hitTestIssueMarkers(
+  placed: readonly PlacedIssueMarker[],
+  x: number,
+  y: number
+): PlacedIssueMarker | null {
+  for (const marker of placed) {
+    const { rect } = marker
+    if (x >= rect.x && x <= rect.x + rect.width && y >= rect.y && y <= rect.y + rect.height) {
+      return marker
+    }
+  }
+  return null
+}

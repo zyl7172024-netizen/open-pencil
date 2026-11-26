@@ -1,0 +1,184 @@
+import { describe, expect, test } from 'bun:test'
+
+import { contractClient } from '#cloud-tests/helpers/contract'
+import { createCloudAPIRouter, type CloudActor, type CloudAPIEnvironment } from '#cloud/server'
+import { Hono } from 'hono'
+
+const actor: CloudActor = {
+  userId: 'alice',
+  email: 'alice@example.com',
+  name: 'Alice'
+}
+
+async function notUsed(): Promise<never> {
+  throw new Error('not used')
+}
+
+function services() {
+  return {
+    collaboration: {
+      issueUserTicket: async () => {
+        throw new Error('not used')
+      },
+      issueShareTicket: async () => {
+        throw new Error('not used')
+      }
+    },
+    documents: {
+      cleanupExpiredUploads: async () => 0,
+      list: async () => [],
+      listShared: async () => [],
+      trash: { list: async () => [], restore: notUsed, purge: notUsed },
+      usage: async () => ({ bytesUsed: 0, objectCount: 0, documentCount: 0 }),
+      access: async () => ({
+        permission: 'edit' as const,
+        canManageSharing: true,
+        sources: ['owner' as const]
+      }),
+      downloadShared: async () => {
+        throw new Error('not used')
+      },
+      downloadRetained: async () => {
+        throw new Error('not used')
+      },
+      download: async () => {
+        throw new Error('not used')
+      },
+      update: async () => undefined,
+      remove: async () => undefined,
+      create: async () => {
+        throw new Error('not used')
+      },
+      createUpload: async () => {
+        throw new Error('not used')
+      },
+      requestImageUploads: async () => {
+        throw new Error('not used')
+      },
+      commitImageUploads: async () => {
+        throw new Error('not used')
+      },
+      imageLinks: async () => {
+        throw new Error('not used')
+      },
+      imageLinksShared: async () => {
+        throw new Error('not used')
+      },
+      commitUpload: async () => {
+        throw new Error('not used')
+      }
+    },
+    versions: {
+      list: notUsed,
+      save: notUsed,
+      update: notUsed,
+      download: notUsed,
+      namedSharedIn: notUsed,
+      downloadNamedShared: notUsed,
+      restore: notUsed,
+      duplicate: notUsed
+    },
+    comments: {
+      forMember: notUsed,
+      forShare: notUsed,
+      importThreads: notUsed,
+      markRead: notUsed,
+      people: notUsed,
+      notificationSettings: notUsed,
+      setNotificationSettings: notUsed,
+      list: notUsed,
+      get: notUsed,
+      createThread: notUsed,
+      updateThread: notUsed,
+      deleteThread: notUsed,
+      reply: notUsed,
+      updateComment: notUsed,
+      deleteComment: notUsed
+    },
+    community: {
+      enabled: false,
+      list: notUsed,
+      download: notUsed,
+      imageLinks: notUsed,
+      object: notUsed,
+      thumbnail: notUsed
+    },
+    reports: { file: notUsed },
+    sharing: {
+      userProfile: async () => null,
+      listShares: async () => [],
+      createShare: async () => {
+        throw new Error('not used')
+      },
+      updateShare: async () => {
+        throw new Error('not used')
+      },
+      rotateShare: async () => {
+        throw new Error('not used')
+      },
+      revokeShare: async () => undefined,
+      resolveShare: async () => {
+        throw new Error('not used')
+      },
+      listGrants: async () => [],
+      putGrant: async () => {
+        throw new Error('not used')
+      },
+      revokeGrant: async () => undefined,
+      listInvitations: async () => [],
+      createInvitation: async () => {
+        throw new Error('not used')
+      },
+      createInvitationContinuation: async () => {
+        throw new Error('not used')
+      },
+      consumeInvitationContinuation: async () => {
+        throw new Error('not used')
+      },
+      previewInvitation: async () => {
+        throw new Error('not used')
+      },
+      acceptInvitation: async () => {
+        throw new Error('not used')
+      },
+      revokeInvitation: async () => undefined
+    },
+    workspaces: {
+      list: async () => [],
+      get: async () => undefined,
+      create: async () => {
+        throw new Error('not used')
+      },
+      ensurePersonal: async () => undefined
+    },
+    workspaceMembers: {
+      rename: notUsed,
+      list: notUsed,
+      invite: notUsed,
+      revokeInvitation: notUsed,
+      resendInvitation: notUsed,
+      updateRole: notUsed,
+      remove: notUsed,
+      delete: notUsed,
+      preview: async () => null,
+      accept: async () => null
+    }
+  }
+}
+
+describe('createCloudAPIRouter', () => {
+  test('exposes API-relative routes independently from deployment assembly', async () => {
+    const router = createCloudAPIRouter(services())
+    const app = new Hono<CloudAPIEnvironment>()
+      .use('*', async (context, next) => {
+        context.set('actor', actor)
+        await next()
+      })
+      .route('/', router)
+
+    // Mounted at the root, so the contract's paths start there too.
+    const api = contractClient(app, {}, 'http://localhost')
+    expect(await api.session.session()).toEqual({ user: { ...actor, scopes: undefined } })
+    expect(await api.workspaces.list()).toEqual({ workspaces: [] })
+  })
+})

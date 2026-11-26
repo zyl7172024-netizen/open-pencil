@@ -1,0 +1,17 @@
+import type { RoomStatus } from '@open-pencil/collab'
+import type { MessagesOf } from '@open-pencil/vue/i18n'
+
+type CollaborationMessages = MessagesOf<'collaboration'>
+
+/** A room's state in words: "Live · 3 here", "Only you here — …", joining, waiting, or offline. */
+export function roomStatusText(
+  messages: CollaborationMessages,
+  status: RoomStatus,
+  peerCount: number
+): string {
+  if (status === 'live') return messages.statusLive({ count: peerCount + 1 })
+  if (status === 'alone') return messages.statusAlone
+  if (status === 'waiting') return messages.waitingTitle
+  if (status === 'unreachable') return messages.unreachableTitle
+  return messages.joiningTitle
+}

@@ -1,0 +1,82 @@
+import { createCloudErrorReporter } from '#cloud/runtime/posthog/errors'
+import {
+  createLoggingErrorReporter,
+  loadServicesSigningKey,
+  parseCloudDeploymentTOML,
+  type ServicesSigningKey,
+  type CloudEnvironment,
+  type CloudErrorReporter,
+  type CloudServerConfig
+} from '#cloud/server'
+
+import { writeWorkersLogLine } from './logging'
+import type { CollaborationRelayRPC } from './relay'
+
+/** The bindings `deploy/cloudflare/wrangler.jsonc` gives the Worker and its relay objects. */
+export type CloudflareCloudBindings = {
+  /** PostgreSQL, through Hyperdrive. */
+  HYPERDRIVE: Hyperdrive
+  /** The collaboration relay, one object per document. */
+  RELAY: DurableObjectNamespace<CollaborationRelayRPC>
+  /** The built site, `dist-cloud`: the editor and the portal. */
+  ASSETS: Fetcher
+  /** Required by `[email] transport = "cloudflare"`. */
+  EMAIL?: SendEmail
+}
+
+/** The bindings, plus the variables and secrets the deployment TOML names. */
+export type CloudflareCloudEnvironment = CloudflareCloudBindings & Record<string, unknown>
+
+export type PreparedCloudflareCloud = {
+  config: CloudServerConfig
+  servicesSigningKey: ServicesSigningKey | undefined
+  /** Logs errors, and sends them to error tracking when the deployment configures it. */
+  reportError: CloudErrorReporter
+}
+
+/** The Worker's string variables and secrets, with `DATABASE_URL` from Hyperdrive. */
+function configEnvironment(env: CloudflareCloudEnvironment): CloudEnvironment {
+  return {
+    ...Object.fromEntries(
+      Object.entries(env).filter((entry): entry is [string, string] => typeof entry[1] === 'string')
+    ),
+    DATABASE_URL: env.HYPERDRIVE.connectionString
+  }
+}
+
+/**
+ * Reads the deployment TOML once per isolate: its config and services signing key stay the same for the
+ * Worker's lifetime. A failure is not kept, so the next request tries again.
+ */
+/** Logs errors from before a config parsed, which has no error tracking to send them to. */
+const logOnly = createLoggingErrorReporter(writeWorkersLogLine)
+
+export function cloudflareCloudSetup(source: string) {
+  let prepared: Promise<PreparedCloudflareCloud> | null = null
+  /** Set once an attempt's config parses, so its later setup steps that fail can be reported. */
+  let reportError: CloudErrorReporter | undefined
+  const prepare = (env: CloudflareCloudEnvironment): Promise<PreparedCloudflareCloud> => {
+    prepared ??= (async () => {
+      // An attempt whose config fails to parse has no project to report to, not an earlier one's.
+      reportError = undefined
+      const config = parseCloudDeploymentTOML(source, configEnvironment(env))
+      reportError = createLoggingErrorReporter(
+        writeWorkersLogLine,
+        createCloudErrorReporter(config, 'cloudflare')
+      )
+      return { config, servicesSigningKey: await loadServicesSigningKey(config), reportError }
+    })().catch((error: unknown) => {
+      prepared = null
+      throw error
+    })
+    return prepared
+  }
+  return {
+    prepare,
+    /**
+     * The reporter of the latest attempt once its config parsed, which also sends to error tracking
+     * when the config has it; before that, one that only logs.
+     */
+    reporter: () => reportError ?? logOnly
+  }
+}

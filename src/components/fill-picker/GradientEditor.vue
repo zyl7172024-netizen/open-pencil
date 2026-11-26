@@ -1,0 +1,155 @@
+<script setup lang="ts">
+import { tv } from 'tailwind-variants'
+
+import type { Fill } from '@open-pencil/scene-graph'
+import { useColorCSS } from '@open-pencil/vue/controls/color-model'
+import { useMessages } from '@open-pencil/vue/i18n'
+import {
+  GradientEditorRoot,
+  GradientEditorBar,
+  GradientEditorStop
+} from '@open-pencil/vue/primitives/GradientEditor'
+import { inputValue } from '@open-pencil/vue/shared/dom-events'
+
+import ColorPicker from '@/components/ColorPicker/ColorPicker.vue'
+import NumberField from '@/components/inputs/NumberField.vue'
+import PaintField from '@/components/inputs/PaintField.vue'
+import IconButton from '@/components/ui/button/IconButton.vue'
+import AppSelect from '@/components/ui/select/AppSelect.vue'
+import fillPickerTheme from '@/theme/fill-picker'
+
+const { fill } = defineProps<{ fill: Fill }>()
+const emit = defineEmits<{ update: [fill: Fill] }>()
+const activeStop = defineModel<number>('activeStop')
+const panels = useMessages('panels')
+const editor = useMessages('editor')
+const fillPicker = tv(fillPickerTheme)
+const colorCSS = useColorCSS()
+
+function barStopClass(active: boolean, dragging: boolean) {
+  return fillPicker({ active, dragging }).barStop()
+}
+
+function listStopClass(active: boolean) {
+  return fillPicker({ active }).listStop()
+}
+</script>
+
+<template>
+  <GradientEditorRoot
+    v-model:active-stop-index="activeStop"
+    :fill="fill"
+    @update="emit('update', $event)"
+    v-slot="root"
+  >
+    <div>
+      <div class="mb-2 w-28">
+        <AppSelect
+          :model-value="root.subtype"
+          :options="root.subtypes"
+          @update:model-value="root.actions.setSubtype($event)"
+        />
+      </div>
+
+      <GradientEditorBar
+        dir="ltr"
+        :stops="root.stops"
+        :active-stop-index="root.activeStopIndex"
+        :bar-background="root.barBackground"
+        :ui="{ bar: 'relative mb-2 h-6 rounded' }"
+        data-test-id="fill-picker-gradient-bar"
+        @select-stop="root.actions.selectStop"
+        @drag-stop="root.actions.dragStop"
+        v-slot="bar"
+      >
+        <GradientEditorStop
+          v-for="(stop, idx) in bar.stops"
+          :key="idx"
+          :stop="stop"
+          :index="idx"
+          :active="idx === bar.activeStopIndex"
+          :dragging="idx === bar.draggingIndex"
+          :removable="bar.stops.length > 2"
+          :class="barStopClass(idx === bar.activeStopIndex, idx === bar.draggingIndex)"
+          :style="{ left: `${stop.position * 100}%`, background: colorCSS(stop.color) }"
+          @select="root.actions.selectStop"
+          @update-position="root.actions.updateStopPosition"
+          @remove="root.actions.removeStop"
+          @pointerdown.stop="bar.actions.stopPointerDown(idx, $event)"
+        />
+      </GradientEditorBar>
+
+      <div class="mb-2">
+        <div class="mb-1 flex items-center justify-between">
+          <span class="text-2xs text-muted">{{ panels.stops }}</span>
+          <IconButton
+            :label="panels.addStop"
+            data-test-id="fill-picker-add-stop"
+            @click="root.actions.addStop"
+          >
+            <icon-lucide-plus class="size-3" />
+          </IconButton>
+        </div>
+        <GradientEditorStop
+          v-for="(stop, idx) in root.stops"
+          dir="ltr"
+          :key="idx"
+          :stop="stop"
+          :index="idx"
+          :active="idx === root.activeStopIndex"
+          :removable="root.stops.length > 2"
+          :interactive="false"
+          :class="listStopClass(idx === root.activeStopIndex)"
+          @select="root.actions.selectStop"
+          @update-position="root.actions.updateStopPosition"
+          @update-color="root.actions.updateStopColor"
+          @update-opacity="root.actions.updateStopOpacity"
+          @remove="root.actions.removeStop"
+          v-slot="s"
+        >
+          <NumberField
+            class="w-14 flex-none"
+            :ui="{ leading: 'hidden', field: 'ps-1.5', display: 'ps-1.5' }"
+            suffix="%"
+            :model-value="s.positionPercent"
+            :min="0"
+            :max="100"
+            @update:model-value="s.actions.updatePosition(Number($event))"
+            @click.stop
+          />
+          <PaintField
+            :opacity="s.opacityPercent / 100"
+            :opacity-label="panels.opacity"
+            @update:opacity="s.actions.updateOpacity($event * 100)"
+            @click.stop
+          >
+            <!-- As in Figma, a stop's colour opens a picker of its own beside this one. -->
+            <template #preview>
+              <ColorPicker
+                :color="stop.color"
+                @open-change="$event && s.actions.select()"
+                @update="root.actions.updateActiveColor"
+              />
+            </template>
+            <template #value>
+              <input
+                class="min-w-0 flex-1 border-none bg-transparent font-mono text-2xs text-surface outline-none"
+                :value="s.hex"
+                maxlength="6"
+                @change="s.actions.updateColor(inputValue($event))"
+                @click.stop
+              />
+            </template>
+          </PaintField>
+          <IconButton
+            v-if="root.stops.length > 2"
+            :label="editor.removeGradientStop"
+            @click.stop="s.actions.remove"
+          >
+            <icon-lucide-minus class="size-3" />
+          </IconButton>
+        </GradientEditorStop>
+      </div>
+    </div>
+  </GradientEditorRoot>
+</template>

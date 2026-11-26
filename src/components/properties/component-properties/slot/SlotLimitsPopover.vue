@@ -1,0 +1,97 @@
+<script setup lang="ts">
+import { PopoverClose, PopoverContent, PopoverPortal, PopoverTrigger } from 'reka-ui'
+import { computed } from 'vue'
+
+import { focusStyles } from '@open-pencil/theme'
+import type { SlotLimit } from '@open-pencil/vue/controls/slots'
+import { useMessages } from '@open-pencil/vue/i18n'
+import { useRetainedPopup } from '@open-pencil/vue/lifecycle/retention'
+
+import AppButton from '@/components/ui/button/AppButton.vue'
+import { useInlineSide } from '@/components/ui/direction/inline-side'
+import SeverityIcon from '@/components/ui/feedback/SeverityIcon.vue'
+import AppPopoverRoot from '@/components/ui/overlay/AppPopoverRoot.vue'
+import { usePopoverUI } from '@/components/ui/overlay/popover'
+
+const startSide = useInlineSide('start')
+const { limits } = defineProps<{ limits: SlotLimit[] }>()
+const emit = defineEmits<{ selectLayers: [] }>()
+const panels = useMessages('panels')
+const common = useMessages('common')
+const { open: popupOpen, portalActive } = useRetainedPopup()
+const issues = computed(() => limits.filter((limit) => !limit.met).length)
+const styles = usePopoverUI({
+  content: 'w-64 max-w-[calc(100vw-1rem)]',
+  header: 'flex items-center gap-1.5 border-b border-border px-3 py-2',
+  body: 'flex flex-col gap-2.5 p-3'
+})
+
+function label(limit: SlotLimit): string {
+  if (limit.kind === 'minimum') return panels.value.slotMinimumLayers(limit.count)
+  if (limit.kind === 'maximum') return panels.value.slotMaximumLayers(limit.count)
+  return panels.value.slotPreferredOnly
+}
+</script>
+
+<template>
+  <AppPopoverRoot v-model:open="popupOpen">
+    <PopoverTrigger
+      :data-issues="issues > 0 || undefined"
+      data-property="slot-limits"
+      :class="[
+        'flex h-5 shrink-0 cursor-pointer items-center gap-1 rounded bg-panel-field px-1.5 text-3xs text-muted hover:bg-hover hover:text-surface data-issues:bg-warning/15 data-issues:text-warning',
+        focusStyles.ring
+      ]"
+    >
+      <SeverityIcon v-if="issues" severity="warning" />
+      <icon-lucide-check v-else class="size-3 text-success" />
+      {{ panels.slotLimitCount(limits.length) }}
+    </PopoverTrigger>
+    <PopoverPortal v-if="portalActive">
+      <PopoverContent
+        :side="startSide"
+        align="start"
+        :side-offset="8"
+        :aria-label="panels.slotLimits"
+        :class="styles.content"
+      >
+        <div :class="styles.header">
+          <h3 class="text-xs font-semibold text-surface">{{ panels.slotLimits }}</h3>
+          <span v-if="issues" class="text-2xs text-muted">
+            {{ panels.slotLimitIssueCount(issues) }}
+          </span>
+          <PopoverClose as-child>
+            <AppButton :aria-label="common.close" class="ms-auto">
+              <icon-lucide-x class="size-3.5" />
+            </AppButton>
+          </PopoverClose>
+        </div>
+        <ul :class="styles.body">
+          <li
+            v-for="limit in limits"
+            :key="limit.kind"
+            class="grid grid-cols-[0.875rem_minmax(0,1fr)] gap-x-2 text-xs text-surface"
+          >
+            <icon-lucide-check v-if="limit.met" class="mt-px size-3.5 text-success" />
+            <SeverityIcon v-else severity="warning" class="mt-px size-3.5" />
+            <span>{{ label(limit) }}</span>
+            <template v-if="limit.kind === 'preferred' && !limit.met">
+              <span />
+              <span class="text-2xs text-muted">
+                {{ panels.slotNonPreferredFound(limit.offending) }}
+              </span>
+              <span />
+              <AppButton
+                variant="soft"
+                class="mt-1 justify-self-start"
+                @click="emit('selectLayers')"
+              >
+                {{ panels.selectLayers }}
+              </AppButton>
+            </template>
+          </li>
+        </ul>
+      </PopoverContent>
+    </PopoverPortal>
+  </AppPopoverRoot>
+</template>

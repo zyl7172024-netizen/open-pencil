@@ -1,0 +1,243 @@
+<script setup lang="ts">
+import { omit } from 'es-toolkit'
+import { PopoverContent, PopoverPortal, PopoverTrigger } from 'reka-ui'
+import { tv } from 'tailwind-variants'
+import { computed } from 'vue'
+
+import type { Fill } from '@open-pencil/scene-graph'
+import type { ShaderPaint, ShaderPreset } from '@open-pencil/scene-graph/shaders'
+import { applySolidFillColor, type OkHCLControls } from '@open-pencil/vue/controls/color-model'
+import { DEFAULT_SHADER_PRESET } from '@open-pencil/vue/controls/shader'
+import { useMessages } from '@open-pencil/vue/i18n'
+import { useRetainedPopup } from '@open-pencil/vue/lifecycle/retention'
+import {
+  pickerOutsideHandlers,
+  usePickerGesture,
+  type PickerKeepOpen
+} from '@open-pencil/vue/primitives/ColorPicker'
+import { FillRoot } from '@open-pencil/vue/primitives/Fill'
+
+import ColorPickerPanel from '@/components/color-picker-panel/ColorPickerPanel.vue'
+import { useEyedropperKeepOpen } from '@/components/color-picker-panel/eyedropper'
+import GradientEditor from '@/components/fill-picker/GradientEditor.vue'
+import ImageFillPicker from '@/components/fill-picker/ImageFillPicker.vue'
+import ShaderFillPicker from '@/components/fill-picker/shader/ShaderFillPicker.vue'
+import { useInlineSide } from '@/components/ui/direction/inline-side'
+import AppPopoverRoot from '@/components/ui/overlay/AppPopoverRoot.vue'
+import { usePopoverUI } from '@/components/ui/overlay/popover'
+import Tip from '@/components/ui/overlay/Tip.vue'
+import FillSwatchTrigger from '@/components/ui/paint/FillSwatchTrigger.vue'
+import fillPickerTheme from '@/theme/fill-picker'
+
+import { useImageFill } from './useImageFill'
+
+const startSide = useInlineSide('start')
+const fillPicker = tv(fillPickerTheme)
+
+function tabClass(active: boolean) {
+  return fillPicker({ active }).tab()
+}
+
+const {
+  fill,
+  okhcl = null,
+  swatchBackground,
+  keepOpen,
+  shader = null,
+  layerSize = null
+} = defineProps<{
+  fill: Fill
+  /** The shader the paint draws, when it is a shader's frame; the picker then edits the shader. */
+  shader?: ShaderPaint | null
+  okhcl?: OkHCLControls | null
+  swatchBackground?: string
+  /** Names the trigger for a paint that is not a fill, such as a stroke. */
+  label?: string
+  /** Whether a press outside the picker should leave it open, such as on a gradient handle. */
+  keepOpen?: PickerKeepOpen
+  /** The one layer the paint is on, which an image crop starts by covering. */
+  layerSize?: { width: number; height: number } | null
+}>()
+/** An image fill's swatch shows its image, covering the swatch as Fill would. */
+const image = useImageFill(() => (fill.type === 'IMAGE' ? fill.imageHash : undefined))
+const imageBackground = computed(() =>
+  image.url.value ? `center / cover no-repeat url("${image.url.value}")` : undefined
+)
+const activeStop = defineModel<number>('activeStop')
+const emit = defineEmits<{
+  update: [fill: Fill]
+  updateShader: [preset: ShaderPreset]
+  openChange: [open: boolean]
+  /** Ends the edit made so far as one undo step: a press's release, or a change with none held. */
+  commit: []
+  /** Puts back what the press being held has changed, on Escape or when the picker is put away. */
+  cancel: []
+}>()
+const gesture = usePickerGesture({
+  open: () => popupOpen.value,
+  commit: () => emit('commit'),
+  cancel: () => emit('cancel')
+})
+const { open: popupOpen, portalActive } = useRetainedPopup(
+  undefined,
+  () => onOpenChange(false),
+  'picker'
+)
+
+/** A press still held when the picker closes is put back, whichever way it closes. */
+function onOpenChange(open: boolean) {
+  if (!open) gesture.abort()
+  emit('openChange', open)
+}
+
+/**
+ * A shader paint is an image paint of the shader's frame. Leaving it for another paint type drops
+ * the frame, or the paint would still name it, and a later Image tab would find the shader again.
+ */
+function update(next: Fill) {
+  const left = shader ? omit(next, ['imageHash']) : next
+  gesture.change(() => emit('update', left))
+}
+
+/** From a shader, which is already an image paint, the Image tab starts an empty image fill. */
+function toImage(toImageFill: () => void) {
+  if (shader) update(fill)
+  else toImageFill()
+}
+
+/** An image arrives once its file is read, a step of its own even if a press is held by then. */
+function updateImage(withImage: () => Fill) {
+  gesture.step(() => emit('update', withImage()))
+}
+
+function updateShader(preset: ShaderPreset) {
+  gesture.change(() => emit('updateShader', preset))
+}
+
+/** OkHCL changes skip `update`, so they are routed through the press too. */
+const pickerOkhcl = computed<OkHCLControls | null>(() =>
+  okhcl
+    ? {
+        ...okhcl,
+        updateOkHCL: (patch) => gesture.change(() => okhcl.updateOkHCL(patch))
+      }
+    : null
+)
+const cls = usePopoverUI({
+  content: 'max-h-(--reka-popover-content-available-height) w-60 overflow-y-auto p-0'
+})
+const panels = useMessages('panels')
+
+/** Dragging a gradient handle or sampling a color on the canvas leaves the picker open. */
+const keepPickerOpen = useEyedropperKeepOpen(() => keepOpen)
+const outside = pickerOutsideHandlers(() => keepPickerOpen)
+</script>
+
+<template>
+  <FillRoot :fill="fill" @update="update" v-slot="root">
+    <AppPopoverRoot v-model:open="popupOpen" overlay-kind="picker" @update:open="onOpenChange">
+      <PopoverTrigger as-child>
+        <FillSwatchTrigger
+          :fill="fill"
+          :label="label ?? panels.fill"
+          :background="swatchBackground ?? imageBackground"
+          data-test-id="fill-picker-swatch"
+        />
+      </PopoverTrigger>
+
+      <PopoverPortal v-if="portalActive">
+        <!-- Top-aligned, so switching paint types changes only its bottom, as in Figma; the
+             collision shift moves it only to stay in the window. -->
+        <PopoverContent
+          :class="cls.content"
+          :side-offset="4"
+          :side="startSide"
+          align="start"
+          data-picker-content
+          @pointer-down-outside="outside.onPointerDownOutside"
+          @focus-outside="outside.onFocusOutside"
+        >
+          <!-- As in Figma: the paint types, a divider, then the type's controls inset 16 px. -->
+          <div class="flex items-center gap-0.5 border-b border-border p-2">
+            <Tip :label="panels.solid">
+              <button
+                :data-active="root.category === 'SOLID' || undefined"
+                :class="tabClass(root.category === 'SOLID')"
+                :aria-label="panels.solid"
+                data-test-id="fill-picker-tab-solid"
+                @click="root.actions.toSolid"
+              >
+                <icon-lucide-square class="size-3.5" />
+              </button>
+            </Tip>
+            <Tip :label="panels.gradient">
+              <button
+                :data-active="root.category === 'GRADIENT' || undefined"
+                :class="tabClass(root.category === 'GRADIENT')"
+                :aria-label="panels.gradient"
+                data-test-id="fill-picker-tab-gradient"
+                @click="root.actions.toGradient"
+              >
+                <icon-lucide-opacity class="size-3.5" />
+              </button>
+            </Tip>
+            <Tip :label="panels.image">
+              <button
+                :data-active="(root.category === 'IMAGE' && !shader) || undefined"
+                :class="tabClass(root.category === 'IMAGE' && !shader)"
+                :aria-label="panels.image"
+                data-test-id="fill-picker-tab-image"
+                @click="toImage(root.actions.toImage)"
+              >
+                <icon-lucide-image class="size-3.5" />
+              </button>
+            </Tip>
+            <Tip :label="panels.shader">
+              <button
+                :data-active="shader !== null || undefined"
+                :class="tabClass(shader !== null)"
+                :aria-label="panels.shader"
+                data-test-id="fill-picker-tab-shader"
+                @click="shader || updateShader(DEFAULT_SHADER_PRESET)"
+              >
+                <icon-lucide-sparkles class="size-3.5" />
+              </button>
+            </Tip>
+          </div>
+
+          <div class="p-4">
+            <ColorPickerPanel
+              v-if="root.category === 'SOLID'"
+              :color="root.fill.color"
+              :okhcl="pickerOkhcl"
+              eyedropper
+              @update="update(applySolidFillColor(root.fill, $event))"
+            />
+
+            <GradientEditor
+              v-if="root.category === 'GRADIENT'"
+              v-model:active-stop="activeStop"
+              :fill="root.fill"
+              @update="update"
+            />
+
+            <ShaderFillPicker
+              v-if="shader"
+              :preset="shader.preset"
+              :preview="image.url.value"
+              @update="updateShader"
+            />
+
+            <ImageFillPicker
+              v-else-if="root.category === 'IMAGE'"
+              :fill="root.fill"
+              :layer-size="layerSize"
+              @update="update"
+              @image="updateImage"
+            />
+          </div>
+        </PopoverContent>
+      </PopoverPortal>
+    </AppPopoverRoot>
+  </FillRoot>
+</template>

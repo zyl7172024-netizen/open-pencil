@@ -1,0 +1,249 @@
+import { shallowReactive } from 'vue'
+
+import { createEditor } from '@open-pencil/core'
+import { BUILTIN_IO_FORMATS, IORegistry } from '@open-pencil/core/io'
+import { SceneGraph } from '@open-pencil/scene-graph'
+import { createDeferred } from '@open-pencil/std/async'
+import { errorMessage } from '@open-pencil/std/errors'
+import { createShaderRasterizer } from '@open-pencil/vue/canvas/surface'
+
+import { useCollabIdentity } from '@/app/collab/identity'
+import { recordPreparationOutcome } from '@/app/diagnostics'
+import {
+  getActiveEditorStore,
+  setActiveEditorStore,
+  useEditorStore
+} from '@/app/editor/active-store'
+import { resolveFigmaClipboardImages } from '@/app/editor/clipboard/figma-images'
+import { bindClipboardNotifications } from '@/app/editor/clipboard/notifications'
+import { loadFont } from '@/app/editor/fonts'
+import { appIcons } from '@/app/editor/icons/provider'
+import { createRecentPages } from '@/app/editor/pages/recent'
+import { createCanvasPaneRegistry } from '@/app/editor/panes/registry'
+import { createEditorPreparationController } from '@/app/editor/preparation/controller'
+import {
+  createEditorPreparationEvents,
+  type EditorPreparationEventName,
+  type EditorPreparationEvents
+} from '@/app/editor/preparation/events'
+import { pageProgressUnit } from '@/app/editor/preparation/types'
+import {
+  createEditorComputedRefs,
+  createEditorStoreModules,
+  defineEditorStoreAccessors
+} from '@/app/editor/session/modules'
+import { scopedStoreFactory } from '@/app/editor/session/scope'
+import {
+  createInitialAppEditorState,
+  type AppEditorState,
+  type AppSwitchPageOptions
+} from '@/app/editor/session/types'
+import { notificationMessages } from '@/app/i18n/notifications'
+import { toast } from '@/app/shell/ui'
+import { IS_TAURI } from '@/constants'
+
+export { EDITOR_TOOLS as TOOLS, TOOL_SHORTCUTS } from '@open-pencil/core'
+export type { EditorToolDef as ToolDef, Tool } from '@open-pencil/core'
+
+function buildEditorStore(initialGraph?: SceneGraph) {
+  const graph = initialGraph ?? new SceneGraph()
+
+  const state = shallowReactive<AppEditorState>(createInitialAppEditorState(graph.getPages()[0].id))
+
+  const editor = createEditor({
+    graph,
+    state,
+    loadFont,
+    icons: appIcons,
+    shaderRasterizer: createShaderRasterizer(),
+    resolveFigmaClipboardImages: IS_TAURI ? resolveFigmaClipboardImages : undefined,
+    skipInitialGraphSetup: !!initialGraph,
+    getUserName: () => useCollabIdentity().name.value
+  })
+  const canvasReadiness = createDeferred<undefined>()
+  const io = new IORegistry(BUILTIN_IO_FORMATS)
+  bindClipboardNotifications(editor)
+
+  if (initialGraph) {
+    editor.subscribeToGraph()
+  }
+
+  const { selectedNodes, selectedNode, layerTree, disposeSelection } = createEditorComputedRefs(
+    editor,
+    state
+  )
+  // Mirror the document color space into app state so UI can react to it.
+  const syncDocumentColorSpace = () => {
+    state.documentColorSpace = editor.graph.documentColorSpace
+  }
+  syncDocumentColorSpace()
+  const stopColorSpaceSync = editor.onEditorEvent(
+    'document:color-space-changed',
+    syncDocumentColorSpace
+  )
+  editor.onEditorEvent('graph:replaced', syncDocumentColorSpace)
+  const recentPages = createRecentPages(editor)
+
+  const preparationEvents = createEditorPreparationEvents()
+  const preparationLifecycle = new Map<
+    number,
+    {
+      kind: NonNullable<AppEditorState['preparation']>['kind']
+      phase: NonNullable<AppEditorState['preparation']>['phase']
+      startedAt: number
+    }
+  >()
+  preparationEvents.on('preparation:started', (preparation) => {
+    preparationLifecycle.set(preparation.id, {
+      kind: preparation.kind,
+      phase: preparation.phase,
+      startedAt: preparation.startedAt
+    })
+  })
+  preparationEvents.on('preparation:updated', (preparation) => {
+    const lifecycle = preparationLifecycle.get(preparation.id)
+    if (lifecycle) lifecycle.phase = preparation.phase
+  })
+  preparationEvents.on('preparation:finished', (result) => {
+    const lifecycle = preparationLifecycle.get(result.id)
+    if (!lifecycle) return
+    recordPreparationOutcome({
+      kind: result.kind,
+      outcome: result.status,
+      cancellationReason: result.status === 'cancelled' ? result.reason : null,
+      failureCode: null,
+      terminalPhase: lifecycle.phase,
+      durationMs: performance.now() - lifecycle.startedAt
+    })
+    preparationLifecycle.delete(result.id)
+  })
+  preparationEvents.on('preparation:failed', (failure) => {
+    const lifecycle = preparationLifecycle.get(failure.id)
+    if (!lifecycle) return
+    recordPreparationOutcome({
+      kind: failure.kind,
+      outcome: 'failed',
+      cancellationReason: null,
+      failureCode: failure.code,
+      terminalPhase: lifecycle.phase,
+      durationMs: performance.now() - lifecycle.startedAt
+    })
+    preparationLifecycle.delete(failure.id)
+  })
+  const preparationController = createEditorPreparationController(state, preparationEvents, {
+    editor
+  })
+  const modules = createEditorStoreModules(editor, state, io, preparationController)
+
+  // ─── Public API ───────────────────────────────────────────────
+  // Spread all core Editor methods, then override getters and add app-specific.
+
+  const panes = createCanvasPaneRegistry(state)
+
+  async function switchPage(pageId: string, options: AppSwitchPageOptions = {}) {
+    const page = editor.graph.getNode(pageId)
+    const preparation =
+      options.preparation ??
+      preparationController.begin({
+        kind: 'page-switch',
+        phase: 'populating-page',
+        subject: page?.name ?? null
+      })
+    const ownsPreparation = options.preparation === undefined
+    let succeeded = false
+    try {
+      const prepared = await editor.preparePage(pageId, {
+        signal: preparation.signal,
+        onProgress: (progress) => {
+          options.onProgress?.(progress)
+          preparation.update({
+            ...progress,
+            unit: pageProgressUnit(progress.phase)
+          })
+        }
+      })
+      preparation.signal.throwIfAborted()
+      if (prepared) {
+        editor.commitPageSwitch(prepared)
+        preparation.update({ phase: 'preparing-render', detail: page?.name ?? null })
+        await options.beforePresentation?.()
+        preparation.signal.throwIfAborted()
+        try {
+          await preparationController.waitForPresentation(preparation.id, editor.state)
+        } catch (error) {
+          preparation.signal.throwIfAborted()
+          // The page is in by now: a canvas that cannot show it fails the render, not the
+          // switch, so an open that waits on it keeps its document.
+          preparation.fail({ code: 'render-failed', message: errorMessage(error), retryable: true })
+          toast.error(notificationMessages.get().operationFailed({ error: errorMessage(error) }))
+          return
+        }
+        preparation.signal.throwIfAborted()
+      }
+      succeeded = true
+    } catch (error) {
+      if (preparation.signal.aborted) {
+        // Another switch took over; its page is the one to show, so this one ends quietly.
+        // A caller's own preparation reports its cancellation itself.
+        if (ownsPreparation) return
+        throw error
+      }
+      if (ownsPreparation) {
+        preparation.fail({ code: 'layout-failed', message: errorMessage(error), retryable: true })
+      }
+      throw error
+    } finally {
+      if (ownsPreparation && succeeded) preparation.complete()
+    }
+  }
+
+  const store = {
+    ...editor,
+    state,
+    preparationController,
+    canvasReady: canvasReadiness.promise,
+    markCanvasReady: () => canvasReadiness.resolve(undefined),
+    onPreparationEvent<Event extends EditorPreparationEventName>(
+      event: Event,
+      handler: EditorPreparationEvents[Event]
+    ) {
+      return preparationEvents.on(event, handler)
+    },
+    panes,
+    selectedNodes,
+    selectedNode,
+    layerTree,
+    splitTree: panes.splitTree,
+    activePaneId: panes.activePaneId,
+    visiblePaneCount: panes.visiblePaneCount,
+    getPaneRenderState: panes.getPaneRenderState,
+    getPaneView: panes.getPaneView,
+    setActivePane: panes.setActivePane,
+    switchPage,
+    recentPages: recentPages.ids,
+    splitPane: panes.splitPane,
+    closePane: panes.closePane,
+    resizePane: panes.resizePane,
+    shiftPane: panes.shiftPane,
+    setSplitSizes: panes.setSplitSizes,
+
+    // App-specific overrides and additions
+    ...modules,
+    dispose() {
+      stopColorSpaceSync()
+      recentPages.dispose()
+      disposeSelection()
+      modules.dispose()
+    }
+  }
+
+  defineEditorStoreAccessors(store, editor)
+
+  return store
+}
+
+export const createEditorStore = scopedStoreFactory(buildEditorStore)
+
+export type EditorStore = ReturnType<typeof createEditorStore>
+
+export { getActiveEditorStore, setActiveEditorStore, useEditorStore }

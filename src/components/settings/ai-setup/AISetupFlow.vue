@@ -1,0 +1,288 @@
+<script setup lang="ts">
+import { tv } from 'tailwind-variants'
+import { computed, ref, useTemplateRef } from 'vue'
+
+import { useMessages } from '@open-pencil/vue/i18n'
+
+import { designModelConnection } from '@/app/ai/models'
+import type { AISetupEntry } from '@/app/ai/models/settings/onboarding/dialog'
+import type { OnboardingAccess } from '@/app/ai/models/settings/onboarding/plan'
+import { AI_SETUP_STEPS, useAIOnboarding } from '@/app/ai/models/settings/onboarding/use'
+import { OPENPENCIL_AI_PROVIDER } from '@/app/ai/providers/openpencil/provider'
+import { canRunHostProcesses } from '@/app/tauri/capabilities'
+import { isTauri } from '@/app/tauri/env'
+import SettingsSaveFeedback from '@/components/settings/layout/SettingsSaveFeedback.vue'
+import AppButton from '@/components/ui/button/AppButton.vue'
+import { AppDialogBody, AppDialogFooter, AppDialogHeader } from '@/components/ui/dialog'
+import AppAlert from '@/components/ui/feedback/AppAlert.vue'
+import AppCheckboxCard from '@/components/ui/toggle/AppCheckboxCard.vue'
+import theme from '@/theme/settings/ai-setup/flow'
+
+import AISetupAccess from './AISetupAccess.vue'
+import AISetupConnection from './AISetupConnection.vue'
+import AISetupReview from './AISetupReview.vue'
+import AISetupRoles from './AISetupRoles.vue'
+import AISetupSkills from './AISetupSkills.vue'
+import AISetupWelcome from './AISetupWelcome.vue'
+
+const {
+  entry,
+  offersTour = true,
+  tourOpening = false,
+  tourFailed = false,
+  agentsAvailable = canRunHostProcesses(),
+  subscriptionsAvailable = isTauri()
+} = defineProps<{
+  entry: AISetupEntry
+  offersTour?: boolean
+  /** The tour is loading after the person chose it. */
+  tourOpening?: boolean
+  /** The tour could not be opened; the person can try again. */
+  tourFailed?: boolean
+  agentsAvailable?: boolean
+  subscriptionsAvailable?: boolean
+}>()
+const emit = defineEmits<{ close: []; advanced: []; tour: [] }>()
+const ai = useMessages('ai')
+const common = useMessages('common')
+const styles = tv(theme)()
+
+const onboarding = useAIOnboarding({ agentsAvailable, subscriptionsAvailable })
+const {
+  answers,
+  step,
+  recommended,
+  plan,
+  roles,
+  gaps,
+  hasDesign,
+  busy,
+  saveResult,
+  canContinue,
+  detections
+} = onboarding
+const { isRecommended } = roles
+const phase = ref<'welcome' | 'wizard' | 'saved'>(entry === 'welcome' ? 'welcome' : 'wizard')
+// The welcome opens before sign-in, and signing in to Cloud sets AI up while it shows.
+const cloudReady = computed(
+  () => designModelConnection.value?.providerID === OPENPENCIL_AI_PROVIDER
+)
+
+const goals = computed(() => [
+  {
+    id: 'design' as const,
+    label: ai.value.aiSetupGoalDesign,
+    description: ai.value.aiSetupGoalDesignDescription
+  },
+  {
+    id: 'vision' as const,
+    label: ai.value.aiSetupGoalVision,
+    description: ai.value.aiSetupGoalVisionDescription
+  }
+])
+const header = computed(() => {
+  if (phase.value === 'welcome') {
+    return {
+      heading: ai.value.aiSetupWelcomeTitle,
+      description: ai.value.aiSetupWelcomeDescription
+    }
+  }
+  if (phase.value === 'saved') {
+    return { heading: ai.value.aiSetupSavedTitle, description: ai.value.aiSetupSavedDescription }
+  }
+  const headings = {
+    goals: ai.value.aiSetupGoalsTitle,
+    access: ai.value.aiSetupAccessTitle,
+    connect: ai.value.aiSetupConnectTitle,
+    review: ai.value.aiSetupReviewTitle
+  }
+  return {
+    heading: headings[step.value],
+    description: ai.value.aiSetupProgress({
+      current: AI_SETUP_STEPS.indexOf(step.value) + 1,
+      total: AI_SETUP_STEPS.length
+    })
+  }
+})
+
+/** Runs in the click handler, so the browser allows the sign-in popup. */
+function signIn(providerID: OnboardingAccess): void {
+  onboarding.signIn(providerID, { keyLabel: 'OpenPencil' })
+}
+
+function back(): void {
+  if (onboarding.back()) return
+  if (entry === 'welcome') phase.value = 'welcome'
+  else emit('close')
+}
+
+const skills = useTemplateRef<{ apply: () => void }>('skills')
+
+async function finish(): Promise<void> {
+  if ((await onboarding.apply()) !== 'saved') return
+  skills.value?.apply()
+  phase.value = 'saved'
+}
+</script>
+
+<template>
+  <AppDialogHeader :heading="header.heading" :description="header.description">
+    <template #actions>
+      <AppButton v-if="phase === 'wizard'" size="xs" class="me-1 ms-auto" @click="emit('advanced')">
+        {{ ai.aiSetupAdvanced }}
+      </AppButton>
+    </template>
+  </AppDialogHeader>
+
+  <AppDialogBody>
+    <div :class="styles.body()" :data-ai-setup-step="phase === 'wizard' ? step : phase">
+      <AISetupWelcome
+        v-if="phase === 'welcome'"
+        :offers-tour="offersTour"
+        :tour-opening="tourOpening"
+        :tour-failed="tourFailed"
+        :cloud-ready="cloudReady"
+        @tour="emit('tour')"
+      />
+
+      <template v-else-if="phase === 'saved'">
+        <AISetupReview :plan="plan" />
+      </template>
+
+      <template v-else-if="step === 'goals'">
+        <AppCheckboxCard
+          v-for="goal in goals"
+          :key="goal.id"
+          :label="goal.label"
+          :description="goal.description"
+          :model-value="answers.goals.includes(goal.id)"
+          @update:model-value="onboarding.setGoal(goal.id, $event)"
+        />
+      </template>
+
+      <template v-else-if="step === 'access'">
+        <p :class="styles.help()">{{ ai.aiSetupAccessDescription }}</p>
+        <AISetupAccess
+          v-model="answers.access"
+          :agents-available="agentsAvailable"
+          :subscriptions-available="subscriptionsAvailable"
+          :detections="detections"
+        />
+      </template>
+
+      <template v-else-if="step === 'connect'">
+        <AppAlert
+          v-if="gaps.length && answers.spending === 'metered'"
+          :heading="ai.aiSetupGapCoveredByOpenRouter"
+          data-slot="setup-gap"
+        >
+          <template #actions>
+            <AppButton size="xs" @click="answers.spending = 'existing'">
+              {{ ai.aiSetupGapRemoveOpenRouter }}
+            </AppButton>
+          </template>
+        </AppAlert>
+        <AppAlert
+          v-else-if="gaps.length"
+          :tone="hasDesign ? 'info' : 'warning'"
+          :heading="gaps.includes('design') ? ai.aiSetupGapDesign : ai.aiSetupGapVision"
+          :description="hasDesign ? ai.aiSetupGapContinue : ai.aiSetupNothingDescription"
+          data-slot="setup-gap"
+        >
+          <template #actions>
+            <AppButton size="xs" variant="outline" @click="answers.spending = 'metered'">
+              {{ ai.aiSetupGapAddOpenRouter }}
+            </AppButton>
+          </template>
+        </AppAlert>
+        <AppAlert
+          v-if="hasDesign && !recommended.connections.length"
+          tone="success"
+          :heading="ai.aiSetupAlreadyConnected"
+        />
+        <AISetupConnection
+          v-for="providerID in recommended.connections"
+          :key="providerID"
+          :provider-i-d="providerID"
+          :state="onboarding.connection(providerID)"
+          :has-saved-key="onboarding.hasSavedKey(providerID)"
+          :sign-in-status="onboarding.signInStatus(providerID)"
+          :server-vision="answers.serverVision ?? false"
+          :agent-setup="onboarding.agentSetup(providerID)"
+          :pi-setup="onboarding.piSetup(providerID)"
+          :recommended="!answers.access.includes(providerID)"
+          :disabled="busy"
+          @update="onboarding.updateConnection(providerID, $event)"
+          @test="onboarding.testConnection(providerID)"
+          @sign-in="signIn(providerID)"
+          @reopen-sign-in="onboarding.reopenSignIn(providerID)"
+          @cancel-sign-in="onboarding.cancelSignIn(providerID)"
+          @sign-out="onboarding.signOut(providerID)"
+          @server-vision="answers.serverVision = $event"
+          @check-agent="onboarding.refreshAgents()"
+          @install-agent="onboarding.installAgent(providerID)"
+          @install-bridge="onboarding.setupCanvasBridge()"
+          @sign-in-agent="onboarding.signInAgent(providerID)"
+          @cancel-agent-sign-in="onboarding.cancelAgentSignIn(providerID)"
+          @submit-agent-sign-in-code="onboarding.submitAgentSignInCode(providerID, $event)"
+        />
+      </template>
+
+      <template v-else>
+        <p :class="styles.help()">{{ ai.aiSetupRolesDescription }}</p>
+        <AISetupRoles
+          :plan="plan"
+          :options="roles.options"
+          :is-recommended="isRecommended"
+          @choose="roles.choose"
+          @use-recommended="roles.useRecommended"
+        />
+        <AISetupSkills v-if="agentsAvailable" ref="skills" />
+        <SettingsSaveFeedback
+          :result="saveResult"
+          :error="saveResult === 'saved' ? null : saveResult"
+        />
+      </template>
+    </div>
+  </AppDialogBody>
+
+  <AppDialogFooter>
+    <template v-if="phase === 'welcome'">
+      <AppButton v-if="cloudReady" color="primary" variant="solid" @click="emit('close')">
+        {{ ai.aiSetupSkip }}
+      </AppButton>
+      <template v-else>
+        <AppButton variant="outline" @click="emit('close')">{{ ai.aiSetupSkip }}</AppButton>
+        <AppButton color="primary" variant="solid" @click="phase = 'wizard'">
+          {{ ai.aiSetupStart }}
+        </AppButton>
+      </template>
+    </template>
+    <template v-else-if="phase === 'saved'">
+      <AppButton color="primary" variant="solid" @click="emit('close')">
+        {{ common.done }}
+      </AppButton>
+    </template>
+    <template v-else>
+      <AppButton :disabled="busy" @click="back">{{ common.back }}</AppButton>
+      <AppButton
+        v-if="step === 'review'"
+        color="primary"
+        variant="solid"
+        :disabled="busy"
+        @click="finish"
+      >
+        {{ ai.aiSetupFinish }}
+      </AppButton>
+      <AppButton
+        v-else
+        color="primary"
+        variant="solid"
+        :disabled="!canContinue"
+        @click="onboarding.next()"
+      >
+        {{ ai.aiSetupContinue }}
+      </AppButton>
+    </template>
+  </AppDialogFooter>
+</template>

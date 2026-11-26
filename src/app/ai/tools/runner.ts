@@ -1,0 +1,213 @@
+import { executeAtomicTool, isEmptyDocumentChange, type DocumentChange } from '@open-pencil/core'
+import type { FigmaAPI } from '@open-pencil/core/figma-api'
+import { graphOf } from '@open-pencil/core/figma-api'
+import {
+  isAtomicTool,
+  toolChangesDocument,
+  toolFailure,
+  type ToolDef
+} from '@open-pencil/core/tools'
+
+import {
+  AI_UNDO_PREFIX,
+  markRunChange,
+  moveRunToPage,
+  recordRunBaseline,
+  recordRunUndoEntry,
+  type Run
+} from '@/app/ai/reply/run'
+import {
+  AUTOMATION_UNDO_LABEL,
+  loadAtomicToolFonts,
+  recordAgentEdit
+} from '@/app/automation/execution/editor'
+import { acquireDocumentEdit } from '@/app/automation/execution/lock'
+import type { EditorStore } from '@/app/editor/active-store'
+
+import { recordToolChange } from './changes/capture'
+
+/** Ends a recorded edit whose tool answered with an error, so the edit is rolled back. */
+class ToolAnsweredError extends Error {
+  constructor() {
+    super('The tool answered with an error')
+    this.name = 'ToolAnsweredError'
+  }
+}
+
+function isToolError(result: unknown): boolean {
+  return typeof result === 'object' && result !== null && 'error' in result
+}
+
+/** The reply a call belongs to: its run, and the call's id in the reply's transcript. */
+export interface ReplyCall {
+  run: Run
+  toolCallId: string
+}
+
+/** One call of an OpenPencil tool, from the built-in chat, a coding agent, or another client. */
+export interface EditorToolCall {
+  store: EditorStore
+  figma: FigmaAPI
+  def: ToolDef
+  args: Record<string, unknown>
+  /** The chat reply the call belongs to; a call from an outside client belongs to none. */
+  reply?: ReplyCall | null
+  /** What a call outside a reply labels its undo entry with, such as `Agent` or `WebMCP`. */
+  source?: string
+  signal?: AbortSignal
+  /** False once the call's document closed, so a late edit is not drawn. */
+  isLive?: () => boolean
+}
+
+export const STOPPED_BEFORE_CALL = 'Stopped before this call ran; nothing was changed.'
+
+/**
+ * The page a call writes to: a parent or a replaced layer on another page puts the new layers
+ * there, so that page lays out, loads their fonts, and records the change.
+ */
+function writtenPageId(figma: FigmaAPI, args: Record<string, unknown>): string {
+  // As render places it: a replaced layer's parent wins over parent_id.
+  const nodeId = args.replace_id ?? args.parent_id
+  const page =
+    typeof nodeId === 'string'
+      ? graphOf(figma).closest(nodeId, (node) => node.type === 'CANVAS')
+      : undefined
+  return page?.id ?? figma.currentPageId
+}
+
+/** Records a reply's call once it ran: its undo entry, its change, and where its agent worked. */
+async function recordReplyCall(
+  call: EditorToolCall,
+  reply: ReplyCall,
+  change: DocumentChange,
+  undoBefore: ReturnType<EditorStore['undo']['peekUndo']>,
+  viewPageId: string
+): Promise<void> {
+  const { store, figma, def } = call
+  const { run, toolCallId } = reply
+  if (!isEmptyDocumentChange(change)) run.changedCalls.add(toolCallId)
+  recordRunUndoEntry(store, run, { tool: def.name, toolCallId }, undoBefore)
+  // View tools (selection, viewport, pages) cannot change the document.
+  if (toolChangesDocument(def)) {
+    try {
+      recordToolChange(store, toolCallId, change)
+    } catch (error) {
+      // The change record is a review aid; the edit and its undo entry already stand.
+      console.warn('Could not record AI tool change', error)
+    }
+    // The agent shows where it edited, even on another page; layers the result names refine
+    // this once the call returns.
+    markRunChange(store, change)
+  }
+  // `switch_page` moves the run, and the user's view with it.
+  if (figma.currentPageId !== viewPageId) await moveRunToPage(store, run, figma.currentPageId)
+}
+
+/**
+ * Runs an edit while its document's lock is held, and records it. The lock is released once the
+ * step and the reply's record of it are in, before the edit's fonts load.
+ */
+async function editAndRecord(
+  call: EditorToolCall,
+  reply: ReplyCall | null,
+  release: () => void
+): Promise<unknown> {
+  const { store, figma, def, args } = call
+  const viewPageId = figma.currentPageId
+  const pageId = writtenPageId(figma, args)
+  // A reply's first edit to a page keeps the whole page, which `changeBaseline` diffs.
+  if (reply && toolChangesDocument(def) && !reply.run.baselines.has(pageId)) {
+    recordRunBaseline(reply.run, store.snapshotPage(pageId))
+  }
+  const prefix = reply ? AI_UNDO_PREFIX : (call.source ?? AUTOMATION_UNDO_LABEL)
+  const undoBefore = store.undo.peekUndo()
+  const recorded: { change?: DocumentChange } = {}
+  const options = {
+    label: `${prefix}: ${def.name}`,
+    pageId,
+    onRecorded: (change: DocumentChange) => {
+      recorded.change = change
+    }
+  }
+  let settled = false
+  const settle = async () => {
+    if (settled) return
+    settled = true
+    try {
+      if (reply && recorded.change) {
+        await recordReplyCall(call, reply, recorded.change, undoBefore, viewPageId)
+      }
+    } finally {
+      release()
+    }
+  }
+  try {
+    if (isAtomicTool(def)) {
+      // An atomic tool records and commits its own step at once, from the layers it touched;
+      // loading its fonts after is not part of it.
+      const result = executeAtomicTool(store, figma, def, args, {
+        label: prefix,
+        signal: call.signal,
+        isLive: call.isLive,
+        onRecorded: options.onRecorded
+      })
+      await settle()
+      await loadAtomicToolFonts(store, figma, args, { isLive: call.isLive })
+      return result
+    }
+    // A tool that answers with an error, as atomic tools' failures do, is rolled back too.
+    const failure: { result?: unknown } = {}
+    try {
+      return await recordAgentEdit(
+        store,
+        options,
+        async () => {
+          const result = await def.execute(figma, args)
+          if (!isToolError(result)) return result
+          failure.result = result
+          throw new ToolAnsweredError()
+        },
+        { isLive: call.isLive, signal: call.signal, afterStep: settle }
+      )
+    } catch (error) {
+      if (error instanceof ToolAnsweredError) return failure.result
+      throw error
+    }
+  } finally {
+    await settle()
+  }
+}
+
+/**
+ * Runs one call of an OpenPencil tool. An edit runs alone in its document, is recorded as one
+ * undo entry, and, for a call that belongs to a chat reply, joins the reply's run so the reply
+ * can revert it and the transcript shows what it changed.
+ */
+export async function runEditorTool(call: EditorToolCall): Promise<unknown> {
+  const { store, figma, def, args } = call
+  if (!def.mutates) return def.execute(figma, args)
+  // Fonts load before the edit takes its turn, so an edit never waits on the network.
+  try {
+    await def.loadFonts(figma, args)
+  } catch (error) {
+    return toolFailure(error)
+  }
+  const reply = call.reply ?? null
+  // Cancelled while waiting for its turn, as a WebMCP or MCP call can be: nothing is edited.
+  const release = await acquireDocumentEdit(store, call.signal)
+  // Whatever fails from here, the lock and the reply's count of running tools are released.
+  let began = false
+  try {
+    call.signal?.throwIfAborted()
+    // Stopped while waiting for its turn: the reply is over, so nothing more is edited.
+    if (reply && !reply.run.active) return { error: STOPPED_BEFORE_CALL }
+    if (reply) {
+      reply.run.beginTool()
+      began = true
+    }
+    return await editAndRecord(call, reply, release)
+  } finally {
+    release()
+    if (began) reply?.run.endTool()
+  }
+}

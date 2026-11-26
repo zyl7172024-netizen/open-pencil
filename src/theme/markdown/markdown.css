@@ -1,0 +1,240 @@
+@reference 'tailwindcss';
+
+/* Markdown that Comark renders: messages, comments, skill instructions, and release notes.
+   Element rules use :where() so a component's own classes win over them. */
+.markdown-content {
+  @apply break-words text-surface;
+
+  :where(h1, h2, h3, h4, h5, h6) {
+    @apply font-semibold;
+  }
+
+  :where(strong) {
+    @apply font-semibold;
+  }
+
+  :where(em) {
+    @apply italic;
+  }
+
+  :where(del) {
+    @apply line-through;
+  }
+
+  :where(a) {
+    @apply cursor-pointer text-primary underline [overflow-wrap:anywhere];
+  }
+
+  :where(ul) {
+    @apply list-disc ps-5;
+  }
+
+  :where(ol) {
+    @apply list-decimal ps-5;
+  }
+
+  :where(li) > :where(p) {
+    @apply my-0;
+  }
+
+  /* A task item shows its checkbox in place of the bullet. */
+  :where(ul.contains-task-list) {
+    @apply list-none ps-1;
+  }
+
+  [data-markdown='task-checkbox'] {
+    @apply me-1.5 size-3 align-[-0.125em] accent-accent;
+  }
+
+  :where(blockquote) {
+    @apply border-s-4 border-muted/30 ps-3 text-muted italic;
+
+    & :where(p) {
+      @apply mb-0;
+    }
+  }
+
+  :where(hr) {
+    @apply border-t border-border;
+  }
+
+  :where(img) {
+    @apply h-auto max-w-full rounded-lg;
+  }
+
+  /* A code block: its language and copy button, then the code on the input color. */
+  [data-markdown='code-block'] {
+    @apply overflow-hidden rounded-md bg-input;
+  }
+
+  [data-markdown='code-block-header'] {
+    @apply flex items-center justify-between ps-2 text-muted;
+  }
+
+  [data-markdown='code-language'] {
+    @apply font-mono;
+  }
+
+  :where(pre) {
+    @apply overflow-x-auto font-mono;
+    background-color: var(--color-input) !important;
+  }
+
+  /* Tables read as part of the reply: regular weight, a light header, no fills on the rows. */
+  [data-markdown='table-wrapper'] {
+    @apply relative;
+  }
+
+  /* The copy button sits in the header row's corner, shown while the table is pointed at or
+     focused; the last header cell leaves it room (after the density rules below). */
+  [data-markdown='table-controls'] {
+    @apply absolute end-1 top-0 opacity-0 transition-opacity;
+  }
+
+  [data-markdown='table-wrapper']:is(:hover, :focus-within) [data-markdown='table-controls'] {
+    @apply opacity-100;
+  }
+
+  [data-markdown='table-scroll'] {
+    @apply overflow-x-auto;
+  }
+
+  [data-markdown='table'] {
+    @apply w-full border-collapse overflow-hidden rounded-md border border-border;
+  }
+
+  :where(thead) {
+    @apply bg-hover/60;
+  }
+
+  :where(tr) {
+    @apply border-b border-border;
+  }
+
+  :where(th) {
+    @apply text-left align-bottom font-medium whitespace-nowrap text-muted;
+  }
+
+  :where(td) {
+    @apply align-top;
+  }
+}
+
+/* Shiki's dual themes: each token carries its dark colors as --shiki-dark variables. */
+:root[data-theme='dark'] .markdown-content :where(.shiki, .shiki span) {
+  color: var(--shiki-dark) !important;
+  font-style: var(--shiki-dark-font-style) !important;
+  font-weight: var(--shiki-dark-font-weight) !important;
+  text-decoration: var(--shiki-dark-text-decoration) !important;
+}
+
+/* What arrives while a reply streams fades in: each new word, list item, code block, and line. */
+.markdown-content[data-markdown-mode='streaming'] {
+  .markdown-word,
+  :where(li),
+  [data-markdown='code-block'],
+  :where(pre .line) {
+    @apply animate-in fade-in duration-200 motion-reduce:animate-none;
+  }
+}
+
+/* Compact text runs at 18px lines, so inline reference chips do not touch the lines around them. */
+.markdown-content[data-markdown-density='compact'] {
+  @apply text-2xs leading-4.5;
+
+  :where(h1) {
+    @apply mt-2.5 mb-1 text-sm;
+  }
+
+  :where(h2) {
+    @apply mt-2.5 mb-1 text-xs;
+  }
+
+  :where(h3, h4, h5, h6) {
+    @apply mt-2 mb-1 text-2xs;
+  }
+
+  :where(p) {
+    @apply my-1.5;
+  }
+
+  :where(ul, ol) {
+    @apply leading-4.5;
+  }
+
+  :where(blockquote, hr, [data-markdown='code-block'], [data-markdown='table-wrapper']) {
+    @apply my-2;
+  }
+
+  [data-markdown='code-block-header'] {
+    @apply h-6 text-4xs leading-3;
+  }
+
+  :where(pre) {
+    @apply p-1.5 pt-0 text-2xs leading-4;
+  }
+
+  :where(th, td) {
+    @apply px-2 py-1 text-2xs leading-4;
+  }
+}
+
+.markdown-content[data-markdown-density='comfortable'] {
+  @apply text-xs leading-5;
+
+  :where(h1) {
+    @apply mt-4 mb-1.5 text-base first:mt-0;
+  }
+
+  :where(h2) {
+    @apply mt-4 mb-1.5 text-sm first:mt-0;
+  }
+
+  :where(h3, h4, h5, h6) {
+    @apply mt-3.5 mb-1 text-xs first:mt-0;
+  }
+
+  :where(p) {
+    @apply my-2;
+  }
+
+  :where(li) {
+    @apply py-0.5 leading-5;
+  }
+
+  :where(blockquote, hr, [data-markdown='code-block'], [data-markdown='table-wrapper']) {
+    @apply my-3;
+  }
+
+  [data-markdown='code-block-header'] {
+    @apply h-7 text-3xs;
+  }
+
+  :where(pre) {
+    @apply p-2 pt-0 text-2xs leading-4;
+  }
+
+  :where(th, td) {
+    @apply px-2.5 py-1.5 text-xs leading-5;
+  }
+}
+
+/* Room for the table's copy button beside the last heading, whatever the density's padding; in
+   comfortable text the taller header row centers the button lower. */
+.markdown-content [data-markdown='table'] th:last-child {
+  @apply pe-8;
+}
+
+.markdown-content[data-markdown-density='comfortable'] [data-markdown='table-controls'] {
+  @apply top-1;
+}
+
+/* The first and last blocks keep no outer margin, so a message's own padding is all around its
+   text: one paragraph sits in its bubble as a request's text does. */
+.markdown-content[data-markdown-density] > :first-child {
+  @apply mt-0;
+}
+
+.markdown-content[data-markdown-density] > :last-child {
+  @apply mb-0;
+}

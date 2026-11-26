@@ -1,0 +1,207 @@
+<script setup lang="ts">
+import { AnimatePresence, motion } from 'motion-v'
+import { ToolbarRoot } from 'reka-ui'
+import { tv } from 'tailwind-variants'
+import IconChevronLeft from '~icons/lucide/chevron-left'
+import IconChevronRight from '~icons/lucide/chevron-right'
+
+import type { EditorToolDef, Tool } from '@open-pencil/core'
+import {
+  getToolbarToolSelection,
+  ToolbarItem,
+  useToolbarState
+} from '@open-pencil/vue/primitives/Toolbar'
+import { toolbarToolTestId } from '@open-pencil/vue/testing'
+
+import { animationsEnabled } from '@/app/shell/motion'
+import { useMotionTransitions } from '@/app/shell/motion/transitions'
+import { useActionToast } from '@/app/shell/toast/action'
+import { useToolbarActions } from '@/components/toolbar/actions'
+import ShapeToolButton from '@/components/toolbar/ShapeToolButton.vue'
+import ToolbarActionGroup from '@/components/toolbar/ToolbarActionGroup.vue'
+import ToolButton from '@/components/toolbar/ToolButton.vue'
+import ToolFlyout from '@/components/toolbar/ToolFlyout.vue'
+import type {
+  ToolbarActionItem,
+  ToolbarUI,
+  ToolIconMap,
+  ToolLabels
+} from '@/components/toolbar/types'
+import toolbarTheme from '@/theme/toolbar'
+
+const { tools, activeTool, flyoutSelections, toolIcons, toolLabels, toolShortcuts, ui } =
+  defineProps<{
+    tools: EditorToolDef[]
+    activeTool: Tool
+    flyoutSelections: ReadonlyMap<Tool, Tool>
+    toolIcons: ToolIconMap
+    toolLabels: ToolLabels
+    toolShortcuts: Readonly<Record<Tool, string>>
+    ui?: ToolbarUI
+  }>()
+
+const toolbar = tv(toolbarTheme)
+const styles = toolbar()
+
+const emit = defineEmits<{
+  setTool: [tool: Tool]
+}>()
+
+const { mobileCategory, slideDirection, hasPrev, hasNext, goPrev, goNext } = useToolbarState()
+const { editActions, arrangeActions } = useToolbarActions()
+const { showActionToast } = useActionToast()
+
+function runAction(item: ToolbarActionItem) {
+  item.action()
+  showActionToast(item.label)
+}
+
+const { quick: itemTransition, layout: layoutTransition } = useMotionTransitions()
+
+const slideVariants = {
+  initial: (dir: unknown) => ({ opacity: 0, x: (dir as number) * 20 }),
+  animate: { opacity: 1, x: 0 },
+  exit: (dir: unknown) => ({ opacity: 0, x: (dir as number) * -20 })
+}
+
+function navigationClass(disabled: boolean) {
+  return toolbar({ disabled }).navigationAction({ class: ui?.navigationAction })
+}
+</script>
+
+<template>
+  <div
+    data-test-id="mobile-toolbar"
+    data-canvas-obstacle
+    class="fixed left-1/2 z-20 flex -translate-x-1/2 items-center gap-1.5"
+    :style="{
+      maxWidth: 'calc(100vw - 2rem)',
+      bottom: `calc(3.5rem + env(safe-area-inset-bottom) + 0.75rem)`
+    }"
+  >
+    <motion.button
+      data-test-id="mobile-toolbar-prev"
+      :disabled="!hasPrev"
+      :data-disabled="!hasPrev || undefined"
+      :class="navigationClass(!hasPrev)"
+      :animate="{ opacity: hasPrev ? 1 : 0 }"
+      :transition="itemTransition"
+      @click="goPrev"
+    >
+      <IconChevronLeft
+        data-direction="reading"
+        :class="styles.navigationIcon({ class: ui?.navigationIcon })"
+      />
+    </motion.button>
+
+    <ToolbarRoot as-child>
+      <motion.div
+        :layout="animationsEnabled"
+        data-test-id="mobile-toolbar-container"
+        class="scrollbar-none relative flex h-11 min-w-0 items-center overflow-x-auto rounded-lg border border-border bg-panel px-2 shadow-lg [&>*]:shrink-0"
+        :transition="layoutTransition"
+      >
+        <AnimatePresence mode="popLayout" :custom="slideDirection">
+          <motion.div
+            v-if="mobileCategory === 0"
+            key="tools"
+            data-test-id="mobile-toolbar-tools"
+            class="flex gap-0.5"
+            :variants="slideVariants"
+            initial="initial"
+            animate="animate"
+            exit="exit"
+            :transition="itemTransition"
+          >
+            <template v-for="tool in tools" :key="tool.key">
+              <ShapeToolButton v-if="tool.key === 'SHAPE_WITH_TEXT'" mobile :ui="ui" />
+
+              <ToolFlyout
+                v-else-if="tool.flyout"
+                mobile
+                :tool="tool"
+                :active-tool="activeTool"
+                :selected-tool="getToolbarToolSelection(tool, activeTool, flyoutSelections)"
+                :tool-icons="toolIcons"
+                :tool-labels="toolLabels"
+                :tool-shortcuts="toolShortcuts"
+                :ui="ui"
+                @select="emit('setTool', $event)"
+              />
+
+              <ToolbarItem v-else v-slot="{ active, actions }" :tool="tool.key">
+                <ToolButton
+                  mobile
+                  :data-test-id="toolbarToolTestId(tool.key, true)"
+                  :icon="toolIcons[tool.key]"
+                  :label="toolLabels[tool.key]"
+                  :active="
+                    active ||
+                    getToolbarToolSelection(tool, activeTool, flyoutSelections) === activeTool
+                  "
+                  :ui="ui"
+                  @click="actions.select"
+                />
+              </ToolbarItem>
+            </template>
+          </motion.div>
+
+          <motion.div
+            v-else-if="mobileCategory === 1"
+            key="edit"
+            data-test-id="mobile-toolbar-edit"
+            class="flex gap-0.5"
+            :variants="slideVariants"
+            initial="initial"
+            animate="animate"
+            exit="exit"
+            :transition="itemTransition"
+          >
+            <ToolbarActionGroup
+              :actions="editActions"
+              :ui="ui"
+              test-prefix="mobile-toolbar"
+              @action="runAction"
+            />
+          </motion.div>
+
+          <motion.div
+            v-else
+            key="arrange"
+            data-test-id="mobile-toolbar-arrange"
+            class="flex gap-0.5"
+            :variants="slideVariants"
+            initial="initial"
+            animate="animate"
+            exit="exit"
+            :transition="itemTransition"
+          >
+            <ToolbarActionGroup
+              :actions="arrangeActions"
+              :ui="ui"
+              test-prefix="mobile-toolbar"
+              @action="runAction"
+            />
+          </motion.div>
+        </AnimatePresence>
+        <!-- Inserting rather than drawing, in every category: commands such as placing an icon. -->
+        <slot name="end" />
+      </motion.div>
+    </ToolbarRoot>
+
+    <motion.button
+      data-test-id="mobile-toolbar-next"
+      :disabled="!hasNext"
+      :data-disabled="!hasNext || undefined"
+      :class="navigationClass(!hasNext)"
+      :animate="{ opacity: hasNext ? 1 : 0 }"
+      :transition="itemTransition"
+      @click="goNext"
+    >
+      <IconChevronRight
+        data-direction="reading"
+        :class="styles.navigationIcon({ class: ui?.navigationIcon })"
+      />
+    </motion.button>
+  </div>
+</template>

@@ -1,0 +1,537 @@
+import { isEqual } from 'es-toolkit/predicate'
+
+import type { ColorProfile, SceneGraph, SceneNode } from '@open-pencil/scene-graph'
+import { BLACK } from '@open-pencil/scene-graph/constants'
+import { readIcon } from '@open-pencil/scene-graph/icons'
+import { imageDataURL } from '@open-pencil/scene-graph/images'
+import { layoutSizingInParent } from '@open-pencil/scene-graph/layout'
+import { shaderOfPaint } from '@open-pencil/scene-graph/shaders'
+import { resolveNodeTextDirection } from '@open-pencil/scene-graph/text/direction'
+
+import { DesignTokens, type CSSModes } from '../tokens/references'
+import type { DesignDocument, DesignElement, DesignNode, DesignStyleDeclaration } from '../types'
+import {
+  cssColor,
+  effectsToCSS,
+  fillToCSS,
+  letterSpacingRoomCSS,
+  letterSpacingToCSS,
+  lineHeightToCSS,
+  textEffectsToCSS
+} from './css'
+import { addGridContainer, addGridPlacement } from './grid'
+import { addBackground, addImageStyle, addStroke, type FieldCSS } from './paint-style'
+import { addPositioning, constraintSizes, placement } from './position'
+import { addFlexGap, addPadding } from './spacing'
+import { textCaseToCSS, textElementContent, uniformLetterSpacing } from './text'
+
+const DOM_CSS_PLUGIN_ID = 'open-pencil-dom-css'
+const IMAGE_SOURCE_URL_KEY = 'image-source-url'
+
+/**
+ * Draws a vector-shaped layer as an inline `<svg>` element sized to the layer, from the
+ * engine's own SVG export. dom-css cannot depend on that engine, so it comes in as an option.
+ */
+export type VectorElementRenderer = (graph: SceneGraph, node: SceneNode) => DesignElement | null
+
+export interface SceneGraphToDesignOptions {
+  rootId?: string
+  includeSourceIds?: boolean
+  /** Write variable-bound values as `var(--name)` where CSS resolves them as drawn. Default true. */
+  tokens?: boolean
+  /** Vector, boolean, star, polygon, and icon layers as inline SVG; without it they project as boxes. */
+  vectorElement?: VectorElementRenderer
+  /** Match the canvas to the pixel, as preview does, rather than write the CSS one would by hand. */
+  canvasMetrics?: CanvasMetrics
+  /** Hidden layers to project as shown, such as the tab panels a component reveals itself. */
+  shown?: ReadonlySet<string>
+}
+
+/** What the canvas measures and CSS would work out differently. */
+export interface CanvasMetrics {
+  /** The line height of text with an automatic one, in pixels, when it has one for every line. */
+  autoLineHeight: (node: SceneNode) => number | undefined
+}
+
+/** Layers whose shape only paths describe, which CSS boxes cannot draw. */
+const VECTOR_SHAPES = new Set<SceneNode['type']>(['VECTOR', 'BOOLEAN_OPERATION', 'STAR', 'POLYGON'])
+
+/** What a box draws itself, which the SVG of a vector layer draws instead. */
+const BOX_PAINT = /^(background|border|box-shadow|outline|filter)/
+
+const px = (value: number) => `${value}px`
+
+function nodeChildren(graph: SceneGraph, node: SceneNode): SceneNode[] {
+  return node.childIds
+    .map((id) => graph.getNode(id))
+    .filter((child): child is SceneNode => child !== undefined)
+}
+
+function justifyContentToCSS(value: SceneNode['primaryAxisAlign']): string | undefined {
+  if (value === 'CENTER') return 'center'
+  if (value === 'MAX') return 'flex-end'
+  if (value === 'SPACE_BETWEEN') return 'space-between'
+  return undefined
+}
+
+/**
+ * Cross-axis alignment of a container's children, or of one child. Auto layout starts children
+ * at the start while flexbox stretches them, so start is written out: a child that hugs its
+ * content keeps its own size.
+ */
+function alignToCSS(
+  value: SceneNode['counterAxisAlign'] | SceneNode['layoutAlignSelf']
+): string | undefined {
+  if (value === 'MIN') return 'flex-start'
+  if (value === 'CENTER') return 'center'
+  if (value === 'MAX') return 'flex-end'
+  if (value === 'STRETCH') return 'stretch'
+  if (value === 'BASELINE') return 'baseline'
+  return undefined
+}
+
+/** Whether a layer sizes itself to its content along an axis, so CSS should too. */
+function hugs(node: SceneNode, axis: 'width' | 'height'): boolean {
+  if (node.type === 'TEXT')
+    return (
+      node.textAutoResize === 'WIDTH_AND_HEIGHT' ||
+      (axis === 'height' && node.textAutoResize === 'HEIGHT')
+    )
+  if (node.layoutMode !== 'HORIZONTAL' && node.layoutMode !== 'VERTICAL') return false
+  const primary = (node.layoutMode === 'HORIZONTAL') === (axis === 'width')
+  return (primary ? node.primaryAxisSizing : node.counterAxisSizing) === 'HUG'
+}
+
+/**
+ * A layer's size: fixed on the axes the design fixes, and left to the content where the layer
+ * hugs it (an auto layout frame set to Hug, or auto-sizing text), so the page grows with it.
+ */
+function addSize(
+  style: DesignStyleDeclaration,
+  node: SceneNode,
+  parent: SceneNode | undefined,
+  css: FieldCSS
+): void {
+  const placed = placement(node, parent)
+  const sized = (axis: 'width' | 'height') =>
+    node[axis] > 0 &&
+    !hugs(node, axis) &&
+    !stretches(node, parent, axis) &&
+    !(placed && constraintSizes(node, placed.parent, axis))
+  if (sized('width')) style.width = css('width', px(node.width))
+  if (sized('height')) style.height = css('height', px(node.height))
+}
+
+/**
+ * Whether a layer fills an axis by stretching, which a fixed CSS size would prevent: across a
+ * flex parent, or either axis of a grid cell. Along a flex parent, fill is `flex-grow`, and the
+ * size stays as its basis.
+ */
+function stretches(
+  node: SceneNode,
+  parent: SceneNode | undefined,
+  axis: 'width' | 'height'
+): boolean {
+  const sizing = layoutSizingInParent(parent, node, axis === 'width' ? 'HORIZONTAL' : 'VERTICAL')
+  if (sizing !== 'FILL' || !parent) return false
+  if (parent.layoutMode === 'GRID') return true
+  const mainAxis = parent.layoutMode === 'HORIZONTAL' ? 'width' : 'height'
+  return axis !== mainAxis
+}
+
+function addSizeConstraints(style: DesignStyleDeclaration, node: SceneNode, css: FieldCSS): void {
+  if (node.minWidth !== null) style['min-width'] = css('minWidth', px(node.minWidth))
+  if (node.maxWidth !== null) style['max-width'] = css('maxWidth', px(node.maxWidth))
+  if (node.minHeight !== null) style['min-height'] = css('minHeight', px(node.minHeight))
+  if (node.maxHeight !== null) style['max-height'] = css('maxHeight', px(node.maxHeight))
+}
+
+function addCornerRadii(style: DesignStyleDeclaration, node: SceneNode, css: FieldCSS): void {
+  if (node.type === 'ELLIPSE') {
+    style['border-radius'] = '50%'
+    return
+  }
+  if (node.independentCorners) {
+    const corners = [
+      ['border-top-left-radius', 'topLeftRadius', node.topLeftRadius],
+      ['border-top-right-radius', 'topRightRadius', node.topRightRadius],
+      ['border-bottom-right-radius', 'bottomRightRadius', node.bottomRightRadius],
+      ['border-bottom-left-radius', 'bottomLeftRadius', node.bottomLeftRadius]
+    ] as const
+    for (const [property, field, radius] of corners)
+      if (radius > 0) style[property] = css(field, px(radius))
+    return
+  }
+
+  if (node.cornerRadius > 0) style['border-radius'] = css('cornerRadius', px(node.cornerRadius))
+}
+
+/**
+ * The shader a layer's fill draws, which the projection keeps as the shader rather than the
+ * image of its still frame: the shader of its first fill, as the projection reads one fill.
+ */
+function layerShader(graph: SceneGraph, node: SceneNode): DesignElement['shader'] {
+  const fill = node.fills.at(0)
+  const shader = fill?.visible ? shaderOfPaint(node, fill) : null
+  if (!shader) return undefined
+  const bytes = graph.images.get(shader.image)
+  const frame = bytes ? imageDataURL(bytes) : undefined
+  return { preset: shader.preset, frame }
+}
+
+const POSITIONED = new Set(['relative', 'absolute', 'fixed', 'sticky'])
+
+/** Whether a `position` value makes an element the containing block of what it places. */
+export function isPositioned(position: unknown): boolean {
+  return typeof position === 'string' && POSITIONED.has(position)
+}
+
+/** A shader layer contains what plays behind its content, beneath everything it holds. */
+function addShaderLayerStyle(style: DesignStyleDeclaration): void {
+  if (!isPositioned(style.position)) style.position = 'relative'
+  style.isolation = 'isolate'
+}
+
+/** Whether something other than its children may set the height of a column. */
+function heightIsLimited(column: SceneNode): boolean {
+  return (
+    column.primaryAxisSizing !== 'HUG' ||
+    column.maxHeight !== null ||
+    column.layoutGrow > 0 ||
+    column.layoutAlignSelf === 'STRETCH' ||
+    column.verticalConstraint === 'STRETCH' ||
+    column.verticalConstraint === 'SCALE'
+  )
+}
+
+/**
+ * Whether flexbox could shrink a layer where auto layout lets it overflow: auto layout shrinks
+ * only layers that fill. A column as tall as its children never runs out of height, so they need
+ * no say.
+ */
+function keepsSize(node: SceneNode, parent: SceneNode): boolean {
+  if (node.layoutPositioning === 'ABSOLUTE' || node.layoutGrow > 0) return false
+  if (parent.layoutMode === 'HORIZONTAL') return true
+  return parent.layoutMode === 'VERTICAL' && heightIsLimited(parent)
+}
+
+/** Styles a node takes from its parent's layout, and its own rotation. */
+function addLayoutChild(
+  style: DesignStyleDeclaration,
+  node: SceneNode,
+  parent: SceneNode | undefined
+): void {
+  if (parent?.layoutMode === 'GRID') addGridPlacement(style, node)
+  else if (parent && parent.layoutMode !== 'NONE' && node.layoutGrow > 0) style['flex-grow'] = '1'
+  if (parent && keepsSize(node, parent)) style['flex-shrink'] = '0'
+  if (node.rotation !== 0) style.transform = `rotate(${node.rotation}deg)`
+}
+
+const SIZE_PROPERTIES = ['width', 'height', 'min-width', 'max-width', 'min-height', 'max-height']
+
+/**
+ * A layer's size includes its padding and stroke, as auto layout measures it. CSS sizes the
+ * content box unless told otherwise, so a sized box with padding or a border says so.
+ */
+function addBoxSizing(style: DesignStyleDeclaration): void {
+  const sized = SIZE_PROPERTIES.some((property) => Object.hasOwn(style, property))
+  const boxed = Object.keys(style).some(
+    (property) =>
+      property.startsWith('padding') ||
+      (property.startsWith('border') && !property.endsWith('radius'))
+  )
+  if (sized && boxed) style['box-sizing'] = 'border-box'
+}
+
+function styleFromSceneNode(
+  node: SceneNode,
+  parent: SceneNode | undefined,
+  css: FieldCSS,
+  profile: ColorProfile,
+  metrics: CanvasMetrics | undefined
+): DesignStyleDeclaration {
+  const style: DesignStyleDeclaration = {}
+  addSize(style, node, parent, css)
+  addPositioning(style, node, parent)
+  addSizeConstraints(style, node, css)
+  addBackground(style, node, css, profile)
+  addImageStyle(style, node)
+  addStroke(style, node, css, profile)
+  Object.assign(style, effectsToCSS(node.effects, css, profile))
+  if (node.opacity < 1) style.opacity = css('opacity', String(node.opacity))
+  addCornerRadii(style, node, css)
+  if (node.clipsContent) style.overflow = 'hidden'
+  const alignSelf = alignToCSS(node.layoutAlignSelf)
+  if (alignSelf) style['align-self'] = alignSelf
+
+  addLayoutChild(style, node, parent)
+  if (node.layoutDirection === 'RTL') style.direction = 'rtl'
+
+  if (node.layoutMode === 'GRID') {
+    addGridContainer(style, node, css)
+    addPadding(style, node, css, metrics !== undefined)
+  } else if (node.layoutMode !== 'NONE') {
+    style.display = 'flex'
+    // Row is the flexbox default.
+    if (node.layoutMode === 'VERTICAL') style['flex-direction'] = 'column'
+    const justifyContent = justifyContentToCSS(node.primaryAxisAlign)
+    const alignItems = alignToCSS(node.counterAxisAlign)
+    if (justifyContent) style['justify-content'] = justifyContent
+    if (alignItems) style['align-items'] = alignItems
+    if (node.layoutWrap === 'WRAP') style['flex-wrap'] = 'wrap'
+    addFlexGap(style, node, css)
+    addPadding(style, node, css, metrics !== undefined)
+  }
+
+  addBoxSizing(style)
+  return style
+}
+
+function styleFromTextNode(
+  node: SceneNode,
+  parent: SceneNode | undefined,
+  css: FieldCSS,
+  profile: ColorProfile,
+  metrics: CanvasMetrics | undefined
+): DesignStyleDeclaration {
+  const style: DesignStyleDeclaration = {}
+  addSize(style, node, parent, css)
+  addPositioning(style, node, parent)
+  addLayoutChild(style, node, parent)
+  if (resolveNodeTextDirection(node) === 'RTL') style.direction = 'rtl'
+  const color = fillToCSS(node.fills.at(0), profile)
+  style.color = color ? css('fills/0/color', color) : cssColor(BLACK, profile)
+  style['font-family'] = node.fontFamily
+  style['font-size'] = css('fontSize', px(node.fontSize))
+  style['font-weight'] = String(node.fontWeight)
+  if (node.italic) style['font-style'] = 'italic'
+  if (node.lineHeight !== null) {
+    style['line-height'] = css('lineHeight', lineHeightToCSS(node.lineHeight))
+  } else {
+    const auto = metrics?.autoLineHeight(node)
+    if (auto !== undefined) style['line-height'] = px(auto)
+  }
+  const spacing = css('letterSpacing', letterSpacingToCSS(node.letterSpacing))
+  if (node.letterSpacing.value !== 0) style['letter-spacing'] = spacing
+  // The spacing after a line's last letter needs room only when one spacing ends every line.
+  const ending = uniformLetterSpacing(node)
+  if (ending && ending.value !== 0) {
+    const written = isEqual(ending, node.letterSpacing) ? spacing : letterSpacingToCSS(ending)
+    Object.assign(style, letterSpacingRoomCSS(ending, written, style.width))
+  }
+  if (node.textAlignHorizontal !== 'LEFT')
+    style['text-align'] = node.textAlignHorizontal.toLowerCase()
+  if (node.opacity < 1) style.opacity = css('opacity', String(node.opacity))
+  Object.assign(style, textEffectsToCSS(node.effects, css, profile))
+  if (node.textDecoration !== 'NONE') {
+    style['text-decoration-line'] =
+      node.textDecoration === 'UNDERLINE' ? 'underline' : 'line-through'
+  }
+  const textTransform = textCaseToCSS(node.textCase)
+  if (textTransform) style['text-transform'] = textTransform
+  style['white-space'] = node.maxLines === 1 ? 'nowrap' : 'pre-wrap'
+  return style
+}
+
+function imageSourceURL(node: SceneNode): string | undefined {
+  return node.pluginData.find(
+    (entry) => entry.pluginId === DOM_CSS_PLUGIN_ID && entry.key === IMAGE_SOURCE_URL_KEY
+  )?.value
+}
+
+function attrsForNode(
+  graph: SceneGraph,
+  node: SceneNode,
+  includeSourceIds: boolean
+): Record<string, string> {
+  const attrs: Record<string, string> = includeSourceIds
+    ? { 'data-open-pencil-node-id': node.id }
+    : {}
+  const sourceURL = imageSourceURL(node)
+  if (sourceURL) attrs.src = sourceURL
+  const fill = node.fills.at(0)
+  if (fill?.type !== 'IMAGE' || !fill.imageHash || shaderOfPaint(node, fill)) return attrs
+  const bytes = graph.images.get(fill.imageHash)
+  if (!bytes) return attrs
+  return { ...attrs, src: imageDataURL(bytes) }
+}
+
+function tagNameForNode(node: SceneNode): string {
+  if (node.type === 'SECTION') return 'section'
+  const fill = node.fills.at(0)
+  const image = fill?.type === 'IMAGE' && !shaderOfPaint(node, fill)
+  if ((image || imageSourceURL(node)) && node.childIds.length === 0) return 'img'
+  return 'div'
+}
+
+interface ProjectionContext {
+  graph: SceneGraph
+  includeSourceIds: boolean
+  tokens: DesignTokens | undefined
+  vectorElement: VectorElementRenderer | undefined
+  canvasMetrics: CanvasMetrics | undefined
+  shown: ReadonlySet<string> | undefined
+}
+
+/**
+ * A vector layer as the renderer's `<svg>`, placed where the layer's box would be: its
+ * position, size, opacity, and transform stay, and its paint is the SVG's, not the box's.
+ */
+function vectorDesignNode(
+  context: ProjectionContext,
+  node: SceneNode,
+  attrs: Record<string, string>,
+  style: DesignStyleDeclaration
+): DesignElement | null {
+  const drawn = context.vectorElement?.(context.graph, node)
+  if (!drawn) return null
+  const placement = Object.fromEntries(
+    Object.entries(style).filter(([property]) => !BOX_PAINT.test(property))
+  )
+  return {
+    ...drawn,
+    attrs: { ...drawn.attrs, ...attrs },
+    inlineStyle: { ...drawn.inlineStyle, ...placement },
+    sourceSceneNodeId: node.id,
+    sourceSceneNode: node
+  }
+}
+
+function sceneNodeToDesignNode(
+  context: ProjectionContext,
+  node: SceneNode,
+  inherited: CSSModes,
+  root: boolean
+): DesignNode | null {
+  if ((!node.visible && !context.shown?.has(node.id)) || node.internalOnly) return null
+  const { graph, includeSourceIds, tokens, canvasMetrics: metrics } = context
+  const parent = node.parentId ? graph.getNode(node.parentId) : undefined
+  const entered = tokens?.enter(node, inherited, root)
+  const modes = entered?.modes ?? inherited
+  const attrs = { ...attrsForNode(graph, node, includeSourceIds), ...entered?.attrs }
+  const css: FieldCSS = (field, literal) => tokens?.reference(node, field, modes) ?? literal
+  const profile = graph.documentColorSpace
+
+  if (node.type === 'TEXT') {
+    const content = textElementContent(
+      node,
+      styleFromTextNode(node, parent, css, profile, metrics),
+      profile
+    )
+    return {
+      type: 'element',
+      tagName: content.tagName,
+      attrs,
+      inlineStyle: content.style,
+      sourceSceneNodeId: node.id,
+      sourceSceneNode: node,
+      children: content.children
+    }
+  }
+
+  // An icon is one drawing, however many paths it has.
+  if (VECTOR_SHAPES.has(node.type) || readIcon(node)) {
+    const vector = vectorDesignNode(
+      context,
+      node,
+      attrs,
+      styleFromSceneNode(node, parent, css, profile, metrics)
+    )
+    if (vector) return vector
+  }
+
+  const children = nodeChildren(graph, node)
+    .map((child) => sceneNodeToDesignNode(context, child, modes, false))
+    .filter((child): child is DesignNode => child !== null)
+
+  if (node.type === 'CANVAS') {
+    return {
+      type: 'element',
+      tagName: 'main',
+      attrs,
+      sourceSceneNodeId: node.id,
+      sourceSceneNode: node,
+      children
+    }
+  }
+
+  const style = styleFromSceneNode(node, parent, css, profile, metrics)
+  const shader = layerShader(graph, node)
+  if (shader) addShaderLayerStyle(style)
+  return {
+    type: 'element',
+    tagName: tagNameForNode(node),
+    attrs,
+    inlineStyle: style,
+    sourceSceneNodeId: node.id,
+    sourceSceneNode: node,
+    children,
+    shader
+  }
+}
+
+function projectionContext(
+  graph: SceneGraph,
+  {
+    includeSourceIds = true,
+    tokens = true,
+    vectorElement,
+    canvasMetrics,
+    shown
+  }: SceneGraphToDesignOptions
+): ProjectionContext {
+  return {
+    graph,
+    includeSourceIds,
+    tokens: tokens ? new DesignTokens(graph) : undefined,
+    vectorElement,
+    canvasMetrics,
+    shown
+  }
+}
+
+export function sceneGraphToDesignDocument(
+  graph: SceneGraph,
+  options: SceneGraphToDesignOptions = {}
+): DesignDocument {
+  const root = graph.getNode(options.rootId ?? graph.rootId)
+  const context = projectionContext(graph, options)
+  const modes = context.tokens?.defaultModes() ?? new Map<string, string>()
+  const children = root
+    ? nodeChildren(graph, root)
+        .map((child) => sceneNodeToDesignNode(context, child, modes, true))
+        .filter((child): child is DesignNode => child !== null)
+    : []
+
+  return { type: 'document', sourceGraph: graph, tokens: context.tokens, children }
+}
+
+/** Project one node, including its own box, instead of the children of a root. */
+export function sceneNodeToDesignDocument(
+  graph: SceneGraph,
+  nodeId: string,
+  options: Omit<SceneGraphToDesignOptions, 'rootId'> = {}
+): DesignDocument {
+  return sceneNodesToDesignDocument(graph, [nodeId], options)
+}
+
+/**
+ * Project several nodes, each with its own box, as one document: the tokens any of them
+ * references are the document's, so its stylesheet defines them all.
+ */
+export function sceneNodesToDesignDocument(
+  graph: SceneGraph,
+  nodeIds: readonly string[],
+  options: Omit<SceneGraphToDesignOptions, 'rootId'> = {}
+): DesignDocument {
+  const context = projectionContext(graph, options)
+  const modes = context.tokens?.defaultModes() ?? new Map<string, string>()
+  const children = nodeIds.flatMap((id) => {
+    const node = graph.getNode(id)
+    const projected = node ? sceneNodeToDesignNode(context, node, modes, true) : null
+    return projected ? [projected] : []
+  })
+  return { type: 'document', sourceGraph: graph, tokens: context.tokens, children }
+}
+
+export type { SceneGraphToDesignOptions as ToDesignDocumentOptions }

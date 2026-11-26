@@ -1,0 +1,21 @@
+{
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "lib": ["ESNext", "DOM", "DOM.Iterable"],
+    "types": ["bun", "node"],
+    "noEmit": true
+  },
+  "include": [
+    "*/*/src/**/*.ts",
+    "*/*/src/**/*.tsx",
+    "*/*/tests/**/*.ts",
+    "../src/env.d.ts",
+    "../src/global.d.ts",
+    "../src/markdown.d.ts",
+    "../packages/core/src/global.d.ts",
+    "../packages/vue/src/global.d.ts",
+    "../packages/dom-css/src/cssom.d.ts",
+    "../packages/dom-css/src/postcss-value-parser.d.ts",
+    "../packages/design-jsx/src/global.d.ts"
+  ]
+}

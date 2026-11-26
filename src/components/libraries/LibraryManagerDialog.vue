@@ -1,0 +1,195 @@
+<script setup lang="ts">
+import { nextTick, watch } from 'vue'
+
+import { useViewportKind } from '@open-pencil/vue/editor/viewport-kind'
+import { useMessages } from '@open-pencil/vue/i18n'
+
+import { useEditorStore } from '@/app/editor/active-store'
+import { openLibraryReview, openPublishLibraryDialog, useLibraryService } from '@/app/libraries'
+import { useLibraryManager } from '@/components/libraries/useLibraryManager'
+import AppButton from '@/components/ui/button/AppButton.vue'
+import IconButton from '@/components/ui/button/IconButton.vue'
+import {
+  AppDialogBody,
+  AppDialogFooter,
+  AppDialogHeader,
+  AppDialogRoot
+} from '@/components/ui/dialog'
+import AppPlaceholder from '@/components/ui/feedback/AppPlaceholder.vue'
+import SegmentedControl from '@/components/ui/select/SegmentedControl.vue'
+import { AppTabsContent, AppTabsList, AppTabsRoot, AppTabsTrigger } from '@/components/ui/tabs'
+import AppSwitch from '@/components/ui/toggle/AppSwitch.vue'
+
+const { initialSection = 'browse' } = defineProps<{
+  initialSection?: 'browse' | 'updates'
+}>()
+const open = defineModel<boolean>({ required: true })
+const editor = useEditorStore()
+const service = useLibraryService()
+const { isMobile } = useViewportKind()
+const libraryMessages = useMessages('panels/libraries')
+
+async function openPublish() {
+  open.value = false
+  await nextTick()
+  openPublishLibraryDialog()
+}
+const {
+  section,
+  loading,
+  ready,
+  showAllPages,
+  applying,
+  visibleUpdateGroups,
+  setSource,
+  toggleLibrary,
+  preferLibrary,
+  updateAsset,
+  updateAll
+} = useLibraryManager(open, editor, service)
+watch(open, (isOpen) => {
+  if (isOpen) section.value = initialSection
+})
+function selectSource(value: string) {
+  if (value === 'local' || value === 'storage') void setSource(value)
+}
+
+function reviewUpdate(group: (typeof visibleUpdateGroups.value)[number]) {
+  const initialInstanceId = group.instanceIds[0]
+  if (!initialInstanceId) return
+  openLibraryReview({
+    libraryId: group.libraryId,
+    assetKey: group.assetKey,
+    instanceIds: group.instanceIds,
+    initialInstanceId
+  })
+}
+</script>
+
+<template>
+  <AppDialogRoot
+    :open="open && ready"
+    size="lg"
+    height="tall"
+    data-test-id="asset-libraries-dialog"
+    @update:open="open = $event"
+  >
+    <AppDialogHeader
+      :heading="libraryMessages.manageLibraries"
+      :description="libraryMessages.manageLibrariesDescription"
+    >
+      <template #actions>
+        <AppButton color="primary" variant="link" class="ms-auto" @click="openPublish">
+          {{ libraryMessages.publishLibrary }}
+        </AppButton>
+      </template>
+    </AppDialogHeader>
+    <AppTabsRoot v-model="section" :orientation="isMobile ? 'horizontal' : 'vertical'">
+      <AppTabsList :label="libraryMessages.manageLibraries">
+        <AppTabsTrigger value="browse">
+          <template #leading><icon-lucide-library class="size-3.5" /></template>
+          {{ libraryMessages.browseLibraries }}
+        </AppTabsTrigger>
+        <AppTabsTrigger value="updates">
+          <template #leading><icon-lucide-refresh-cw class="size-3.5" /></template>
+          {{ libraryMessages.libraryUpdates }}
+          <template v-if="visibleUpdateGroups.length" #trailing>
+            <span class="rounded-full bg-accent px-1.5 text-3xs text-on-accent">{{
+              visibleUpdateGroups.length
+            }}</span>
+          </template>
+        </AppTabsTrigger>
+      </AppTabsList>
+      <AppTabsContent value="browse" as-child>
+        <AppDialogBody>
+          <SegmentedControl
+            required
+            class="mb-4"
+            :model-value="service.catalogSource"
+            :label="libraryMessages.browseLibraries"
+            :options="[
+              { value: 'local', label: libraryMessages.localLibraries },
+              { value: 'storage', label: libraryMessages.storageLibraries }
+            ]"
+            @update:model-value="selectSource"
+          />
+          <div
+            v-for="library in service.summaries.value"
+            :key="library.libraryId"
+            class="flex items-center gap-3 border-b border-border py-3"
+          >
+            <icon-lucide-library class="size-4 text-component" />
+            <div class="min-w-0 flex-1">
+              <p class="truncate text-xs text-surface">{{ library.name }}</p>
+              <p class="text-3xs text-muted">
+                {{ libraryMessages.libraryAssetCount({ count: library.assetCount }) }}
+              </p>
+            </div>
+            <IconButton
+              v-if="editor.graph.enabledLibraries.get(library.libraryId)?.enabled"
+              :label="libraryMessages.preferLibrary"
+              @click="preferLibrary(library.libraryId)"
+            >
+              <icon-lucide-star class="size-4" />
+            </IconButton>
+            <AppButton variant="outline" @click="toggleLibrary(library.libraryId)">
+              {{
+                editor.graph.enabledLibraries.get(library.libraryId)?.enabled
+                  ? libraryMessages.disableLibrary
+                  : libraryMessages.enableLibrary
+              }}
+            </AppButton>
+          </div>
+          <AppPlaceholder
+            v-if="!loading && service.summaries.value.length === 0"
+            :label="libraryMessages.noLibraries"
+            size="compact"
+          />
+        </AppDialogBody>
+      </AppTabsContent>
+      <AppTabsContent value="updates" class="flex flex-col overflow-hidden">
+        <AppDialogBody>
+          <h3 class="mb-3 text-sm font-semibold text-surface">
+            {{ libraryMessages.libraryUpdates }}
+          </h3>
+          <div
+            v-for="asset in visibleUpdateGroups"
+            :key="`${asset.libraryId}:${asset.assetKey}`"
+            class="flex items-center gap-3 border-b border-border py-3"
+          >
+            <icon-lucide-component class="size-4 text-component" />
+            <div class="min-w-0 flex-1">
+              <button type="button" class="block w-full text-start" @click="reviewUpdate(asset)">
+                <p class="truncate text-xs text-surface">{{ asset.name }}</p>
+                <p data-test-id="library-update-instance-count" class="text-3xs text-muted">
+                  {{ libraryMessages.libraryInstanceCount({ count: asset.instanceIds.length }) }}
+                </p>
+              </button>
+            </div>
+            <AppButton variant="outline" :disabled="applying !== null" @click="updateAsset(asset)">
+              {{ libraryMessages.updateLibraryAsset }}
+            </AppButton>
+          </div>
+          <AppPlaceholder
+            v-if="visibleUpdateGroups.length === 0"
+            :label="libraryMessages.noLibraryUpdates"
+            size="compact"
+          />
+        </AppDialogBody>
+        <AppDialogFooter>
+          <template #start>
+            <AppSwitch v-model="showAllPages" :label="libraryMessages.showUpdatesForAllPages" />
+          </template>
+          <AppButton
+            color="primary"
+            variant="solid"
+            :disabled="visibleUpdateGroups.length === 0 || applying !== null"
+            @click="updateAll"
+          >
+            {{ libraryMessages.updateAll }}
+          </AppButton>
+        </AppDialogFooter>
+      </AppTabsContent>
+    </AppTabsRoot>
+  </AppDialogRoot>
+</template>

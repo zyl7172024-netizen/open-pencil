@@ -1,0 +1,262 @@
+import { beforeAll, describe, expect, test } from 'bun:test'
+
+import { materializeDocument, materializeFigArchive } from '#fig/document/materialize'
+import { DEFAULT_SLOT_CONTENT } from '#fig/instance-overrides/types'
+
+import { parseFigBuffer } from '@open-pencil/fig'
+import type { GUID } from '@open-pencil/kiwi/fig'
+import type { NodeChange } from '@open-pencil/kiwi/fig/codec'
+import { guidToString } from '@open-pencil/kiwi/fig/guid'
+import type { SceneGraph, SceneNode } from '@open-pencil/scene-graph'
+import { guid } from '@open-pencil/test-support/fig/guid'
+import { readFixtureArrayBuffer } from '@open-pencil/test-support/paths'
+
+/**
+ * `slots.fig` was built with Figma's plugin API (`createSlot`, `appendChild`, `resetSlot`,
+ * `setProperties`) and saved from Figma. Each instance's expected slot content below is
+ * what Figma's `SlotNode.children` reported for that instance before the save.
+ */
+let graph: SceneGraph
+
+function topLevel(name: string): SceneNode {
+  const page = graph.getPages().find((candidate) => candidate.name === 'Slots fixture')
+  const node = page && graph.getChildren(page.id).find((child) => child.name === name)
+  if (!node) throw new Error(`Missing ${name}`)
+  return node
+}
+
+function slotFrame(node: SceneNode, from = graph): SceneNode {
+  const frame = from
+    .getChildren(node.id)
+    .find((child) => child.componentPropertyReferences.some((ref) => ref.field === 'SLOT_CONTENT'))
+  if (!frame) throw new Error(`No slot frame in ${node.name}`)
+  return frame
+}
+
+function slotChildren(name: string): string[] {
+  return graph.getChildren(slotFrame(topLevel(name)).id).map((child) => child.name)
+}
+
+beforeAll(() => {
+  graph = materializeFigArchive(readFixtureArrayBuffer('slots.fig')).graph
+})
+
+describe('slot properties', () => {
+  test('a slot is a SLOT property bound to a frame of its component', () => {
+    const card = topLevel('Card empty slot')
+    const [definition] = card.componentPropertyDefinitions
+    expect(definition).toMatchObject({ name: 'Content', type: 'SLOT' })
+    expect(slotFrame(card).componentPropertyReferences).toEqual([
+      { propertyId: definition.id, field: 'SLOT_CONTENT' }
+    ])
+  })
+
+  test('settings, description and preferred components are kept', () => {
+    const [definition] = topLevel('List').componentPropertyDefinitions
+    expect(definition).toMatchObject({
+      name: 'Items',
+      type: 'SLOT',
+      description: 'Put list items here',
+      preferredValues: ['dd573203ee6ffb4302ba13e151f637f67afdcd94'],
+      slotSettings: {
+        minChildren: 1,
+        maxChildren: 3,
+        allowPreferredValuesOnly: true,
+        displayEmptyByDefault: true,
+        stretchChildOnInsert: true
+      }
+    })
+  })
+
+  // The file gives each variant a copy of the set's slot, linked by `parentPropDefId`; Figma's
+  // scripts see the set's property alone (desktop 126), and so does OpenPencil.
+  test("variants sharing a slot bind the set's definition", () => {
+    const panel = topLevel('Panel')
+    expect(panel.componentPropertyDefinitions.map(({ name, type }) => [name, type])).toEqual([
+      ['Content', 'SLOT'],
+      ['Size', 'VARIANT']
+    ])
+    const [content] = panel.componentPropertyDefinitions
+    for (const variant of graph.getChildren(panel.id)) {
+      expect(variant.componentPropertyDefinitions).toEqual([])
+      expect(slotFrame(variant).componentPropertyReferences[0].propertyId).toBe(content.id)
+    }
+  })
+})
+
+describe('instance slot content', () => {
+  test('an untouched instance shows the component content and assigns nothing', () => {
+    expect(slotChildren('A untouched')).toEqual([])
+    expect(slotChildren('B untouched')).toEqual(['Default body', 'Default image'])
+    expect(slotChildren('B reset')).toEqual(['Default body', 'Default image'])
+    expect(topLevel('B untouched').componentPropertyAssignments).toEqual({})
+  })
+
+  test('assigned content replaces the default, in its saved order', () => {
+    expect(slotChildren('A filled')).toEqual(['Added text', 'Added rectangle'])
+    expect(slotChildren('B modified')).toEqual([
+      'Inserted first',
+      'Default image',
+      'Added after default'
+    ])
+    expect(slotChildren('B cleared')).toEqual([])
+  })
+
+  test('the instance owns assigned content, which links to no component layer', () => {
+    const instance = topLevel('B modified')
+    const [definition] = topLevel('Card default content').componentPropertyDefinitions
+    expect(Object.keys(instance.componentPropertyAssignments)).toEqual([definition.id])
+    for (const child of graph.getChildren(slotFrame(instance).id))
+      expect(child.componentId).toBeNull()
+  })
+
+  test('instances in a slot keep their own component', () => {
+    const item = topLevel('Item')
+    const content = graph.getChildren(slotFrame(topLevel('D violations')).id)
+    expect(content.map((child) => child.type)).toEqual([
+      'INSTANCE',
+      'INSTANCE',
+      'INSTANCE',
+      'INSTANCE',
+      'ROUNDED_RECTANGLE'
+    ])
+    for (const child of content.slice(0, 4)) expect(child.componentId).toBe(item.id)
+  })
+
+  test('content survives a variant switch', () => {
+    expect(slotChildren('Panel small filled')).toEqual(['Slot content'])
+    expect(slotChildren('Panel switched to large')).toEqual(['Survives variant switch?'])
+  })
+
+  test('an instance in a slot can fill its own slot', () => {
+    const [inner] = graph.getChildren(slotFrame(topLevel('A nested')).id)
+    expect(inner.name).toBe('Card default content')
+    expect(graph.getChildren(slotFrame(inner).id).map((child) => child.name)).toEqual([
+      'Default body',
+      'Default image',
+      'Inner added'
+    ])
+  })
+
+  test('content frames are not layers of the internal canvas', () => {
+    const internal = graph.getPages(true).find((page) => page.internalOnly)
+    if (!internal) throw new Error('Missing internal canvas')
+    expect(graph.getChildren(internal.id)).toEqual([])
+  })
+})
+
+describe('missing slot content', () => {
+  /** A card whose slot holds `Default`, and an instance assigning a content frame that is gone. */
+  const records = (): NodeChange[] => {
+    const slotValue = (target: GUID) => ({
+      value: { slotContentIdValue: { guid: target } },
+      dataType: 'SLOT_CONTENT_ID',
+      resolvedDataType: 'SLOT_CONTENT_ID'
+    })
+    return [
+      { guid: guid(1), type: 'DOCUMENT' },
+      { guid: guid(2), type: 'CANVAS', parentIndex: { guid: guid(1), position: '!' } },
+      {
+        guid: guid(3),
+        type: 'SYMBOL',
+        name: 'Card',
+        parentIndex: { guid: guid(2), position: 'a' },
+        componentPropDefs: [
+          { id: guid(10), name: 'Content', type: 'SLOT', varValue: slotValue(DEFAULT_SLOT_CONTENT) }
+        ]
+      },
+      {
+        guid: guid(4),
+        type: 'FRAME',
+        name: 'Content',
+        parentIndex: { guid: guid(3), position: 'a' },
+        parameterConsumptionMap: {
+          entries: [
+            {
+              variableField: 'SLOT_CONTENT_ID',
+              variableData: {
+                value: { propRefValue: { defId: guid(10) } },
+                dataType: 'PROP_REF',
+                resolvedDataType: 'SLOT_CONTENT_ID'
+              }
+            }
+          ]
+        }
+      },
+      {
+        guid: guid(5),
+        type: 'TEXT',
+        name: 'Default',
+        parentIndex: { guid: guid(4), position: 'a' },
+        textData: { characters: 'Default' }
+      },
+      {
+        guid: guid(6),
+        type: 'INSTANCE',
+        name: 'Card',
+        parentIndex: { guid: guid(2), position: 'b' },
+        symbolData: { symbolID: guid(3) },
+        componentPropAssignments: [{ defID: guid(10), varValue: slotValue(guid(99)) }]
+      }
+    ] as NodeChange[]
+  }
+
+  test('is fatal in strict reads', () => {
+    expect(() => materializeDocument(records())).toThrow('Missing slot content')
+  })
+
+  test('is reported, and the slot keeps its component content', () => {
+    const reported: unknown[] = []
+    const result = materializeDocument(records(), [], {
+      onMissingSlotContent: (diagnostic) => reported.push(diagnostic)
+    })
+    const instance = result.sources.get('1:6')
+    const node = instance && result.graph.getNode(instance)
+    if (!node) throw new Error('Missing instance')
+    const content = result.graph.getChildren(slotFrame(node, result.graph).id)
+    expect(content.map((child) => child.name)).toEqual(['Default'])
+    // Without the assignment the slot keeps following its component.
+    expect(node.componentPropertyAssignments).toEqual({})
+    expect(reported).toEqual([{ slotId: '1:4', slotContentId: '1:99' }])
+  })
+})
+
+/**
+ * In `slots.fig`, "A filled" (14:38) assigns the content frame 14:42, holding "Added text"
+ * (14:43) and "Added rectangle" (14:45), to the slot its component "Card empty slot" (14:15)
+ * shows in the frame "Content" (14:17).
+ */
+const FILLED = '14:38'
+const CONTENT = '14:42'
+
+test('slot content keeps the records it was read from', () => {
+  const { graph, sources } = materializeFigArchive(readFixtureArrayBuffer('slots.fig'))
+  const instance = graph.getNode(FILLED)
+  const frame = instance && graph.getChildren(instance.id).find((child) => child.name === 'Content')
+  expect(sources.get(CONTENT)).toBe(frame?.id)
+  expect(graph.getNode(sources.get('14:43') ?? '')?.name).toBe('Added text')
+  expect(graph.getNode(sources.get('14:45') ?? '')?.name).toBe('Added rectangle')
+  expect(instance?.source.fig.hiddenSlotAssignments).toEqual([])
+})
+
+/** The file with the component's slot frame no longer showing its slot. */
+function withoutSlotFrame(): NodeChange[] {
+  const records = parseFigBuffer(readFixtureArrayBuffer('slots.fig')).nodeChanges
+  return records.map((record) =>
+    record.guid && guidToString(record.guid) === '14:17'
+      ? { ...record, parameterConsumptionMap: { entries: [] } }
+      : record
+  )
+}
+
+test('an instance keeps the slot assignment none of its layers shows', () => {
+  const { graph, sources } = materializeDocument(withoutSlotFrame())
+  const instance = graph.getNode(FILLED)
+  expect(sources.has(CONTENT)).toBe(false)
+  expect(instance?.source.fig.hiddenSlotAssignments).toMatchObject([
+    {
+      defID: { sessionID: 14, localID: 0 },
+      varValue: { value: { slotContentIdValue: { guid: { sessionID: 14, localID: 42 } } } }
+    }
+  ])
+})

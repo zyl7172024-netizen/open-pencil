@@ -1,0 +1,337 @@
+import type { SceneNode } from '@open-pencil/scene-graph'
+import { copyDerivedGlyphs, copyGeometryPaths } from '@open-pencil/scene-graph/copy'
+import { faceStyleKey } from '@open-pencil/scene-graph/font-style'
+import {
+  cloneInstanceOverrideState,
+  setInstanceOverride,
+  type InstanceOverrideState
+} from '@open-pencil/scene-graph/instances/overrides'
+
+import { isNodeFontLoaded } from '#core/canvas/text'
+import { textAutoResizeChanges } from '#core/layout/text-auto-resize'
+import { getTextMeasurer, withTextMeasurer } from '#core/layout/text-measurement'
+import type { TextEditorState } from '#core/text/editor'
+import { hasGlyphOutlines } from '#core/text/font/glyphs'
+import { prepareTextFonts } from '#core/text/prepare'
+
+import { applyBoundTextEdit } from './components/authoring/text-edit'
+import { fitEmptyLabelToPlaceholder } from './connectors/label-edit'
+import { applyGeneratedTextNameEdit } from './text/name'
+import { pathTextEditChanges } from './text/path-edit'
+import {
+  createTextEditSession,
+  resizeTextNodeForEdit,
+  snapshotTextNode,
+  textSnapshotChanged,
+  type TextEditSession
+} from './text/session'
+import type { EditorContext } from './types'
+import { createVariableBindingActions } from './variables/bindings'
+
+/**
+ * Path text is edited by re-flowing glyph OUTLINES along its path. When the font
+ * is unavailable we can't produce new glyphs, so editing would corrupt the baked
+ * lettering — treat it as a baked graphic and refuse to enter edit mode. Non-path
+ * text still edits (system-font fallback); path text with the font available
+ * edits fully (add/remove characters reflow). "Available" is deliberately broad:
+ * today that means loaded locally, but a future remote provider (e.g. Google
+ * Fonts) would extend hasGlyphOutlines without changing this gate.
+ */
+function isPathTextEditable(node: SceneNode): boolean {
+  if (!node.textPathData) return true
+  return hasGlyphOutlines(node.fontFamily, faceStyleKey(node))
+}
+
+type PathTextEditSnapshot = Pick<
+  SceneNode,
+  'derivedTextGlyphs' | 'strokeGeometry' | 'textPathData' | 'textPathBox'
+>
+
+function snapshotPathText(
+  node: SceneNode | undefined,
+  includeClearedPathState = false
+): PathTextEditSnapshot | null {
+  if (!node || (!includeClearedPathState && !node.textPathData)) return null
+  return {
+    derivedTextGlyphs: copyDerivedGlyphs(node.derivedTextGlyphs),
+    strokeGeometry: copyGeometryPaths(node.strokeGeometry),
+    textPathData: node.textPathData ? structuredClone(node.textPathData) : null,
+    textPathBox: node.textPathBox ? { ...node.textPathBox } : null
+  }
+}
+
+type InstanceOverridesSnapshot = {
+  instanceId: string
+  instanceOverrides: InstanceOverrideState
+}
+
+function containingInstanceIds(ctx: EditorContext, nodeId: string): string[] {
+  const ids: string[] = []
+  let current = ctx.graph.getNode(nodeId)
+  while (current?.parentId) {
+    current = ctx.graph.getNode(current.parentId)
+    if (current?.type === 'INSTANCE') ids.push(current.id)
+  }
+  return ids
+}
+
+function snapshotInstanceOverrides(
+  ctx: EditorContext,
+  instanceIds: string[]
+): InstanceOverridesSnapshot[] {
+  return instanceIds.flatMap((instanceId) => {
+    const instance = ctx.graph.getNode(instanceId)
+    return instance?.type === 'INSTANCE'
+      ? [{ instanceId, instanceOverrides: cloneInstanceOverrideState(instance.instanceOverrides) }]
+      : []
+  })
+}
+
+function restoreInstanceOverrides(ctx: EditorContext, snapshots: InstanceOverridesSnapshot[]) {
+  for (const snapshot of snapshots) {
+    ctx.graph.updateNode(snapshot.instanceId, {
+      instanceOverrides: cloneInstanceOverrideState(snapshot.instanceOverrides)
+    })
+  }
+}
+
+function applyTextInstanceOverride(
+  ctx: EditorContext,
+  instanceIds: string[],
+  nodeId: string,
+  text: string
+) {
+  for (const instanceId of instanceIds) {
+    const instance = ctx.graph.getNode(instanceId)
+    if (instance?.type !== 'INSTANCE') continue
+    setInstanceOverride(instance.instanceOverrides, instance.id, nodeId, 'text', text)
+    ctx.graph.updateNode(instance.id, { instanceOverrides: instance.instanceOverrides })
+  }
+}
+
+export function createTextActions(ctx: EditorContext) {
+  let activeSession: TextEditSession | null = null
+  /** Puts back the size an empty connector label had before its placeholder sized it. */
+  let restoreEmptyLabel: (() => void) | null = null
+  const variableBindings = createVariableBindingActions(ctx)
+
+  /**
+   * Typing resizes auto-sized text and lays out its auto-layout ancestors as it goes, so a Hug
+   * frame grows with its label while it is edited, as in Figma. A size in `changes`, measured
+   * from the edit's own paragraph, wins over the measurement. A keystroke that leaves the text's
+   * size as it was lays nothing out.
+   */
+  function updateTextEditNode(nodeId: string, changes: Partial<SceneNode>) {
+    const node = ctx.graph.getNode(nodeId)
+    if (!node) return
+    const { width, height } = node
+    measuringEditedText(nodeId, () => {
+      ctx.graph.updateNode(nodeId, {
+        ...textAutoResizeChanges(node, changes),
+        ...changes,
+        ...pathTextEditChanges(node, changes)
+      })
+      if (node.width !== width || node.height !== height) ctx.runLayoutForNode(nodeId)
+    })
+    if ('text' in changes || 'styleRuns' in changes) prepareEditedText(nodeId)
+  }
+
+  /**
+   * Runs `fn` with the text being typed measured in the fonts it is drawn with now, as its edit
+   * draws it, so its size and its glyphs agree while it waits for fonts it newly needs. Other text
+   * is measured as layout measures it.
+   */
+  function measuringEditedText(nodeId: string, fn: () => void) {
+    const renderer = ctx.getRenderer()
+    const measure = getTextMeasurer()
+    if (!renderer || !measure) return fn()
+    withTextMeasurer(
+      (node, maxWidth) =>
+        node.id === nodeId ? renderer.measureTextAsDrawn(node, maxWidth) : measure(node, maxWidth),
+      fn
+    )
+  }
+
+  /**
+   * Prepares the fonts the typed text newly needs, such as a script's fallback, through the one
+   * gate, and once they are in, redraws the edit and sizes the text in them.
+   */
+  function prepareEditedText(nodeId: string) {
+    const renderer = ctx.getRenderer()
+    const node = ctx.graph.getNode(nodeId)
+    if (!renderer?.fontsLoaded || !node || isNodeFontLoaded(renderer, node)) return
+    void sizeInPreparedFonts(nodeId, node)
+  }
+
+  async function sizeInPreparedFonts(nodeId: string, node: SceneNode) {
+    const graph = ctx.graph
+    await prepareTextFonts([node], { loadFont: ctx.loadFont })
+    // A replaced document has its own text, whatever its ids.
+    if (ctx.graph !== graph) return
+    const te = ctx.getTextEditor()
+    const current = ctx.graph.getNode(nodeId)
+    if (!current) return
+    if (te?.isActive && te.nodeId === nodeId) te.rebuildParagraph(current)
+    measuringEditedText(nodeId, () => {
+      const sized = textAutoResizeChanges(current, { text: current.text })
+      const { width, height } = current
+      ctx.graph.updateNode(nodeId, sized)
+      if (current.width !== width || current.height !== height) ctx.runLayoutForNode(nodeId)
+    })
+    ctx.requestRender()
+  }
+
+  /** A text draws from its live layout while edited, so it is drawn afresh as the edit starts and ends. */
+  function redrawText(nodeId: string) {
+    for (const renderer of ctx.getRenderers()) renderer.redrawNode(nodeId, ctx.graph)
+  }
+
+  function startTextEditing(nodeId: string) {
+    const te = ctx.getTextEditor()
+    if (ctx.state.editingTextId) commitTextEdit()
+    const node = ctx.graph.getNode(nodeId)
+    if (!node) return
+    // Font-gated: unavailable-font path text stays a non-editable baked graphic.
+    if (!isPathTextEditable(node)) return
+    activeSession = createTextEditSession(node)
+    ctx.state.editingTextId = nodeId
+    redrawText(nodeId)
+    restoreEmptyLabel = fitEmptyLabelToPlaceholder(ctx, node)
+    if (te) {
+      te.setRenderer(ctx.getRenderer())
+      te.start(node)
+    }
+    ctx.requestRender()
+  }
+
+  /** Records what the edit changed since its session began, as one undo step. */
+  function recordTextEdit(textState: TextEditorState) {
+    const result = { nodeId: textState.nodeId, text: textState.text }
+    const before = activeSession?.before ?? {
+      text: '',
+      styleRuns: [],
+      textParagraphs: [],
+      size: {}
+    }
+    const beforePathText = activeSession?.beforePathText ?? null
+    const node = ctx.graph.getNode(result.nodeId)
+    const after = snapshotTextNode(node, result.text)
+    after.text = result.text
+    const sizeChanges =
+      before.text !== after.text ? resizeTextNodeForEdit(node, textState.paragraph) : {}
+    if (Object.keys(sizeChanges).length > 0) after.size = sizeChanges
+    const changed = textSnapshotChanged(before, after)
+    const containingInstances = containingInstanceIds(ctx, result.nodeId)
+    const instanceOverridesBefore = snapshotInstanceOverrides(ctx, containingInstances)
+
+    if (!changed) return
+
+    updateTextEditNode(result.nodeId, {
+      text: after.text,
+      styleRuns: after.styleRuns,
+      textParagraphs: after.textParagraphs,
+      ...sizeChanges
+    })
+    const afterPathText = snapshotPathText(
+      ctx.graph.getNode(result.nodeId),
+      beforePathText !== null
+    )
+    if (before.text !== after.text) {
+      applyTextInstanceOverride(ctx, containingInstances, result.nodeId, after.text)
+    }
+    const instanceOverridesAfter = snapshotInstanceOverrides(ctx, containingInstances)
+
+    // Text a property drives becomes the property's value too, and typing over text a variable
+    // decides lets go of the variable, as in Figma, both in the same undo step.
+    ctx.undo.runBatch('Edit text', () => {
+      ctx.undo.push({
+        label: 'Edit text',
+        forward: () => {
+          ctx.graph.updateNode(result.nodeId, {
+            text: after.text,
+            styleRuns: after.styleRuns,
+            textParagraphs: after.textParagraphs,
+            ...after.size,
+            ...afterPathText
+          })
+          restoreInstanceOverrides(ctx, instanceOverridesAfter)
+          ctx.runLayoutForNode(result.nodeId)
+        },
+        inverse: () => {
+          ctx.graph.updateNode(result.nodeId, {
+            text: before.text,
+            styleRuns: before.styleRuns,
+            textParagraphs: before.textParagraphs,
+            ...before.size,
+            ...beforePathText
+          })
+          restoreInstanceOverrides(ctx, instanceOverridesBefore)
+          ctx.runLayoutForNode(result.nodeId)
+        }
+      })
+      if (before.text !== after.text) {
+        if (node && 'text' in node.boundVariables)
+          variableBindings.unbindVariable(result.nodeId, 'text')
+        applyBoundTextEdit(ctx, result.nodeId, after.text)
+        applyGeneratedTextNameEdit(ctx, result.nodeId, after.text)
+      }
+    })
+  }
+
+  function commitTextEdit() {
+    const te = ctx.getTextEditor()
+    const restore = restoreEmptyLabel
+    const edited = ctx.state.editingTextId
+    restoreEmptyLabel = null
+    if (!te?.isActive) {
+      ctx.state.editingTextId = null
+      activeSession = null
+      restore?.()
+      if (edited) {
+        redrawText(edited)
+        ctx.requestRender()
+      }
+      return
+    }
+    const textState = te.state
+    if (textState) recordTextEdit(textState)
+    te.stop()
+    ctx.state.editingTextId = null
+    activeSession = null
+    restore?.()
+    if (edited) redrawText(edited)
+    ctx.requestRender()
+  }
+
+  /**
+   * Runs a change to the text being edited as an undo step of its own: what was typed before it
+   * becomes a step first, and the edit then goes on from the text the change leaves, which an
+   * undo or redo can also be.
+   */
+  function runTextEditStep(change: () => void) {
+    const te = ctx.getTextEditor()
+    const textState = te?.isActive ? te.state : null
+    if (!te || !textState) {
+      change()
+      return
+    }
+    recordTextEdit(textState)
+    change()
+    const node = ctx.graph.getNode(textState.nodeId)
+    if (!node) {
+      // The change took the text away, such as an undo past the step that made it: the edit
+      // ends with it, recording nothing of a node that is gone.
+      te.stop()
+      ctx.state.editingTextId = null
+      activeSession = null
+      restoreEmptyLabel = null
+      ctx.requestRender()
+      return
+    }
+    activeSession = createTextEditSession(node)
+    te.syncToNode(node)
+    ctx.requestRender()
+  }
+
+  return { startTextEditing, updateTextEditNode, commitTextEdit, runTextEditStep }
+}

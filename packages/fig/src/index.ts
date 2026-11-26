@@ -1,0 +1,126 @@
+export { materializeFigFragment, type FragmentMaterializationOptions } from './document/fragment'
+export {
+  materializeDocument,
+  materializeFigArchive,
+  type DocumentAssemblyOptions
+} from './document/materialize'
+export {
+  figCheckpointRecords,
+  type FigSessionCheckpoint,
+  type FigSessionResume,
+  createFigDocumentSession
+} from './document/session'
+export type { SavedVariant } from './document/component/set-variants'
+export { figArchiveMetaSchema, type FigArchiveMetaJSON } from './schema'
+export {
+  figArchiveKind,
+  figArchiveMetaJSON,
+  parseFigBuffer,
+  readFigArchiveMeta,
+  renameFigArchive,
+  streamFigArchive,
+  writeFigArchive,
+  type FigArchiveContents,
+  type FigArchiveMeta,
+  type FigImageEntry,
+  type FigParseResult,
+  type WriteFigArchiveInput
+} from './archive'
+export {
+  readZipDirectory,
+  zipEntryContents,
+  type FigRangeReader,
+  type ZipEntry
+} from './zip/directory'
+export { bytesStream, readStreamBytes, zipStream, type ZipStreamEntry } from './zip/stream'
+export {
+  figArchiveComponentUsePages,
+  figArchiveRecordInfo,
+  figArchiveRecordPages,
+  figComponentUsePages,
+  figRecordPages,
+  patchFigArchive,
+  patchFigRecords,
+  type FigArchiveRecordInfo,
+  type FigSlotContent,
+  type FigUnreadVariable,
+  type FigPatchedArchiveInput,
+  entryPathKey,
+  type FigEntryListPatch,
+  type FigEntryPatch,
+  type FigRecordFieldPatch,
+  type FigRecordPatch
+} from './record-patch'
+export { extractFigThumbnailFromReader, type FigThumbnailLimits } from './thumbnail'
+export {
+  effectiveFigmaRawNodeFields,
+  effectiveFigmaSourcePayload,
+  readEffectiveFigmaRawField,
+  staleFigmaRawFields
+} from './source-metadata'
+
+import {
+  FIG_KIWI_DEFAULT_VERSION,
+  buildFigKiwi,
+  decompressFigKiwiData,
+  parseFigKiwiChunks
+} from '@open-pencil/kiwi/fig/container'
+
+export interface FigDocumentSource {
+  readonly bytes?: Uint8Array
+  readonly fileName?: string
+}
+
+export interface FigDocument<Graph = unknown> {
+  readonly graph: Graph
+  readonly source?: FigDocumentSource
+}
+
+export interface ReadFigOptions {
+  readonly preserveRawMetadata?: boolean
+}
+
+export interface WriteFigOptions {
+  readonly source?: FigDocumentSource
+}
+
+export interface FigContainerDocument {
+  readonly schemaDeflated: Uint8Array
+  readonly dataRaw: Uint8Array
+  readonly source?: FigDocumentSource
+}
+
+export interface ReadFigContainerOptions {
+  readonly fileName?: string
+}
+
+export interface WriteFigContainerOptions {
+  readonly version?: number
+}
+
+export const FIG_PACKAGE_STATUS = 'document-reader' as const
+
+export function readFigContainer(
+  bytes: Uint8Array,
+  options: ReadFigContainerOptions = {}
+): FigContainerDocument {
+  const chunks = parseFigKiwiChunks(bytes)
+  if (!chunks) throw new Error('Invalid fig-kiwi container')
+  const [schemaDeflated, dataDeflated] = chunks
+  return {
+    schemaDeflated,
+    dataRaw: decompressFigKiwiData(dataDeflated),
+    source: { bytes, fileName: options.fileName }
+  }
+}
+
+export function writeFigContainer(
+  document: FigContainerDocument,
+  options: WriteFigContainerOptions = {}
+): Uint8Array {
+  return buildFigKiwi(
+    document.schemaDeflated,
+    document.dataRaw,
+    options.version ?? FIG_KIWI_DEFAULT_VERSION
+  )
+}

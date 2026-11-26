@@ -1,0 +1,316 @@
+import { IS_BROWSER } from '@open-pencil/core/constants'
+import { minOf } from '@open-pencil/std/arrays'
+import { errorMessage } from '@open-pencil/std/errors'
+import { BACKOFF, backoffDelay } from '@open-pencil/std/timing'
+
+import {
+  describeDiagnosticError,
+  recordStorageFailure,
+  storageOperationForJob
+} from '@/app/diagnostics'
+import {
+  activeStorageProviderID,
+  openStorageAdapter,
+  storageLocationOf,
+  StorageRevisionConflictError,
+  StorageUnavailableError
+} from '@/app/integrations/storage'
+import { evictLocalFigCache } from '@/app/storage/cache-eviction'
+import { getLocalCanvasStore } from '@/app/storage/local-store'
+import { getOutbox } from '@/app/storage/sync/outbox'
+import { setUploadProgress } from '@/app/storage/sync/progress'
+import { setPendingSyncCount, setSyncUI } from '@/app/storage/sync/status'
+import { PARKED_ATTEMPT_AT, type OutboxJob } from '@/app/storage/sync/types'
+import { emitStorageWorkspaceEvent } from '@/app/storage/workspace/events'
+
+const MAX_ATTEMPTS = 8
+
+let pumping = false
+let wakeTimer: ReturnType<typeof setTimeout> | null = null
+let onlineBound = false
+
+function isOnline(): boolean {
+  // Runtimes without a network indicator, such as workers and tests, count as online.
+  if (typeof navigator === 'undefined') return true
+  const online: unknown = Reflect.get(navigator, 'onLine')
+  return online !== false
+}
+
+/** How long after its `attempts`th failure a job is tried again. */
+function backoffMs(attempts: number): number {
+  return backoffDelay(attempts - 1, BACKOFF.retry)
+}
+
+export function nextSyncWakeDelay(jobs: OutboxJob[], now = Date.now()): number | null {
+  if (jobs.length === 0) return null
+  const nextAt = minOf(jobs.map((job) => job.nextAttemptAt))
+  return nextAt === PARKED_ATTEMPT_AT ? null : Math.max(250, nextAt - now)
+}
+
+function isPermanentError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false
+  const msg = error.message.toLowerCase()
+  return (
+    msg.includes('403') ||
+    msg.includes('401') ||
+    msg.includes('access denied') ||
+    msg.includes('invalid access key')
+  )
+}
+
+async function runJob(job: OutboxJob): Promise<void> {
+  const store = getLocalCanvasStore()
+  const meta = await store.getMeta(job.canvasId)
+  const location = meta ? storageLocationOf(meta) : { providerId: activeStorageProviderID.value }
+  const adapter = await openStorageAdapter(location)
+
+  if (job.type === 'deleteCanvas') {
+    await adapter.deleteDocument(job.canvasId)
+    // Keep the tombstoned row: reconcile purges it once the remote listing
+    // confirms the object is gone. Removing it here opened a race where a
+    // concurrent reconcile re-seeded the canvas from a stale remote listing.
+    await store.updateMeta(job.canvasId, { syncStatus: 'synced', lastSyncError: null })
+    return
+  }
+
+  if (!meta || meta.tombstoned) {
+    // Nothing to put
+    return
+  }
+
+  // Superseded by a newer local revision already on disk
+  if (meta.revision > job.revision) return
+  if (!meta.hasFig) return
+  const fig = await store.readFig(job.canvasId)
+  if (!fig || fig.byteLength === 0) throw new Error('Local document missing for sync')
+  setUploadProgress(job.canvasId, 0)
+  let written: { revision: string | null }
+  try {
+    written = await adapter.putDocument(
+      job.canvasId,
+      fig,
+      {
+        name: meta.name,
+        updatedAt: meta.updatedAt
+      },
+      ({ transferredBytes, totalBytes }) => {
+        if (totalBytes) setUploadProgress(job.canvasId, transferredBytes / totalBytes)
+      },
+      { baseRevision: meta.remoteRevision ?? null }
+    )
+  } finally {
+    setUploadProgress(job.canvasId, null)
+  }
+  // Later local edits build on what was just stored, even when they arrived mid-upload.
+  if (written.revision !== null) {
+    await store.updateMeta(job.canvasId, { remoteRevision: written.revision })
+  }
+  // Only mark synced if still on this revision and no other pending work for newer rev
+  const latest = await store.getMeta(job.canvasId)
+  if (latest && latest.revision === job.revision && !latest.tombstoned) {
+    await store.updateMeta(
+      job.canvasId,
+      {
+        syncStatus: 'synced',
+        lastSyncedAt: new Date().toISOString(),
+        lastSyncError: null,
+        conflictRevision: null
+      },
+      { expectedRevision: job.revision }
+    )
+    await evictLocalFigCache(new Set([job.canvasId]))
+    emitStorageWorkspaceEvent({
+      ...location,
+      documentId: job.canvasId,
+      kind: 'synced'
+    })
+  }
+}
+
+async function pumpOnce(): Promise<void> {
+  const outbox = getOutbox()
+  const jobs = await outbox.list()
+  setPendingSyncCount(jobs.length)
+
+  if (jobs.length === 0) {
+    if (isOnline()) setSyncUI('idle')
+    return
+  }
+
+  if (!isOnline()) {
+    setSyncUI('offline')
+    scheduleWake(5000)
+    return
+  }
+
+  setSyncUI('syncing')
+  const now = Date.now()
+  // Single-flight globally for simplicity (large figs)
+  const job = jobs.find((j) => j.nextAttemptAt <= now)
+  if (!job) {
+    const delay = nextSyncWakeDelay(jobs, now)
+    if (delay != null) scheduleWake(delay)
+    return
+  }
+
+  try {
+    await runJob(job)
+    await outbox.remove(job.id)
+    const remaining = await outbox.list()
+    setPendingSyncCount(remaining.length)
+    if (remaining.length === 0) setSyncUI('idle')
+    else scheduleWake(50)
+  } catch (error) {
+    const { errorName, errorCode, retryable } = describeDiagnosticError(error)
+    recordStorageFailure({
+      operation: storageOperationForJob(job.type),
+      errorName,
+      errorCode,
+      retryable
+    })
+    const message = errorMessage(error)
+    if (error instanceof StorageRevisionConflictError) {
+      // Both versions stay: the local bytes on this device, the newer one on the provider.
+      // The job waits for the person to choose, and other work carries on.
+      await getLocalCanvasStore().updateMeta(job.canvasId, {
+        syncStatus: 'conflict',
+        conflictRevision: error.currentRevision,
+        lastSyncError: null
+      })
+      await outbox.update({ ...job, nextAttemptAt: PARKED_ATTEMPT_AT })
+      const conflicted = await getLocalCanvasStore().getMeta(job.canvasId)
+      if (conflicted) {
+        emitStorageWorkspaceEvent({
+          ...storageLocationOf(conflicted),
+          documentId: job.canvasId,
+          kind: 'changed'
+        })
+      }
+      scheduleWake(50)
+      return
+    }
+    if (error instanceof StorageUnavailableError) {
+      await outbox.update({
+        ...job,
+        nextAttemptAt: PARKED_ATTEMPT_AT
+      })
+      setSyncUI('error', message)
+      return
+    }
+
+    const attempts = job.attempts + 1
+    const permanent = isPermanentError(error) || attempts >= MAX_ATTEMPTS
+    console.warn('[Storage sync] job failed:', job.type, job.canvasId, message)
+
+    if (permanent) {
+      await getLocalCanvasStore().updateMeta(job.canvasId, {
+        syncStatus: 'error',
+        lastSyncError: message
+      })
+      setSyncUI('error', message.slice(0, 120))
+      // Never discard a document mutation. Keep it durable until the user
+      // repairs credentials/permissions and explicitly wakes synchronization.
+      await outbox.update({
+        ...job,
+        attempts,
+        nextAttemptAt: PARKED_ATTEMPT_AT
+      })
+      return
+    }
+
+    const updated: OutboxJob = {
+      ...job,
+      attempts,
+      nextAttemptAt: Date.now() + backoffMs(attempts)
+    }
+    await outbox.update(updated)
+    await getLocalCanvasStore().updateMeta(job.canvasId, {
+      syncStatus: 'pending',
+      lastSyncError: message
+    })
+    // Wake for the next ready job across the whole queue — not this job's
+    // full backoff, which starved other jobs that were ready sooner.
+    const all = await outbox.list()
+    const nextAt = minOf(all.map((j) => j.nextAttemptAt))
+    scheduleWake(Math.max(250, nextAt - Date.now()))
+  }
+}
+
+function scheduleWake(ms: number) {
+  if (wakeTimer != null) clearTimeout(wakeTimer)
+  wakeTimer = setTimeout(() => {
+    wakeTimer = null
+    void kickSyncEngine()
+  }, ms)
+}
+
+function ensureOnlineListeners() {
+  if (onlineBound || !IS_BROWSER) return
+  onlineBound = true
+  window.addEventListener('online', () => {
+    setSyncUI('syncing')
+    void kickSyncEngine()
+  })
+  window.addEventListener('offline', () => {
+    setSyncUI('offline')
+  })
+}
+
+/** Start or continue draining the outbox. Safe to call often. */
+export async function kickSyncEngine(): Promise<void> {
+  ensureOnlineListeners()
+  if (pumping) return
+  pumping = true
+  let pumpFailed = false
+  try {
+    // Drain a few jobs per kick to avoid long tight loops blocking the tab.
+    for (let i = 0; i < 3; i++) {
+      const before = (await getOutbox().list()).length
+      await pumpOnce()
+      const after = (await getOutbox().list()).length
+      if (after === 0 || after >= before) break
+    }
+  } catch (error) {
+    // Never let an escaped rejection strand the queue — retry shortly.
+    pumpFailed = true
+    console.warn('[Storage sync] pump failed:', error)
+    scheduleWake(5000)
+  } finally {
+    pumping = false
+  }
+  // A job enqueued mid-pump can slip past the loop's exit check while its
+  // kick was swallowed by the pumping guard — re-wake if work is already due.
+  // (Skip offline — pumpOnce owns those wakes — and errors, which keep their
+  // 5s backoff; re-waking would clobber it into a tight retry loop.)
+  if (pumpFailed || !isOnline()) return
+  const jobs = await getOutbox().list()
+  if (jobs.some((job) => job.nextAttemptAt <= Date.now())) scheduleWake(250)
+}
+
+export async function enqueuePutCanvas(canvasId: string, revision: number): Promise<void> {
+  await getOutbox().enqueue({ canvasId, type: 'putCanvas', revision })
+  void kickSyncEngine()
+}
+
+export async function enqueueDeleteCanvas(canvasId: string): Promise<void> {
+  await getOutbox().enqueue({ canvasId, type: 'deleteCanvas', revision: 0 })
+  void kickSyncEngine()
+}
+
+/** Retry durable work immediately after storage settings or credentials change. */
+export async function resumeStorageSync(): Promise<void> {
+  const outbox = getOutbox()
+  const jobs = await outbox.list()
+  const now = Date.now()
+  await Promise.all(jobs.map((job) => outbox.update({ ...job, nextAttemptAt: now })))
+  if (jobs.length > 0) setSyncUI('syncing')
+  void kickSyncEngine()
+}
+
+/** After credentials cleared — drop local mirror + outbox (optional safety). */
+export async function clearStorageLocalMirror(): Promise<void> {
+  await getLocalCanvasStore().clearAll()
+  await getOutbox().clear()
+  setPendingSyncCount(0)
+  setSyncUI('idle')
+}

@@ -1,0 +1,205 @@
+<script setup lang="ts">
+import { templateRef } from '@vueuse/core'
+import { ContextMenuContent, ContextMenuItem, ContextMenuPortal } from 'reka-ui'
+import { tv } from 'tailwind-variants'
+import { computed, ref, watch, type ComponentPublicInstance } from 'vue'
+
+import type { SceneNode } from '@open-pencil/scene-graph'
+import { useInlineRename } from '@open-pencil/vue/editor/inline-rename'
+import { useMessages } from '@open-pencil/vue/i18n'
+import { PageListRoot } from '@open-pencil/vue/primitives/PageList'
+import { useFlatReorderDrag } from '@open-pencil/vue/shared/drag'
+
+import { useActiveEditorStoreRef } from '@/app/editor/active-store'
+import { presenceByPage } from '@/app/presence/registry'
+import { appPreferences } from '@/app/settings/preferences/store'
+import PageIssueBadge from '@/components/design-check/PageIssueBadge.vue'
+import PagePresenceHover from '@/components/presence/PagePresenceHover.vue'
+import PresenceMarkers from '@/components/presence/PresenceMarkers.vue'
+import IconButton from '@/components/ui/button/IconButton.vue'
+import AppContextMenuRoot from '@/components/ui/menu/AppContextMenuRoot.vue'
+import AppContextMenuTrigger from '@/components/ui/menu/AppContextMenuTrigger.vue'
+import { useMenuUI } from '@/components/ui/menu/menu'
+import MenuScrollArea from '@/components/ui/menu/MenuScrollArea.vue'
+import pageListTheme from '@/theme/page-list'
+
+type PageItem = Pick<SceneNode, 'id' | 'name' | 'childIds'>
+
+interface PageActions {
+  rename: (pageId: string, name: string) => void
+  delete: (pageId: string) => void
+  move: (pageId: string, index: number) => void
+}
+
+const pageInput = templateRef<HTMLInputElement>('pageInput')
+const rename = useInlineRename((id, name) => pageActions.value?.rename(id, name))
+const panels = useMessages('panels')
+const pageMessages = useMessages('pages')
+const menuCls = useMenuUI({
+  content: 'min-w-36',
+  item: 'justify-start gap-2'
+})
+const pageListStyles = tv(pageListTheme)
+const baseStyles = pageListStyles()
+
+const storeRef = useActiveEditorStoreRef()
+/** Who works on each page: people in the room and active agents. */
+const pagePresence = computed(() =>
+  storeRef.value ? presenceByPage(storeRef.value) : new Map<string, never[]>()
+)
+
+/** Errors and warnings per page, following the View → Design issues toggle like the markers. */
+function pageIssues(pageId: string) {
+  if (!appPreferences.value.designCheck.showOnCanvas) return null
+  return storeRef.value?.designCheck.pages.counts.value.get(pageId) ?? null
+}
+
+const pageActions = ref<Pick<PageActions, 'rename'> | null>(null)
+const currentPages = ref<readonly PageItem[]>([])
+const currentMovePage = ref<PageActions['move'] | null>(null)
+const pageReorder = useFlatReorderDrag<PageItem>({
+  items: () => currentPages.value,
+  onMove: (pageId, index) => currentMovePage.value?.(pageId, index)
+})
+
+function setPageActions(renamePage: (pageId: string, name: string) => void) {
+  pageActions.value = { rename: renamePage }
+}
+
+watch(pageInput, (input) => {
+  if (input) void rename.focusInput(input)
+})
+
+function startRename(pg: PageItem, renamePage: (pageId: string, name: string) => void) {
+  setPageActions(renamePage)
+  rename.start(pg.id, pg.name)
+}
+
+function pageDropPosition(pg: PageItem): 'before' | 'after' | undefined {
+  if (pageReorder.instructionTargetId.value !== pg.id) return undefined
+  if (pageReorder.instruction.value?.operation === 'reorder-before') return 'before'
+  if (pageReorder.instruction.value?.operation === 'reorder-after') return 'after'
+  return undefined
+}
+
+function pageStyles(pg: PageItem, currentPageId: string) {
+  return pageListStyles({
+    active: pg.id === currentPageId,
+    dragging: pageReorder.draggingId.value === pg.id,
+    dropPosition: pageDropPosition(pg)
+  })
+}
+
+function setupPageRowRef(
+  value: Element | ComponentPublicInstance | null,
+  pg: PageItem,
+  pages: readonly PageItem[],
+  movePage: PageActions['move']
+) {
+  currentPages.value = pages
+  currentMovePage.value = movePage
+  pageReorder.setupItem(value instanceof HTMLElement ? value : null, () => ({ id: pg.id }))
+}
+</script>
+
+<template>
+  <PageListRoot v-slot="{ pages, currentPageId, isDivider, actions }">
+    <div data-test-id="pages-panel" :class="baseStyles.panel()">
+      <div :class="baseStyles.header()">
+        <span data-test-id="pages-header" :class="baseStyles.title()">{{ panels.pages }}</span>
+        <IconButton :label="panels.addPage" data-test-id="pages-add" @click="actions.add()">
+          <icon-lucide-plus class="size-3.5" />
+        </IconButton>
+      </div>
+      <div :class="baseStyles.body()">
+        <div data-test-id="pages-scroll" :class="baseStyles.viewport()">
+          <AppContextMenuRoot v-for="pg in pages" :key="pg.id" :modal="false">
+            <AppContextMenuTrigger as-child>
+              <div
+                data-test-id="pages-row"
+                :ref="(value) => setupPageRowRef(value, pg, pages, actions.move)"
+                :class="pageStyles(pg, currentPageId).row()"
+                :data-page-id="pg.id"
+                :data-active="pg.id === currentPageId || undefined"
+                :data-dragging="pageReorder.draggingId.value === pg.id || undefined"
+                :data-drop-position="pageDropPosition(pg)"
+              >
+                <div
+                  v-if="pageDropPosition(pg) === 'before'"
+                  data-test-id="pages-drop-indicator"
+                  :class="pageStyles(pg, currentPageId).dropIndicator()"
+                />
+                <div
+                  v-if="rename.editingId.value === pg.id"
+                  :class="pageStyles(pg, currentPageId).renameRow()"
+                >
+                  <icon-lucide-file :class="pageStyles(pg, currentPageId).icon()" />
+                  <input
+                    ref="pageInput"
+                    data-test-id="pages-item-input"
+                    :aria-label="pageMessages.pageNameLabel"
+                    :class="pageStyles(pg, currentPageId).renameInput()"
+                    :value="pg.name"
+                    @blur="rename.commit(pg.id, $event)"
+                    @keydown.stop="rename.onKeydown"
+                  />
+                </div>
+                <div
+                  v-else-if="isDivider(pg)"
+                  data-test-id="pages-divider"
+                  :class="pageStyles(pg, currentPageId).divider()"
+                  @dblclick="startRename(pg, actions.rename)"
+                >
+                  <div :class="pageStyles(pg, currentPageId).dividerLine()" />
+                </div>
+                <PagePresenceHover v-else :page-id="pg.id">
+                  <button
+                    data-test-id="pages-item"
+                    :class="pageStyles(pg, currentPageId).item()"
+                    @click="actions.switch(pg.id)"
+                    @dblclick="startRename(pg, actions.rename)"
+                  >
+                    <icon-lucide-file :class="pageStyles(pg, currentPageId).icon()" />
+                    <span :class="pageStyles(pg, currentPageId).label()">{{ pg.name }}</span>
+                    <span :class="pageStyles(pg, currentPageId).trailing()">
+                      <PresenceMarkers :entries="pagePresence.get(pg.id) ?? []" />
+                      <PageIssueBadge :counts="pageIssues(pg.id)" />
+                    </span>
+                  </button>
+                </PagePresenceHover>
+                <div
+                  v-if="pageDropPosition(pg) === 'after'"
+                  data-test-id="pages-drop-indicator"
+                  :class="pageStyles(pg, currentPageId).dropIndicator()"
+                />
+              </div>
+            </AppContextMenuTrigger>
+            <ContextMenuPortal>
+              <ContextMenuContent :class="menuCls.content" :side-offset="2" align="start">
+                <MenuScrollArea>
+                  <ContextMenuItem
+                    data-test-id="pages-context-rename"
+                    :class="menuCls.item"
+                    @select="startRename(pg, actions.rename)"
+                  >
+                    <icon-lucide-pencil :class="menuCls.icon" />
+                    <span>{{ pageMessages.rename }}</span>
+                  </ContextMenuItem>
+                  <ContextMenuItem
+                    data-test-id="pages-context-delete"
+                    :class="menuCls.item"
+                    :disabled="pages.length <= 1"
+                    @select="actions.delete(pg.id)"
+                  >
+                    <icon-lucide-trash-2 :class="menuCls.icon" />
+                    <span>{{ pageMessages.delete }}</span>
+                  </ContextMenuItem>
+                </MenuScrollArea>
+              </ContextMenuContent>
+            </ContextMenuPortal>
+          </AppContextMenuRoot>
+        </div>
+      </div>
+    </div>
+  </PageListRoot>
+</template>

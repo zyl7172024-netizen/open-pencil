@@ -1,0 +1,55 @@
+<script setup lang="ts">
+import { PopoverContent, PopoverPortal, PopoverTrigger } from 'reka-ui'
+import { computed } from 'vue'
+
+import { showsRoomDocument } from '@open-pencil/collab'
+
+import CampaignNoteHost from '@/components/campaigns/CampaignNoteHost.vue'
+import ConnectedRoom from '@/components/collab-panel/ConnectedRoom.vue'
+import { useCollabPanelContext } from '@/components/collab-panel/context'
+import ShareOrJoinRoom from '@/components/collab-panel/ShareOrJoinRoom.vue'
+import AppPopoverRoot from '@/components/ui/overlay/AppPopoverRoot.vue'
+import { usePopoverUI } from '@/components/ui/overlay/popover'
+
+import { shareButton } from './ui'
+
+const collab = useCollabPanelContext()
+const cls = usePopoverUI({ content: 'z-50 w-72 p-3' })
+const connection = computed(() => {
+  const status = collab.state.status
+  if (!status) return 'idle'
+  return showsRoomDocument(status) ? 'connected' : 'joining'
+})
+</script>
+
+<template>
+  <AppPopoverRoot v-model:open="collab.popoverOpen">
+    <PopoverTrigger as-child>
+      <button
+        data-test-id="collab-share-button"
+        :data-connection="connection"
+        :class="shareButton({ connection })"
+      >
+        <icon-lucide-share-2 class="size-3.5" />
+        {{ collab.messages.share }}
+      </button>
+    </PopoverTrigger>
+
+    <PopoverPortal>
+      <PopoverContent
+        data-test-id="collab-popover"
+        :class="cls.content"
+        :side-offset="8"
+        side="bottom"
+        align="end"
+        @open-auto-focus.prevent
+      >
+        <ConnectedRoom v-if="collab.state.inRoom" />
+        <template v-else>
+          <CampaignNoteHost placement="share" class="mb-3" />
+          <ShareOrJoinRoom />
+        </template>
+      </PopoverContent>
+    </PopoverPortal>
+  </AppPopoverRoot>
+</template>

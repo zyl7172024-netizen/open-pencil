@@ -1,0 +1,179 @@
+<script setup lang="ts">
+import { computed, reactive, watch } from 'vue'
+
+import { isNumberRange, type BehaviourKind } from '@open-pencil/scene-graph/behaviours'
+import type {
+  BehaviourBooleanControl,
+  BehaviourNumberControl,
+  BehaviourPartControl,
+  BehaviourValueControl
+} from '@open-pencil/vue/controls/behaviour'
+import { useMessages } from '@open-pencil/vue/i18n'
+
+import NumberField from '@/components/inputs/NumberField.vue'
+import PanelFieldGroup from '@/components/ui/panel/PanelFieldGroup.vue'
+import AppSelect from '@/components/ui/select/AppSelect.vue'
+
+import BehaviourBindingField from './BehaviourBindingField.vue'
+import { useBehaviourLabels } from './labels'
+
+/** One row of the Behaviour section: a value of the control, or one of its parts. */
+const { kind, row } = defineProps<{
+  kind: BehaviourKind
+  row: { part: BehaviourPartControl } | { value: BehaviourValueControl }
+}>()
+const emit = defineEmits<{
+  bind: [propertyId: string]
+  create: [name: string]
+  mapValue: [mapping: { on: string; off: string }]
+  setNumber: [settings: Omit<BehaviourNumberControl, 'id' | 'type'>]
+}>()
+const panels = useMessages('panels')
+const behaviourMessages = useMessages('panels/behaviours')
+const labels = useBehaviourLabels()
+
+const part = computed(() => ('part' in row ? row.part : null))
+const value = computed(() => ('value' in row ? row.value : null))
+/** A row the control requires that is still unbound; its label shows it. */
+const missing = computed(() => {
+  const control = part.value ?? value.value
+  return !!control && 'required' in control && control.required && !control.propertyId
+})
+const number = computed(() => (value.value?.type === 'number' ? value.value : null))
+const id = computed(() => part.value?.id ?? value.value?.id ?? '')
+const label = computed(() =>
+  part.value ? labels.value.part(id.value) : labels.value.valueOf(kind, id.value)
+)
+
+/** Variant values of the bound property, for choosing which mean on and off. */
+function variantValues(boolean: BehaviourBooleanControl) {
+  const option = boolean.options.find((item) => item.id === boolean.propertyId)
+  return (option?.values ?? []).map((name) => ({ value: name, label: name }))
+}
+
+const MAPPING_SIDES = ['on', 'off'] as const
+
+const mappingLabel = (side: 'on' | 'off') =>
+  side === 'on'
+    ? behaviourMessages.value.behaviourOnValue
+    : behaviourMessages.value.behaviourOffValue
+
+function setMapping(boolean: BehaviourBooleanControl, side: 'on' | 'off', choice: string) {
+  emit('mapValue', {
+    on: side === 'on' ? choice : (boolean.on ?? ''),
+    off: side === 'off' ? choice : (boolean.off ?? '')
+  })
+}
+
+const NUMBER_FIELDS = ['min', 'max', 'step', 'default'] as const
+type NumberSetting = (typeof NUMBER_FIELDS)[number]
+
+/** Number fields as they are scrubbed, reset whenever the value changes. */
+const drafts = reactive<Partial<Record<NumberSetting, number>>>({})
+watch(
+  value,
+  (current) => {
+    if (current?.type === 'number')
+      for (const field of NUMBER_FIELDS) drafts[field] = current[field]
+  },
+  { immediate: true, deep: true }
+)
+
+/** Keep a range a slider can step through; any other puts the field back. */
+function commitNumber(number: BehaviourNumberControl, field: NumberSetting, input: number) {
+  const { id: _id, type: _type, ...settings } = number
+  const next = { ...settings, [field]: input }
+  if (isNumberRange(next)) emit('setNumber', next)
+  else drafts[field] = number[field]
+}
+
+function numberLabel(field: NumberSetting) {
+  const p = behaviourMessages.value
+  return {
+    min: p.behaviourMin,
+    max: p.behaviourMax,
+    step: p.behaviourStep,
+    default: p.behaviourStart
+  }[field]
+}
+</script>
+
+<template>
+  <PanelFieldGroup
+    :label="label"
+    :data-row="id"
+    :data-missing="missing || undefined"
+    :ui="{ root: 'group', label: 'group-data-[missing]:text-warning' }"
+  >
+    <BehaviourBindingField
+      v-if="part"
+      :label="label"
+      :property-id="part.propertyId"
+      :options="part.options"
+      :placeholder="behaviourMessages.behaviourChooseSlot"
+      :empty-label="behaviourMessages.behaviourNoSlots"
+      :create-label="behaviourMessages.behaviourAddSlot({ name: label })"
+      :missing="part.required"
+      :data-property="`behaviour-part-${id}`"
+      @bind="emit('bind', $event)"
+      @create="emit('create', label)"
+    />
+    <template v-else-if="value?.type === 'boolean'">
+      <BehaviourBindingField
+        :label="label"
+        :property-id="value.propertyId"
+        :options="value.options"
+        :placeholder="behaviourMessages.behaviourChooseProperty"
+        :empty-label="panels.noComponentProperties"
+        :create-label="behaviourMessages.behaviourAddVariants"
+        :missing="value.required"
+        :data-property="`behaviour-value-${id}`"
+        @bind="emit('bind', $event)"
+        @create="emit('create', label)"
+      />
+      <!-- Which variant value draws the control on and which off, labelled as the states are. -->
+      <div
+        v-if="value.propertyId && variantValues(value).length"
+        class="mt-1.5 grid grid-cols-2 gap-x-1 gap-y-1.5"
+      >
+        <PanelFieldGroup v-for="side in MAPPING_SIDES" :key="side" :label="mappingLabel(side)">
+          <AppSelect
+            :label="
+              behaviourMessages.behaviourValueField({ value: label, side: mappingLabel(side) })
+            "
+            :model-value="value[side] ?? ''"
+            :options="variantValues(value)"
+            :data-property="`behaviour-value-${id}-${side}`"
+            @update:model-value="setMapping(value, side, $event)"
+          />
+        </PanelFieldGroup>
+      </div>
+    </template>
+    <BehaviourBindingField
+      v-else-if="value?.type === 'text'"
+      :label="label"
+      :property-id="value.propertyId"
+      :options="value.options"
+      :placeholder="behaviourMessages.behaviourChooseProperty"
+      :empty-label="panels.noComponentProperties"
+      :create-label="behaviourMessages.behaviourAddTextLayer"
+      :missing="value.required"
+      :data-property="`behaviour-value-${id}`"
+      @bind="emit('bind', $event)"
+      @create="emit('create', label)"
+    />
+    <div v-else-if="number" class="grid grid-cols-2 gap-1" :data-property="`behaviour-value-${id}`">
+      <NumberField
+        v-for="field in NUMBER_FIELDS"
+        :key="field"
+        :label="numberLabel(field)"
+        :aria-label="numberLabel(field)"
+        :model-value="drafts[field] ?? number[field]"
+        :data-property="`behaviour-number-${field}`"
+        @update:model-value="drafts[field] = $event"
+        @commit="(input: number) => number && commitNumber(number, field, input)"
+        @cancel="drafts[field] = number[field]"
+      />
+    </div>
+  </PanelFieldGroup>
+</template>

@@ -1,0 +1,376 @@
+import type {
+  CanvasKit,
+  FontStyle,
+  Paint,
+  Paragraph,
+  ParagraphBuilder,
+  TextFontFeatures,
+  TextFontVariations
+} from '@open-pencil/canvaskit'
+import type { CharacterStyleOverride, ColorProfile, SceneNode } from '@open-pencil/scene-graph'
+import { normalizeColor, toExtendedSRGB } from '@open-pencil/scene-graph/color'
+import { faceStyleKey, type NamedFace } from '@open-pencil/scene-graph/font-style'
+import { rangeFontStyle } from '@open-pencil/scene-graph/shared-styles'
+import { lineHeightPixels, styleRunPieces, textLengthPixels } from '@open-pencil/scene-graph/text'
+import { resolveNodeTextDirection } from '@open-pencil/scene-graph/text/direction'
+
+import {
+  pushParagraphStyle,
+  type ParagraphPaintStyle,
+  type ParagraphBuildOptions
+} from '#core/canvas/text/paint'
+import type { TextRenderer } from '#core/canvas/text/renderer'
+import { DEFAULT_FONT_FAMILY, DEFAULT_FONT_SIZE } from '#core/constants'
+import { autoWidthWrapWidth } from '#core/layout/text-measurement'
+import { shownTextSlice } from '#core/text/case'
+import { ELLIPSIS } from '#core/text/ellipsis'
+import { makeParagraphBuilder } from '#core/text/font/collection'
+import {
+  drawnFontVariations,
+  loadedFace,
+  resolveParagraphFontFamilies,
+  type LoadedFace
+} from '#core/text/font/families'
+import { fontManager } from '#core/text/font/manager'
+import { laidOutText } from '#core/text/keycap'
+
+import type { ParagraphNode } from './inputs'
+
+export function resolveParagraphLayoutWidth(node: ParagraphNode, maxWidth?: number): number {
+  if (maxWidth !== undefined) return maxWidth
+  if (node.textAutoResize === 'WIDTH_AND_HEIGHT') {
+    return autoWidthWrapWidth(node) ?? 1e6
+  }
+  return node.width || 1e6
+}
+
+export function buildTruncateOpts(node: ParagraphNode): { maxLines?: number; ellipsis?: string } {
+  if (node.textTruncation !== 'ENDING') return {}
+
+  const opts: { maxLines?: number; ellipsis: string } = { ellipsis: ELLIPSIS }
+  if (node.maxLines != null && node.maxLines > 0) {
+    opts.maxLines = node.maxLines
+  }
+  return opts
+}
+
+function getParagraphTextAlign(
+  ck: CanvasKit,
+  node: Pick<SceneNode, 'textAlignHorizontal' | 'textDirection' | 'text'>
+) {
+  const direction = resolveNodeTextDirection(node)
+  switch (node.textAlignHorizontal) {
+    case 'CENTER':
+      return ck.TextAlign.Center
+    case 'RIGHT':
+      return direction === 'RTL' ? ck.TextAlign.Left : ck.TextAlign.Right
+    case 'JUSTIFIED':
+      return ck.TextAlign.Justify
+    default:
+      return direction === 'RTL' ? ck.TextAlign.Right : ck.TextAlign.Left
+  }
+}
+
+/** Explicit axes win over the named-instance axes of a variable face (`implicit`). */
+export function textFontVariations(
+  variations: SceneNode['fontVariations'] | undefined,
+  implicit: SceneNode['fontVariations'] | null = null
+): TextFontVariations[] | undefined {
+  const explicitAxes = new Set(variations?.map((variation) => variation.axis))
+  const merged = [
+    ...(implicit ?? []).filter((variation) => !explicitAxes.has(variation.axis)),
+    ...(variations ?? [])
+  ]
+  if (merged.length === 0) return undefined
+  return merged.map((variation) => ({ axis: variation.axis, value: variation.value }))
+}
+
+export function textFontFeatures(
+  features: SceneNode['fontFeatures'] | undefined
+): TextFontFeatures[] | undefined {
+  if (!features || features.length === 0) return undefined
+  return features.map((feature) => ({
+    name: feature.tag.toLowerCase(),
+    value: feature.enabled ? 1 : 0
+  }))
+}
+
+/**
+ * The style a paragraph asks CanvasKit for: the face of the family that is loaded. Asked for a
+ * face it lacks, CanvasKit slants and emboldens another, which neither Figma, a browser, nor a
+ * native text stack draws the same, so a missing face is drawn as the face that exists and
+ * reported missing, as Figma does. A family with no face loaded asks for the style as given.
+ */
+function drawnFontStyle(
+  ck: CanvasKit,
+  loaded: LoadedFace | null,
+  weight: number,
+  italic: boolean
+): FontStyle {
+  const face = loaded ?? { weight, italic }
+  return {
+    weight: { value: face.weight },
+    slant: face.italic ? ck.FontSlant.Italic : ck.FontSlant.Upright
+  }
+}
+
+/** The colour a style run's text is drawn in: its first visible solid fill, or `baseColor`. */
+export function styleRunColor(
+  ck: CanvasKit,
+  style: SceneNode['styleRuns'][number]['style'],
+  baseColor: Float32Array,
+  space: ColorProfile
+): Float32Array {
+  const visibleFill = style.fills?.find((fill) => fill.visible && fill.type === 'SOLID')
+  if (!visibleFill) return baseColor
+  const color = toExtendedSRGB(normalizeColor(visibleFill.color), space)
+  return ck.Color4f(color.r, color.g, color.b, color.a * visibleFill.opacity)
+}
+
+/**
+ * A text style's color. CanvasKit keeps `color` in 8-bit sRGB, which clips a wide-gamut color, and
+ * draws `foregroundColor` with float components, so both carry it; a pushed foreground paint, as
+ * a gradient fill draws with, still takes their place.
+ */
+function textColor(color: Float32Array) {
+  return { color, foregroundColor: color }
+}
+
+function styleRunLanguage(
+  style: SceneNode['styleRuns'][number]['style'],
+  node: Pick<ParagraphNode, 'textLanguage'>
+): string | undefined {
+  return (style.textLanguage !== undefined ? style.textLanguage : node.textLanguage) ?? undefined
+}
+
+function pushStyleRun(
+  r: TextRenderer,
+  builder: ParagraphBuilder,
+  node: ParagraphNode,
+  style: CharacterStyleOverride,
+  baseColor: Float32Array,
+  baseFontSize: number,
+  fontFamilies: (primary: string, face: NamedFace) => string[],
+  halfLeading: boolean,
+  paintStyle?: ParagraphPaintStyle
+): void {
+  const ck = r.ck
+  const runFontSize = style.fontSize ?? baseFontSize
+  // A percent follows the run's own font size, as in Figma.
+  const runLineHeight = lineHeightPixels(
+    style.lineHeight !== undefined ? style.lineHeight : node.lineHeight,
+    runFontSize
+  )
+  const runFamily = style.fontFamily ?? (node.fontFamily || DEFAULT_FONT_FAMILY)
+  const runWeight = style.fontWeight ?? node.fontWeight
+  const runItalic = style.italic ?? node.italic
+  const runFace = {
+    fontWeight: runWeight,
+    italic: runItalic,
+    fontStyle: rangeFontStyle(node, style)
+  }
+  const runKey = faceStyleKey(runFace)
+  const runLoaded = loadedFace(runFamily, runWeight, runItalic, runKey)
+
+  const runColor = styleRunColor(ck, style, baseColor, r.documentColorSpace ?? 'srgb')
+  const textStyle = new ck.TextStyle({
+    ...textColor(runColor),
+    fontFamilies: fontFamilies(runFamily, runFace),
+    fontSize: runFontSize,
+    locale: styleRunLanguage(style, node),
+    fontStyle: drawnFontStyle(ck, runLoaded, runWeight, runItalic),
+    fontVariations: textFontVariations(
+      drawnFontVariations({
+        family: runFamily,
+        weight: runWeight,
+        italic: runItalic,
+        style: runKey,
+        fontSize: runFontSize,
+        variations: style.fontVariations ?? node.fontVariations,
+        opticalSizeFromFontSize: style.opticalSizeFromFontSize ?? node.opticalSizeFromFontSize,
+        loaded: runLoaded
+      })
+    ),
+    fontFeatures: textFontFeatures(style.fontFeatures ?? node.fontFeatures),
+    letterSpacing: textLengthPixels(style.letterSpacing ?? node.letterSpacing, runFontSize),
+    heightMultiplier: runLineHeight ? runLineHeight / runFontSize : undefined,
+    halfLeading
+  })
+  pushParagraphStyle(builder, textStyle, paintStyle)
+}
+
+/** `text[start, end)` in the case each of its characters has. */
+function addParagraphText(
+  builder: ParagraphBuilder,
+  node: ParagraphNode,
+  start: number,
+  end: number
+): void {
+  builder.addText(laidOutText(shownTextSlice(node, start, end)))
+}
+
+function addStyledRuns(
+  r: TextRenderer,
+  builder: ParagraphBuilder,
+  node: ParagraphNode,
+  baseColor: Float32Array,
+  baseFontSize: number,
+  fontFamilies: (primary: string, face: NamedFace) => string[],
+  halfLeading: boolean,
+  paintStyle?: ParagraphPaintStyle
+): void {
+  const text = node.text
+  // A run that starts or ends inside a surrogate pair moves to its end, as Skia would shape each
+  // half on its own.
+  const boundary = (index: number) => codePointBoundary(text, index)
+  for (const { start, end, style } of styleRunPieces(node.styleRuns, text.length, boundary)) {
+    if (!style) {
+      addParagraphText(builder, node, start, end)
+      continue
+    }
+    pushStyleRun(
+      r,
+      builder,
+      node,
+      style,
+      baseColor,
+      baseFontSize,
+      fontFamilies,
+      halfLeading,
+      paintStyle
+    )
+    addParagraphText(builder, node, start, end)
+    builder.pop()
+  }
+}
+
+function isHighSurrogate(code: number): boolean {
+  return code >= 0xd800 && code <= 0xdbff
+}
+
+function isLowSurrogate(code: number): boolean {
+  return code >= 0xdc00 && code <= 0xdfff
+}
+
+/** `index`, or the end of the surrogate pair it splits. */
+function codePointBoundary(text: string, index: number): number {
+  const splitsPair =
+    index > 0 &&
+    index < text.length &&
+    isLowSurrogate(text.charCodeAt(index)) &&
+    isHighSurrogate(text.charCodeAt(index - 1))
+  return splitsPair ? index + 1 : index
+}
+
+/** What a paragraph that is one block of a longer text needs beyond its node's own style. */
+export interface ParagraphBlockOptions {
+  /** Room before the first line, as a plain paragraph's first-line indent. */
+  firstLineIndent?: number
+  /** Truncation for this block in place of the node's. */
+  truncation?: { maxLines?: number; ellipsis?: string }
+}
+
+/** Room before a paragraph's first line, as an empty placeholder on its baseline. */
+function addFirstLineIndent(ck: CanvasKit, builder: ParagraphBuilder, width: number): void {
+  builder.addPlaceholder(width, 0, ck.PlaceholderAlignment.Baseline, ck.TextBaseline.Alphabetic, 0)
+}
+
+/**
+ * A native paragraph for `node`'s text in its style runs, not yet laid out. A first-line
+ * indent is a placeholder before the text, which takes the first character index.
+ */
+export function buildSkParagraph(
+  r: TextRenderer,
+  node: ParagraphNode,
+  color?: Float32Array,
+  { halfLeading = false, foregroundPaint }: ParagraphBuildOptions = {},
+  block: ParagraphBlockOptions = {}
+): Paragraph {
+  const ck = r.ck
+  const baseColor = color ?? ck.BLACK
+  const baseFontSize = node.fontSize || DEFAULT_FONT_SIZE
+  const baseLineHeight = lineHeightPixels(node.lineHeight, baseFontSize)
+  const cjkFallbacks = fontManager.getCJKFallbackFamilies()
+  const arabicFallbacks = fontManager.getArabicFallbackFamilies()
+  const textDirection = resolveNodeTextDirection(node)
+
+  const truncateOpts = block.truncation ?? buildTruncateOpts(node)
+
+  const fontFamilies = (primary: string, face: NamedFace) =>
+    resolveParagraphFontFamilies(
+      primary,
+      { weight: face.fontWeight, italic: face.italic, style: faceStyleKey(face) },
+      arabicFallbacks,
+      cjkFallbacks
+    )
+  const nodeFamily = node.fontFamily || DEFAULT_FONT_FAMILY
+  const nodeKey = faceStyleKey(node)
+  const nodeLoaded = loadedFace(nodeFamily, node.fontWeight, node.italic, nodeKey)
+
+  const baseTextStyle = {
+    ...textColor(baseColor),
+    fontFamilies: fontFamilies(nodeFamily, node),
+    fontSize: baseFontSize,
+    locale: node.textLanguage ?? undefined,
+    fontStyle: drawnFontStyle(ck, nodeLoaded, node.fontWeight, node.italic),
+    fontVariations: textFontVariations(
+      drawnFontVariations({
+        family: nodeFamily,
+        weight: node.fontWeight,
+        italic: node.italic,
+        style: nodeKey,
+        fontSize: baseFontSize,
+        variations: node.fontVariations,
+        opticalSizeFromFontSize: node.opticalSizeFromFontSize,
+        loaded: nodeLoaded
+      })
+    ),
+    fontFeatures: textFontFeatures(node.fontFeatures),
+    letterSpacing: textLengthPixels(node.letterSpacing, baseFontSize),
+    heightMultiplier: baseLineHeight ? baseLineHeight / baseFontSize : undefined,
+    halfLeading
+  }
+  const paraStyle = new ck.ParagraphStyle({
+    textAlign: getParagraphTextAlign(ck, node),
+    textDirection: textDirection === 'RTL' ? ck.TextDirection.RTL : ck.TextDirection.LTR,
+    ...truncateOpts,
+    textStyle: baseTextStyle,
+    // Figma fits and sizes lines by their glyphs, and starts them at their first glyph.
+    trimLetterSpacing: true,
+    applyRoundingHack: false
+  })
+
+  if (!r.fontProvider) throw new Error('Font provider not initialized')
+  const builder = makeParagraphBuilder(ck, paraStyle, r.fontProvider)
+
+  let background: Paint | undefined
+  try {
+    let paintStyle: ParagraphPaintStyle | undefined
+    if (foregroundPaint) {
+      background = new ck.Paint()
+      background.setColor(ck.TRANSPARENT)
+      paintStyle = { foreground: foregroundPaint, background }
+      builder.pushPaintStyle(new ck.TextStyle(baseTextStyle), foregroundPaint, background)
+    }
+    if (block.firstLineIndent) addFirstLineIndent(ck, builder, block.firstLineIndent)
+    if (node.styleRuns.length === 0) {
+      addParagraphText(builder, node, 0, node.text.length)
+    } else {
+      addStyledRuns(
+        r,
+        builder,
+        node,
+        baseColor,
+        baseFontSize,
+        fontFamilies,
+        halfLeading,
+        paintStyle
+      )
+    }
+
+    return builder.build()
+  } finally {
+    builder.delete()
+    background?.delete()
+  }
+}

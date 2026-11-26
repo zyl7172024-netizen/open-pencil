@@ -1,0 +1,15 @@
+import { focusStyles } from '@open-pencil/theme'
+
+export default {
+  slots: {
+    root: [
+      'group flex w-full cursor-pointer items-center gap-3 rounded border border-border bg-panel-field px-3 py-2 text-start whitespace-normal transition-colors enabled:hover:bg-panel-field-hover disabled:cursor-not-allowed disabled:opacity-50',
+      focusStyles.ring
+    ],
+    leading: 'flex shrink-0 items-center justify-center text-muted',
+    body: 'min-w-0 flex-1',
+    label: 'block truncate text-2xs font-medium text-surface',
+    description: 'block text-3xs break-words text-muted',
+    trailing: 'flex shrink-0 items-center gap-1 text-muted'
+  }
+} as const

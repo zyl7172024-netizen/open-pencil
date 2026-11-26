@@ -1,0 +1,14 @@
+{
+  "title": "Rinomina",
+  "layers": "Rinomina {count} livelli",
+  "preview": "Anteprima",
+  "match": "Corrispondenza",
+  "to": "Rinomina in",
+  "currentName": "Nome attuale",
+  "layerName": "Nome del livello",
+  "numberAscending": "Numero ↑",
+  "numberDescending": "Numero ↓",
+  "startAscendingFrom": "Inizia ordine crescente da",
+  "stopDescendingAt": "Termina ordine decrescente a",
+  "invalidPattern": "Espressione regolare non valida"
+}

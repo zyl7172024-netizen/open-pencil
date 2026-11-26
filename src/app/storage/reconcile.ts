@@ -1,0 +1,73 @@
+import type { StorageDocument } from '@/app/integrations/storage'
+import type { LocalCanvasMeta } from '@/app/storage/local-store'
+
+export type StorageReconciliation = {
+  documents: StorageDocument[]
+  remoteDocumentsToSeed: StorageDocument[]
+  localIdsToPurge: string[]
+}
+
+/**
+ * Merge a successful remote listing with pending local work without reviving tombstones, except
+ * for a document restored on the server since this device deleted it.
+ */
+export function reconcileStorageDocuments(
+  local: LocalCanvasMeta[],
+  remote: StorageDocument[]
+): StorageReconciliation {
+  const localById = new Map(local.map((metadata) => [metadata.id, metadata]))
+  const remoteById = new Map(remote.map((document) => [document.id, document]))
+  const remoteIds = new Set(remoteById.keys())
+  // Restoring a deleted document, from Trash or by an administrator, marks it changed after this
+  // device deleted it; a listing fetched before the deletion went through still shows it older.
+  const restored = (metadata: LocalCanvasMeta) => {
+    const listed = remoteById.get(metadata.id)
+    return (
+      metadata.tombstoned &&
+      metadata.syncStatus === 'synced' &&
+      listed !== undefined &&
+      listed.updatedAt > metadata.updatedAt
+    )
+  }
+  const tombstonedIds = new Set(
+    local
+      .filter((metadata) => metadata.tombstoned && !restored(metadata))
+      .map((metadata) => metadata.id)
+  )
+  const merged = new Map(
+    remote
+      .filter((document) => !tombstonedIds.has(document.id))
+      .map((document) => [document.id, document])
+  )
+
+  // A synced copy the provider no longer lists was deleted there, by another device or person.
+  const deletedRemotely = (metadata: LocalCanvasMeta) =>
+    metadata.syncStatus === 'synced' && !remoteIds.has(metadata.id)
+
+  for (const metadata of local) {
+    if (metadata.tombstoned || deletedRemotely(metadata)) continue
+    if (metadata.syncStatus === 'synced' && merged.has(metadata.id)) continue
+    merged.set(metadata.id, {
+      id: metadata.id,
+      name: metadata.name,
+      updatedAt: metadata.updatedAt,
+      metadataAuthoritative: true,
+      revision: metadata.remoteRevision ?? null
+    })
+  }
+
+  return {
+    documents: [...merged.values()].sort((first, second) =>
+      second.updatedAt.localeCompare(first.updatedAt)
+    ),
+    remoteDocumentsToSeed: remote.filter((document) => !localById.has(document.id)),
+    localIdsToPurge: local
+      .filter(
+        (metadata) =>
+          (metadata.tombstoned && !remoteIds.has(metadata.id)) ||
+          restored(metadata) ||
+          deletedRemotely(metadata)
+      )
+      .map((metadata) => metadata.id)
+  }
+}

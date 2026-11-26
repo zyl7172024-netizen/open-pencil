@@ -1,0 +1,22 @@
+{
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "types": ["@cloudflare/workers-types"],
+    "paths": {
+      "#feedback/*": ["./src/*"],
+      "@open-pencil/std/*": ["../std/src/*"],
+      "@open-pencil/cloud/contract": ["../cloud/src/contract/index.ts"],
+      "@open-pencil/cloud/email": ["../cloud/src/email/index.ts"],
+      "#cloud/*": ["../cloud/src/*"]
+    }
+  },
+  "include": ["src/**/*.ts", "worker-configuration.d.ts"]
+}

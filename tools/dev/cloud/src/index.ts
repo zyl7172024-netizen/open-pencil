@@ -1,0 +1,245 @@
+import { existsSync } from 'node:fs'
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
+
+import { fromUint8Array } from 'js-base64'
+
+import { resolveWorkspaceRoot } from '@open-pencil/package-artifacts-tools'
+import { randomHex } from '@open-pencil/std/random'
+
+import { composeProjectName, localCloudDeploymentTOML } from './config'
+
+const root = await resolveWorkspaceRoot(import.meta.dir)
+const composeFile = join(root, 'packages/cloud/deploy/compose.yml')
+const generatedDirectory = join(root, 'packages/cloud/deploy/generated')
+const generatedConfig = join(generatedDirectory, 'openpencil-cloud.local.toml')
+const generatedSecret = join(generatedDirectory, 'auth-secret')
+const generatedSigningKey = join(generatedDirectory, 'services-signing-key.pem')
+const generatedServiceToken = join(generatedDirectory, 'service-token')
+
+// Development-only credentials shared with compose.yml defaults.
+const POSTGRES_PASSWORD = 'openpencil-development-password'
+const S3_ACCESS_KEY_ID = 'openpencil'
+const S3_SECRET_ACCESS_KEY = 'openpencil-development-secret'
+
+async function output(command: string[]): Promise<string> {
+  const child = Bun.spawn(command, { cwd: root, stdout: 'pipe', stderr: 'pipe' })
+  const [stdout, stderr, exitCode] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+    child.exited
+  ])
+  if (exitCode !== 0) throw new Error(stderr.trim() || `${command[0]} exited with ${exitCode}`)
+  return stdout.trim()
+}
+
+async function execute(
+  command: string[],
+  options: { allowFailure?: boolean; environment?: Record<string, string | undefined> } = {}
+): Promise<number> {
+  const child = Bun.spawn(command, {
+    cwd: root,
+    env: options.environment,
+    stdout: 'inherit',
+    stderr: 'inherit'
+  })
+  const exitCode = await child.exited
+  if (exitCode !== 0 && !options.allowFailure) {
+    throw new Error(`${command.join(' ')} exited with ${exitCode}`)
+  }
+  return exitCode
+}
+
+function compose(project: string, ...args: string[]): string[] {
+  return ['docker', 'compose', '--project-name', project, '--file', composeFile, ...args]
+}
+
+async function publishedPort(project: string, service: string, port: number): Promise<number> {
+  const address = await output(compose(project, 'port', service, String(port)))
+  const value = Number(address.slice(address.lastIndexOf(':') + 1))
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error(`Could not resolve the published ${service} port ${port}`)
+  }
+  return value
+}
+
+const portlessURL = (name: string) => output(['bunx', 'portless', 'get', name])
+
+function aliasName(url: string): string {
+  const hostname = new URL(url).hostname
+  if (!hostname.endsWith('.localhost'))
+    throw new Error(`Portless returned an unexpected URL: ${url}`)
+  return hostname.slice(0, -'.localhost'.length)
+}
+
+async function authSecret(): Promise<string> {
+  if (existsSync(generatedSecret)) return (await readFile(generatedSecret, 'utf8')).trim()
+  const secret = randomHex(32)
+  await writeFile(generatedSecret, `${secret}\n`, { mode: 0o600 })
+  return secret
+}
+
+/** A secret kept in the generated directory, made once, so a restart keeps signed-in sessions. */
+async function keptSecret(path: string, make: () => Promise<string>): Promise<string> {
+  if (existsSync(path)) return (await readFile(path, 'utf8')).trim()
+  const secret = await make()
+  await writeFile(path, `${secret}\n`, { mode: 0o600 })
+  return secret
+}
+
+/** An ES256 key in PKCS #8 PEM, as `[services] signing_key` takes it. */
+async function signingKeyPEM(): Promise<string> {
+  const { privateKey } = await crypto.subtle.generateKey(
+    { name: 'ECDSA', namedCurve: 'P-256' },
+    true,
+    ['sign', 'verify']
+  )
+  const der = new Uint8Array(await crypto.subtle.exportKey('pkcs8', privateKey))
+  const lines = fromUint8Array(der).match(/.{1,64}/g) ?? []
+  return ['-----BEGIN PRIVATE KEY-----', ...lines, '-----END PRIVATE KEY-----'].join('\n')
+}
+
+/**
+ * A billing service to sell plans through, when `OPENPENCIL_CLOUD_DEV_BILLING_URL` names one, such
+ * as the official one on 127.0.0.1, with its secrets.
+ */
+async function localBilling() {
+  const endpoint = process.env.OPENPENCIL_CLOUD_DEV_BILLING_URL
+  if (!endpoint) return null
+  return {
+    endpoint,
+    servicesEndpoint: process.env.OPENPENCIL_CLOUD_DEV_SERVICES_URL || 'http://127.0.0.1:8788',
+    signingKey: await keptSecret(generatedSigningKey, signingKeyPEM),
+    serviceToken: await keptSecret(generatedServiceToken, async () => randomHex(32))
+  }
+}
+
+async function start(project: string): Promise<void> {
+  const [cloudURL, siteURL, mailURL, objectStorageURL, editorURL] = await Promise.all([
+    portlessURL('cloud.open-pencil'),
+    portlessURL('cloud-site.open-pencil'),
+    portlessURL('mail.open-pencil'),
+    portlessURL('s3.open-pencil'),
+    portlessURL('open-pencil')
+  ])
+
+  // Port 0 lets Docker pick free loopback ports, so worktrees never collide.
+  const services = {
+    ...process.env,
+    POSTGRES_PORT: '0',
+    SEAWEEDFS_S3_PORT: '0',
+    SEAWEEDFS_MASTER_PORT: '0',
+    MAILPIT_UI_PORT: '0',
+    MAILPIT_SMTP_PORT: '0'
+  }
+  await execute(compose(project, 'up', '--detach', '--wait', 'postgres', 'seaweedfs', 'mailpit'), {
+    environment: services
+  })
+  await execute(compose(project, 'run', '--rm', 'seaweedfs-init'), { environment: services })
+  const [postgresPort, s3Port, mailpitUIPort, smtpPort] = await Promise.all([
+    publishedPort(project, 'postgres', 5432),
+    publishedPort(project, 'seaweedfs', 8333),
+    publishedPort(project, 'mailpit', 8025),
+    publishedPort(project, 'mailpit', 1025)
+  ])
+
+  await mkdir(generatedDirectory, { recursive: true })
+  const billing = await localBilling()
+  await writeFile(
+    generatedConfig,
+    localCloudDeploymentTOML({
+      cloudURL,
+      editorURL,
+      // Browsers upload straight to object storage, and Safari blocks plain HTTP from HTTPS pages.
+      objectStorageURL,
+      smtpPort,
+      // A workspace of this local server to show as its community gallery.
+      communityWorkspace: process.env.OPENPENCIL_CLOUD_DEV_COMMUNITY_WORKSPACE || undefined,
+      billing: billing ?? undefined
+    }),
+    { mode: 0o600 }
+  )
+  await execute(['bunx', 'portless', 'alias', aliasName(mailURL), String(mailpitUIPort), '--force'])
+  await execute([
+    'bunx',
+    'portless',
+    'alias',
+    aliasName(objectStorageURL),
+    String(s3Port),
+    '--force'
+  ])
+
+  const betterAuthSecret = await authSecret()
+  // The server serves the editor and its own pages from Vite's development server, so an edit
+  // shows at once, through hot updates, with no build.
+  const site = Bun.spawn(
+    ['bunx', 'portless', 'run', '--name', 'cloud-site.open-pencil', 'vite', '--mode', 'cloud'],
+    { cwd: root, stdout: 'inherit', stderr: 'inherit' }
+  )
+
+  console.warn(`OpenPencil Cloud: ${cloudURL}`)
+  console.warn(`Captured email:  ${mailURL}`)
+  console.warn('Stop the services with `bun run cloud:dev:down`; their data is kept.')
+  if (billing) {
+    console.warn(`Billing:         ${billing.endpoint}`)
+    console.warn(`The internal API token billing presents is in ${generatedServiceToken}`)
+  }
+
+  const serverEnvironment: Record<string, string | undefined> = {
+    ...process.env,
+    HOST: '127.0.0.1',
+    OPENPENCIL_CLOUD_CONFIG: generatedConfig,
+    OPENPENCIL_CLOUD_DEV_SITE_URL: siteURL,
+    DATABASE_URL: `postgresql://openpencil:${POSTGRES_PASSWORD}@127.0.0.1:${postgresPort}/openpencil`,
+    BETTER_AUTH_SECRET: betterAuthSecret,
+    S3_ACCESS_KEY_ID,
+    S3_SECRET_ACCESS_KEY
+  }
+  if (billing) {
+    serverEnvironment.OPENPENCIL_CLOUD_SERVICES_SIGNING_KEY = billing.signingKey
+    serverEnvironment.OPENPENCIL_CLOUD_SERVICE_TOKEN = billing.serviceToken
+  }
+
+  try {
+    // The Cloud package's own `dev` script, which loads its Vue email templates; plain `bun` reads
+    // a `.vue` import as its file path, and every email went out empty.
+    process.exitCode = await execute(
+      [
+        'bunx',
+        'portless',
+        'run',
+        '--name',
+        'cloud.open-pencil',
+        'bun',
+        'run',
+        '--cwd',
+        'packages/cloud',
+        'dev'
+      ],
+      {
+        allowFailure: true,
+        environment: serverEnvironment
+      }
+    )
+  } finally {
+    // The development server stops with the Cloud server however that ends.
+    site.kill()
+  }
+}
+
+async function stop(project: string): Promise<void> {
+  await execute(compose(project, 'down'), { allowFailure: true })
+  for (const name of ['mail.open-pencil', 's3.open-pencil']) {
+    const url = await portlessURL(name)
+    await execute(['bunx', 'portless', 'alias', '--remove', aliasName(url)], {
+      allowFailure: true
+    })
+  }
+  await rm(generatedConfig, { force: true })
+}
+
+const project = composeProjectName(await output(['git', 'branch', '--show-current']))
+const command = process.argv[2] ?? 'up'
+if (command === 'up') await start(project)
+else if (command === 'down') await stop(project)
+else throw new Error('Usage: bun tools/dev/cloud/src/index.ts [up|down]')

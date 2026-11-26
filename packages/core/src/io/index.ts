@@ -1,0 +1,45 @@
+export { IORegistry } from './registry'
+export { extractExportGraph, findPageId } from './subgraph'
+export {
+  BUILTIN_IO_FORMATS,
+  type BuiltinIOFormatId,
+  DOCUMENT_EXTENSIONS,
+  figFormat,
+  penFormat,
+  pngFormat,
+  jpgFormat,
+  webpFormat,
+  svgFormat,
+  jsxFormat,
+  htmlFormat,
+  tailwindJSXFormat
+} from './formats'
+export { vectorElement } from './formats/html/vectors'
+export {
+  renderNodesToPPTX,
+  type PPTXExportOptions,
+  type PPTXExportStats,
+  type PPTXRasterize
+} from './formats/pptx'
+export type {
+  IOFormatRole,
+  IOFormatCategory,
+  IOTextEncoding,
+  IOBinaryData,
+  IOTextData,
+  IOData,
+  ReadDocumentInput,
+  ReadDocumentResult,
+  ExportTarget,
+  ExportRequest,
+  ExportAsset,
+  ExportResult,
+  HTMLExportOptions,
+  IOContext,
+  FigWriteOptions,
+  RasterExportOptions,
+  SVGExportOptions,
+  IOFormatSupport,
+  IOFormatExportOptions,
+  IOFormatAdapter
+} from './types'

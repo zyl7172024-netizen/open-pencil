@@ -1,0 +1,117 @@
+<script setup lang="ts">
+import { SelectSeparator } from 'reka-ui'
+
+import { panelNumber } from '@open-pencil/core/geometry'
+import type { LayoutSizing } from '@open-pencil/scene-graph'
+import type { SizeLimitProp } from '@open-pencil/vue/controls/layout'
+import { useMessages } from '@open-pencil/vue/i18n'
+import { useRetainedPopup } from '@open-pencil/vue/lifecycle/retention'
+import { useLayoutControlsContext } from '@open-pencil/vue/primitives/LayoutControls'
+
+import type { SizeAxisFieldProps } from '@/components/properties/layout/size/types'
+import VariableNumberField from '@/components/properties/VariableNumberField.vue'
+import Tip from '@/components/ui/overlay/Tip.vue'
+import AppSelectContent from '@/components/ui/select/AppSelectContent.vue'
+import AppSelectItem from '@/components/ui/select/AppSelectItem.vue'
+import AppSelectRoot from '@/components/ui/select/AppSelectRoot.vue'
+import { useSelectUI } from '@/components/ui/select/select'
+import SelectFieldTrigger from '@/components/ui/select/SelectFieldTrigger.vue'
+
+type SizeSelectValue = LayoutSizing | `add-${SizeLimitProp}` | `remove-${SizeLimitProp}`
+
+const { axis, icon, label } = defineProps<SizeAxisFieldProps>()
+
+const ctx = useLayoutControlsContext()
+const { open: popupOpen, portalActive } = useRetainedPopup()
+const panels = useMessages('panels')
+const selectUI = useSelectUI()
+
+const sizing = () => (axis === 'width' ? ctx.widthSizing : ctx.heightSizing)
+const sizingOptions = () => (axis === 'width' ? ctx.widthSizingOptions : ctx.heightSizingOptions)
+const sizingLabel = () => {
+  if (sizing() === 'HUG') return panels.value.sizingHugShort
+  if (sizing() === 'FILL') return panels.value.sizingFillShort
+  return ''
+}
+const limitItems = () =>
+  axis === 'width'
+    ? [
+        {
+          prop: 'minWidth' as const,
+          addLabel: panels.value.addMinWidth,
+          removeLabel: panels.value.removeMinWidth
+        },
+        {
+          prop: 'maxWidth' as const,
+          addLabel: panels.value.addMaxWidth,
+          removeLabel: panels.value.removeMaxWidth
+        }
+      ]
+    : [
+        {
+          prop: 'minHeight' as const,
+          addLabel: panels.value.addMinHeight,
+          removeLabel: panels.value.removeMinHeight
+        },
+        {
+          prop: 'maxHeight' as const,
+          addLabel: panels.value.addMaxHeight,
+          removeLabel: panels.value.removeMaxHeight
+        }
+      ]
+
+function handleSelect(value: SizeSelectValue) {
+  if (value === 'FIXED' || value === 'HUG' || value === 'FILL') {
+    ctx.setAxisSizing(axis, value)
+    return
+  }
+
+  const [action, prop] = value.split('-') as ['add' | 'remove', SizeLimitProp]
+  if (action === 'add') ctx.addSizeLimit(prop)
+  else ctx.removeSizeLimit(prop)
+}
+</script>
+
+<template>
+  <Tip :label="label">
+    <VariableNumberField
+      :round="panelNumber"
+      :icon="icon"
+      :aria-label="label"
+      :model-value="panelNumber(ctx.node[axis])"
+      :min="0"
+      :node-id="ctx.node.id"
+      :binding-path="axis"
+      @update:model-value="ctx.updateAxisSize(axis, $event)"
+      @commit="(value: number, previous: number) => ctx.commitAxisSize(axis, value, previous)"
+      @cancel="ctx.cancelPreview"
+    >
+      <template #menu>
+        <AppSelectRoot
+          v-model:open="popupOpen"
+          :model-value="sizing()"
+          @update:model-value="handleSelect($event as SizeSelectValue)"
+        >
+          <SelectFieldTrigger data-slot="sizing-trigger" :label="label" :text="sizingLabel()" />
+          <AppSelectContent v-if="portalActive" align="end">
+            <AppSelectItem
+              v-for="option in sizingOptions()"
+              :key="option.value"
+              :value="option.value"
+            >
+              {{ option.label }}
+            </AppSelectItem>
+            <SelectSeparator :class="selectUI.separator" />
+            <AppSelectItem
+              v-for="item in limitItems()"
+              :key="item.prop"
+              :value="`${ctx.node[item.prop] == null ? 'add' : 'remove'}-${item.prop}`"
+            >
+              {{ ctx.node[item.prop] == null ? item.addLabel : item.removeLabel }}
+            </AppSelectItem>
+          </AppSelectContent>
+        </AppSelectRoot>
+      </template>
+    </VariableNumberField>
+  </Tip>
+</template>

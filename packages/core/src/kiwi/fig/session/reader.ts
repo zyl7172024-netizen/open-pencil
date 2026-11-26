@@ -1,0 +1,76 @@
+import { createFigDocumentSession } from '@open-pencil/fig'
+import type { FigPageManifestEntry } from '@open-pencil/kiwi/fig'
+
+import { buildFigPopulationDelta, installFigMutationJournal } from '#core/kiwi/fig/population/delta'
+import { readerSessionOptions, type FigReaderDiagnostic } from '#core/kiwi/fig/session/options'
+
+/** Worker and main-thread transport for the .fig reader session for the FIG reader session. */
+export function openReaderSession(
+  bytes: ArrayBuffer,
+  populate: 'all' | 'first-page' | 'none' = 'all'
+) {
+  const diagnostics: FigReaderDiagnostic[] = []
+  const session = createFigDocumentSession(bytes, readerSessionOptions(diagnostics))
+  const pages: FigPageManifestEntry[] = session.pages.map((page) => ({
+    sourceId: page.id,
+    name: page.name,
+    position: page.position,
+    internalOnly: page.internalOnly
+  }))
+  const sourceByGraph = new Map<string, string>()
+  for (const page of session.pages) {
+    const id = session.graphPageId(page.id)
+    if (id) sourceByGraph.set(id, page.id)
+  }
+  const loadedGraphIds = () =>
+    [...session.loadedPageIds].flatMap((id) => {
+      const graphId = session.graphPageId(id)
+      return graphId ? [graphId] : []
+    })
+  if (populate === 'all') {
+    for (const page of pages) if (!page.internalOnly) session.loadPage(page.sourceId)
+  } else if (populate === 'first-page') {
+    const page = pages.find((page) => !page.internalOnly)
+    if (page) session.loadPage(page.sourceId)
+  }
+  /** Runs a load, with what it changed in the graph and the checkpoint after it. */
+  const journaled = (load: () => boolean) => {
+    const journal = installFigMutationJournal(session.graph)
+    try {
+      const populated = load()
+      return {
+        checkpoint: session.checkpoint(),
+        populated,
+        delta: buildFigPopulationDelta(session.graph, journal, loadedGraphIds())
+      }
+    } finally {
+      journal.stop()
+    }
+  }
+  return {
+    session,
+    /** Records skipped so far, including those of pages loaded later. */
+    diagnostics,
+    checkpoint: () => session.checkpoint(),
+    graph: session.graph,
+    pages,
+    /** `onProgress` is called as the load advances, as `loadPage` calls it. */
+    populate(pageId: string, onProgress?: () => void) {
+      const sourceId = sourceByGraph.get(pageId)
+      if (!sourceId) throw new Error(`Unknown graph page ${pageId}`)
+      const populated = !session.loadedPageIds.has(sourceId)
+      return journaled(() => {
+        session.loadPage(sourceId, onProgress)
+        onProgress?.()
+        return populated
+      })
+    },
+    /**
+     * Builds components no page brought, such as variants of a set no instance uses, as
+     * `loadComponents` does; `populated` is false when one needs a layer the user deleted.
+     */
+    loadComponents(componentIds: readonly string[], onProgress?: () => void) {
+      return journaled(() => session.loadComponents(componentIds, undefined, onProgress))
+    }
+  }
+}

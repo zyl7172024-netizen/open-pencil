@@ -1,0 +1,11 @@
+{
+  "newPage": "Nouvelle page",
+  "rename": "Renommer",
+  "delete": "Supprimer",
+  "pageName": "Page {number}",
+  "pages": "Pages",
+  "goToPage": "Aller à la page…",
+  "recentPage": "Récente",
+  "currentPage": "Page actuelle",
+  "pageNameLabel": "Nom de la page"
+}

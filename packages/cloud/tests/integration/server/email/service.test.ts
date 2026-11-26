@@ -1,0 +1,260 @@
+import { describe, expect, test } from 'bun:test'
+
+import { createCloudTestDatabase } from '#cloud-tests/helpers/database'
+import { createTransactionalEmailService, TransactionalEmailTransportError } from '#cloud/server'
+
+const secret = 'transactional-email-test-secret-at-least-32-characters'
+const invitation = {
+  inviterName: 'Alice',
+  documentName: 'Homepage',
+  permission: 'view' as const,
+  expiresAt: '2026-01-08T00:00:00.000Z',
+  acceptanceURL: 'https://cloud.example.com/invitations/id#secret-token'
+}
+
+describe('transactional email outbox', () => {
+  test('encrypts payloads and deduplicates logical messages', async () => {
+    const runtime = await createCloudTestDatabase()
+    try {
+      const email = createTransactionalEmailService(runtime.database, {
+        encryptionSecret: secret,
+        from: 'OpenPencil <cloud@example.com>'
+      })
+      const input = {
+        idempotencyKey: 'document-invitation/invitation-id',
+        kind: 'document-invitation' as const,
+        recipientEmail: 'Person@Example.com',
+        payload: invitation
+      }
+      const first = await email.enqueue(input)
+      expect(await email.enqueue(input)).toBe(first)
+      const rows = await runtime.database.selectFrom('transactionalEmail').selectAll().execute()
+      expect(rows).toHaveLength(1)
+      expect(rows[0]?.recipientEmailNormalized).toBe('person@example.com')
+      const encryptedPayload = rows[0]?.payloadEncrypted
+      if (!encryptedPayload) throw new Error('Expected an encrypted transactional email payload')
+      expect(encryptedPayload).not.toContain('secret-token')
+      expect(encryptedPayload.split('.')).toHaveLength(5)
+    } finally {
+      await runtime.close()
+    }
+  })
+
+  test('claims, renders, and records transport acceptance', async () => {
+    const runtime = await createCloudTestDatabase()
+    const sent: unknown[] = []
+    try {
+      const email = createTransactionalEmailService(runtime.database, {
+        encryptionSecret: secret,
+        from: 'OpenPencil <cloud@example.com>',
+        replyTo: 'hello@example.com',
+        transport: {
+          id: 'memory',
+          async send(message) {
+            sent.push(message)
+            return { transportMessageId: 'message-id', acceptedAt: '2026-01-01T00:00:00.000Z' }
+          }
+        }
+      })
+      await email.enqueue({
+        idempotencyKey: 'document-invitation/accepted',
+        kind: 'document-invitation',
+        recipientEmail: 'person@example.com',
+        payload: invitation
+      })
+      expect(await email.deliverPending({ batchSize: 10, leaseDurationMs: 60_000 })).toEqual({
+        claimed: 1,
+        accepted: 1,
+        retrying: 0,
+        failed: 0,
+        suppressed: 0
+      })
+      expect(sent).toHaveLength(1)
+      expect(sent[0]).toMatchObject({
+        to: 'person@example.com',
+        replyTo: 'hello@example.com',
+        subject: 'Alice invited you to view “Homepage”'
+      })
+      expect(
+        await runtime.database
+          .selectFrom('transactionalEmail')
+          .select(['status', 'attemptCount', 'transport', 'transportMessageId', 'payloadEncrypted'])
+          .executeTakeFirstOrThrow()
+      ).toMatchObject({
+        status: 'accepted',
+        attemptCount: 1,
+        transport: 'memory',
+        transportMessageId: 'message-id',
+        payloadEncrypted: null
+      })
+    } finally {
+      await runtime.close()
+    }
+  })
+
+  test('writes in the recipient’s language, as given or as their account says, then the sender’s, then English', async () => {
+    const runtime = await createCloudTestDatabase()
+    const sent: Array<{ to: string; subject: string; html: string }> = []
+    try {
+      await runtime.database
+        .insertInto('user')
+        .values({
+          id: '22222222-2222-4222-8222-222222222222',
+          name: 'Reader',
+          email: 'Reader@Example.com',
+          emailVerified: true,
+          image: null,
+          locale: 'de'
+        })
+        .execute()
+      const email = createTransactionalEmailService(runtime.database, {
+        encryptionSecret: secret,
+        from: 'OpenPencil <cloud@example.com>',
+        transport: {
+          id: 'memory',
+          async send(message) {
+            sent.push(message)
+            return {
+              transportMessageId: message.deliveryId,
+              acceptedAt: '2026-01-01T00:00:00.000Z'
+            }
+          }
+        }
+      })
+      const enqueue = (recipientEmail: string, locale?: 'fr') =>
+        email.enqueue({
+          idempotencyKey: `document-invitation/${recipientEmail}`,
+          kind: 'document-invitation',
+          recipientEmail,
+          fallbackLocale: locale,
+          payload: invitation
+        })
+      await enqueue('reader@example.com', 'fr')
+      await enqueue('guest@example.com', 'fr')
+      await enqueue('stranger@example.com')
+      // A sender with the account at hand, as signing up is, gives its language; none is English.
+      await email.enqueue({
+        idempotencyKey: 'email-verification/signing-up',
+        kind: 'email-verification',
+        recipientEmail: 'signing-up@example.com',
+        recipientLocale: 'ja',
+        fallbackLocale: 'fr',
+        payload: { name: 'Ada', actionURL: 'https://cloud.example.com/verify' }
+      })
+      await email.deliverPending({ batchSize: 10, leaseDurationMs: 60_000 })
+      const language = (to: string) =>
+        /<html[^>]* lang="([^"]+)"/.exec(sent.find((message) => message.to === to)?.html ?? '')?.[1]
+      expect(language('reader@example.com')).toBe('de')
+      expect(language('guest@example.com')).toBe('fr')
+      expect(language('stranger@example.com')).toBe('en')
+      expect(language('signing-up@example.com')).toBe('ja')
+    } finally {
+      await runtime.close()
+    }
+  })
+
+  test('leaves retired kinds pending without taking batch slots', async () => {
+    const runtime = await createCloudTestDatabase()
+    const sent: string[] = []
+    try {
+      const email = createTransactionalEmailService(runtime.database, {
+        encryptionSecret: secret,
+        from: 'OpenPencil <cloud@example.com>',
+        transport: {
+          id: 'memory',
+          async send(message) {
+            sent.push(message.to)
+            return {
+              transportMessageId: message.deliveryId,
+              acceptedAt: '2026-01-01T00:00:00.000Z'
+            }
+          }
+        }
+      })
+      const enqueue = (recipientEmail: string) =>
+        email.enqueue({
+          idempotencyKey: `document-invitation/${recipientEmail}`,
+          kind: 'document-invitation',
+          recipientEmail,
+          payload: invitation
+        })
+      const retired = await enqueue('retired@example.com')
+      await runtime.database
+        .updateTable('transactionalEmail')
+        .set({ kind: 'enrollment-invited', nextAttemptAt: new Date(0) })
+        .where('id', '=', retired)
+        .execute()
+      await enqueue('person@example.com')
+      expect(await email.deliverPending({ batchSize: 1, leaseDurationMs: 60_000 })).toMatchObject({
+        claimed: 1,
+        accepted: 1
+      })
+      expect(sent).toEqual(['person@example.com'])
+      expect(
+        await runtime.database
+          .selectFrom('transactionalEmail')
+          .select(['status', 'claimId'])
+          .where('id', '=', retired)
+          .executeTakeFirstOrThrow()
+      ).toEqual({ status: 'pending', claimId: null })
+    } finally {
+      await runtime.close()
+    }
+  })
+
+  test('retries transient failures and terminates suppressed recipients', async () => {
+    const runtime = await createCloudTestDatabase()
+    let suppressed = false
+    try {
+      const email = createTransactionalEmailService(runtime.database, {
+        encryptionSecret: secret,
+        from: 'OpenPencil <cloud@example.com>',
+        transport: {
+          id: 'memory',
+          async send() {
+            throw new TransactionalEmailTransportError(
+              suppressed ? 'suppressed' : 'transient',
+              suppressed ? 'suppressed' : 'temporary',
+              'Rejected'
+            )
+          }
+        }
+      })
+      await email.enqueue({
+        idempotencyKey: 'document-invitation/retry',
+        kind: 'document-invitation',
+        recipientEmail: 'person@example.com',
+        payload: invitation
+      })
+      const now = new Date(Date.now() + 1000)
+      expect(await email.deliverPending({ batchSize: 1, leaseDurationMs: 60_000, now })).toEqual({
+        claimed: 1,
+        accepted: 0,
+        retrying: 1,
+        failed: 0,
+        suppressed: 0
+      })
+      suppressed = true
+      expect(
+        await email.deliverPending({
+          batchSize: 1,
+          leaseDurationMs: 60_000,
+          now: new Date(now.getTime() + 60_000)
+        })
+      ).toEqual({ claimed: 1, accepted: 0, retrying: 0, failed: 0, suppressed: 1 })
+      expect(
+        await runtime.database
+          .selectFrom('transactionalEmail')
+          .select(['status', 'attemptCount', 'lastErrorCode', 'payloadEncrypted'])
+          .executeTakeFirstOrThrow()
+      ).toEqual({
+        status: 'suppressed',
+        attemptCount: 2,
+        lastErrorCode: 'suppressed',
+        payloadEncrypted: null
+      })
+    } finally {
+      await runtime.close()
+    }
+  })
+})

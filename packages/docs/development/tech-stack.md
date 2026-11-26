@@ -1,0 +1,69 @@
+# Tech Stack
+
+## Core Technologies
+
+| Layer | Technology | Why |
+|-------|-----------|-----|
+| **Rendering** | Skia CanvasKit WASM | Same engine as Figma — proven performance, GPU-accelerated, pixel-perfect |
+| **UI Framework** | Vue 3 + VueUse | Reactive composition API, excellent TypeScript support |
+| **Components** | Reka UI | Headless, accessible UI primitives (tree, slider, etc.) |
+| **Styling** | Tailwind CSS 4 | Utility-first, fast iteration, dark theme |
+| **Layout** | Taffy WASM | Rust CSS flexbox and grid engine, also used by Servo, Blitz, Bevy, and Zed |
+| **File Format** | Kiwi binary + Zstd | Figma's own format — compact, fast parsing, .fig compatible |
+| **Collaboration** | Trystero + Yjs | P2P WebRTC via MQTT signaling, CRDT sync, y-indexeddb persistence |
+| **Color** | culori | Color space conversions (HSV, RGB, hex) |
+| **AI/MCP** | MCP SDK + Hono | 90+ tools for AI coding tools, stdio + HTTP transports |
+| **JSX Transform** | Sucrase | Lightweight (201 KB) JSX → JS, synchronous, browser-compatible |
+| **Events** | nanoevents | 108 bytes, typed event emitter for SceneGraph mutations |
+| **Desktop** | Tauri v2 | ~5MB native app (vs Electron's ~100MB), Rust backend |
+| **Build** | Vite 7 | Fast HMR, native ES modules |
+| **Testing** | Playwright + bun:test | Visual regression (E2E) + fast unit tests |
+| **Linting** | oxlint | Rust-based, orders of magnitude faster than ESLint |
+| **Formatting** | oxfmt | Rust-based formatter |
+| **Type Checking** | TypeScript 7, vue-tsc | TypeScript 7 (the native Go compiler) checks `.ts`; vue-tsc checks `.vue` on the TypeScript 6 API |
+
+vue-tsc is pinned to 3.3.11: later versions report "Cannot find name" for a `v-for` or `v-slot` variable when a component prop value in its scope contains `//` ([vuejs/language-tools#6240](https://github.com/vuejs/language-tools/issues/6240)). Lift the pin once `bun run check:vue` passes on a newer release.
+
+## Key Dependencies
+
+```json
+{
+  "@open-pencil/canvaskit": "workspace:*",
+  "vue": "^3.5.41",
+  "@open-pencil/taffy": "workspace:*",
+  "nanoevents": "^9.1.0",
+  "sucrase": "^3.35.1",
+  "reka-ui": "^2.10.3",
+  "tailwindcss": "^4.3.3",
+  "culori": "^4.0.2",
+  "@hpcc-js/wasm-zstd": "^1.16.2",
+  "fflate": "^0.8.3",
+  "@trystero-p2p/mqtt": "^0.26.0",
+  "yjs": "^13.6.32",
+  "y-indexeddb": "^9.0.12"
+}
+```
+
+## Why Not...
+
+### Why not SVG rendering?
+
+SVG is slow for complex documents. Every node is a DOM element — 10,000 nodes means 10,000 DOM nodes with layout, paint, and compositing overhead. CanvasKit draws everything to a single GPU surface. (Penpot still defaults to SVG rendering but has an opt-in Rust/Skia WASM renderer in development.)
+
+### Why not Electron (like Figma desktop)?
+
+Tauri v2 uses the system webview (~5MB) instead of bundling Chromium (~100MB). The Rust backend provides native performance for file I/O and system integration.
+
+### Why not React (like the original plan)?
+
+The project migrated from React to Vue 3 early in development. Vue's reactivity system and VueUse composables proved more ergonomic for the editor's state management needs.
+
+### Why not custom layout engine?
+
+Taffy implements the CSS flexbox and CSS Grid specs and is shared by Servo, Blitz, Bevy, and Zed; the same build also lays out HTML import, through Blitz. It replaced Yoga: on Figma's Material 3 kit (78k layers) Taffy places 432 more layers where Figma saved them than Yoga did, mostly Fill items in rows, and none the other way round. Building a custom engine would be months of work to reach the same correctness level.
+
+## Additional Technologies
+
+| Technology | Purpose | Status |
+|-----------|---------|--------|
+| CSS Grid in Taffy | Grid-based auto layout | Shipped; Taffy implements CSS Grid upstream, so no grid fork is needed |

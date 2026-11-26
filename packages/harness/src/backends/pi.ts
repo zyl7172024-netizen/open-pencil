@@ -1,0 +1,192 @@
+import { createPi } from '@ai-sdk/harness-pi'
+import type { PiAuthenticationMode, PiHarnessSettings } from '@ai-sdk/harness-pi'
+import { HarnessAgent } from '@ai-sdk/harness/agent'
+import type { HarnessAgentResumeSessionState, HarnessAgentSession } from '@ai-sdk/harness/agent'
+import { createJustBashSandbox } from '@ai-sdk/sandbox-just-bash'
+import type { TextStreamPart, ToolSet } from 'ai'
+
+import { errorMessage } from '@open-pencil/std/errors'
+
+import type { HarnessSessionConfiguration, JSONValue } from '../protocol'
+import type { BackendEvent, BackendSession, HarnessBackend, HarnessResumeState } from './types'
+
+export type PiThinkingLevel = NonNullable<PiHarnessSettings['thinkingLevel']>
+
+export interface PiHarnessBackendOptions {
+  auth?: PiAuthenticationMode
+  apiKey?: string
+  model?: string
+  thinkingLevel?: PiThinkingLevel
+  agentDir?: string
+  mcpServers?: Record<string, unknown>
+  instructions?: string
+  permissionMode?: 'allow-all' | 'allow-reads' | 'allow-edits'
+}
+
+function asJSONValue(value: unknown): JSONValue {
+  if (value === undefined || typeof value === 'bigint' || typeof value === 'function') return null
+  try {
+    const clone = structuredClone(value)
+    JSON.stringify(clone)
+    return clone as JSONValue
+  } catch {
+    return null
+  }
+}
+
+/** The harness reports a compaction as a call and result of its own `compaction` tool. */
+function isCompaction(part: { toolName: string; toolCallId: string }): boolean {
+  return part.toolName === 'compaction' && part.toolCallId.startsWith('harness-compaction-')
+}
+
+function compactionEvent(output: unknown): BackendEvent | undefined {
+  if (typeof output !== 'object' || output === null) return undefined
+  if (!('summary' in output) || typeof output.summary !== 'string') return undefined
+  if (!('trigger' in output) || (output.trigger !== 'manual' && output.trigger !== 'auto'))
+    return undefined
+  const tokensBefore = 'tokensBefore' in output ? output.tokensBefore : undefined
+  return {
+    type: 'compaction',
+    trigger: output.trigger,
+    summary: output.summary,
+    tokensBefore: typeof tokensBefore === 'number' ? tokensBefore : null
+  }
+}
+
+function mapPart(part: TextStreamPart<ToolSet>): BackendEvent | undefined {
+  if ((part.type === 'tool-call' || part.type === 'tool-result') && isCompaction(part))
+    return part.type === 'tool-result' ? compactionEvent(part.output) : undefined
+  if (part.type === 'text-delta') return { type: 'text-delta', text: part.text }
+  if (part.type === 'reasoning-delta') return { type: 'reasoning-delta', text: part.text }
+  if (part.type === 'tool-call') {
+    return {
+      type: 'tool-call',
+      toolCallId: part.toolCallId,
+      toolName: part.toolName,
+      input: asJSONValue(part.input)
+    }
+  }
+  if (part.type === 'tool-result') {
+    return {
+      type: 'tool-result',
+      toolCallId: part.toolCallId,
+      toolName: part.toolName,
+      output: asJSONValue(part.output)
+    }
+  }
+  if (part.type === 'finish') {
+    const usage = part.totalUsage
+    return {
+      type: 'finish',
+      finishReason: part.finishReason,
+      usage: {
+        inputTokens: usage.inputTokens ?? null,
+        outputTokens: usage.outputTokens ?? null,
+        cacheReadTokens: usage.inputTokenDetails.cacheReadTokens ?? null,
+        cacheWriteTokens: usage.inputTokenDetails.cacheWriteTokens ?? null
+      }
+    }
+  }
+  if (part.type === 'error') {
+    return {
+      type: 'error',
+      message: errorMessage(part.error)
+    }
+  }
+  return undefined
+}
+
+class PiBackendSession implements BackendSession {
+  readonly sessionId: string
+  readonly isResume: boolean
+
+  constructor(
+    private readonly agent: HarnessAgent,
+    private readonly session: HarnessAgentSession
+  ) {
+    this.sessionId = session.sessionId
+    this.isResume = session.isResume
+  }
+
+  async *runTurn(prompt: string, signal?: AbortSignal): AsyncIterable<BackendEvent> {
+    const result = await this.agent.stream({ session: this.session, prompt, abortSignal: signal })
+    for await (const part of result.fullStream) {
+      const event = mapPart(part)
+      if (event) yield event
+    }
+  }
+
+  async compact(instructions?: string): Promise<void> {
+    await this.session.compact(instructions)
+  }
+
+  async stop(): Promise<HarnessResumeState> {
+    return (await this.session.stop()) as HarnessResumeState
+  }
+
+  async destroy(): Promise<void> {
+    await this.session.destroy()
+  }
+}
+
+export class PiHarnessBackend implements HarnessBackend {
+  readonly id = 'pi'
+  readonly capabilities = {
+    adapter: 'pi',
+    sandboxes: ['just-bash'],
+    structuredOutput: false,
+    sessionResume: 'live-process',
+    turnContinuation: true
+  } as const
+
+  constructor(private readonly defaults: PiHarnessBackendOptions = {}) {}
+
+  async createSession(options: {
+    sessionId: string
+    resumeState?: HarnessResumeState
+    configuration?: HarnessSessionConfiguration
+    signal?: AbortSignal
+  }): Promise<BackendSession> {
+    const configuration = options.configuration
+    if (!configuration) throw new Error('Harness configuration is required')
+    const thinkingLevel =
+      typeof configuration.settings?.thinkingLevel === 'string'
+        ? (configuration.settings.thinkingLevel as PiThinkingLevel)
+        : undefined
+    const permissionMode =
+      typeof configuration.settings?.permissionMode === 'string'
+        ? (configuration.settings.permissionMode as PiHarnessBackendOptions['permissionMode'])
+        : undefined
+    // A supplied environment authenticates this session alone, without touching process.env.
+    const auth =
+      this.defaults.auth ??
+      (this.defaults.apiKey ? { AI_GATEWAY_API_KEY: this.defaults.apiKey } : undefined)
+    // Plain literals, so the compiler rejects a setting an adapter no longer accepts.
+    const harness = createPi({
+      auth,
+      thinkingLevel: thinkingLevel ?? this.defaults.thinkingLevel,
+      agentDir: this.defaults.agentDir,
+      mcpServers: configuration.mcpServers ?? this.defaults.mcpServers
+    })
+    const agent = new HarnessAgent({
+      harness,
+      model: configuration.model,
+      sandbox: createJustBashSandbox({ cwd: '/workspace' }),
+      sandboxConfig: { workDir: 'workspace' },
+      instructions: configuration.instructions ?? this.defaults.instructions,
+      skills: configuration.skills ?? [],
+      permissionMode: permissionMode ?? this.defaults.permissionMode ?? 'allow-edits'
+    })
+    const sessionOptions: {
+      sessionId: string
+      resumeFrom?: HarnessAgentResumeSessionState
+      abortSignal?: AbortSignal
+    } = { sessionId: options.sessionId }
+    if (options.resumeState !== undefined) {
+      sessionOptions.resumeFrom = options.resumeState as HarnessAgentResumeSessionState
+    }
+    if (options.signal !== undefined) sessionOptions.abortSignal = options.signal
+    const session = await agent.createSession(sessionOptions)
+    return new PiBackendSession(agent, session)
+  }
+}

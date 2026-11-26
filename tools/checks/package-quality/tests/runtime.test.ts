@@ -1,0 +1,150 @@
+import { expect, test } from 'bun:test'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { setImmediate } from 'node:timers/promises'
+
+import {
+  evaluateRuntime,
+  publicImportCheck,
+  verifyPublicImports
+} from '#package-quality/smoke/runtime'
+import { measurePhase } from '#package-quality/timing'
+
+import type { CommandRequest } from '@open-pencil/package-artifacts-tools'
+
+test('public imports retain separate bounded Node and Bun invocations and their exclusions', async () => {
+  const requests: CommandRequest[] = []
+  const release = Promise.withResolvers<undefined>()
+  const verification = verifyPublicImports(
+    [
+      {
+        name: '@fixture/library',
+        version: '1.0.0',
+        exports: { '.': './index.js', './extra': './extra.js', './theme.css': './theme.css' }
+      },
+      {
+        name: '@open-pencil/mcp',
+        version: '1.0.0',
+        exports: { '.': './index.js', './stdio': './stdio.js' }
+      },
+      {
+        name: '@open-pencil/core',
+        version: '1.0.0',
+        exports: { './runtime-assets/install': './dist/runtime-assets/install.js' }
+      },
+      {
+        name: '@open-pencil/cloud',
+        version: '1.0.0',
+        exports: { './runtime/cloudflare': './dist/runtime-cloudflare.js' }
+      }
+    ],
+    '/fixture',
+    async (request) => {
+      requests.push(request)
+      await release.promise
+      return { stdout: '', stderr: '' }
+    }
+  )
+  try {
+    await setImmediate()
+    expect(requests).toHaveLength(4)
+  } finally {
+    release.resolve(undefined)
+    await verification
+  }
+  expect(requests).toHaveLength(8)
+  for (const runtime of ['node', 'bun']) {
+    const calls = requests.filter(({ command }) => command === runtime)
+    expect(calls).toHaveLength(4)
+    expect(calls.map(({ args }) => args?.at(-1))).toEqual([
+      'await import("@fixture/library")',
+      'await import("@fixture/library/extra")',
+      // A stylesheet is looked for where its export points, rather than imported.
+      publicImportCheck('@fixture/library/theme.css'),
+      'await import("@open-pencil/mcp")'
+    ])
+    for (const request of calls) {
+      expect(request.cwd).toBe('/fixture')
+      expect(request.timeoutMs).toBe(30_000)
+      expect(request.args).toContain('--eval')
+      if (runtime === 'node') expect(request.args).toContain('--input-type=module')
+    }
+  }
+})
+
+test.each(['node', 'bun'] as const)(
+  'a stylesheet export fails in %s while its file is missing or a directory, and passes once shipped',
+  async (runtime) => {
+    const consumer = await mkdtemp(join(tmpdir(), 'open-pencil-stylesheet-'))
+    try {
+      const library = join(consumer, 'node_modules', '@fixture', 'library')
+      await mkdir(library, { recursive: true })
+      await writeFile(
+        join(library, 'package.json'),
+        JSON.stringify({ name: '@fixture/library', exports: { './theme.css': './theme.css' } })
+      )
+      const check = publicImportCheck('@fixture/library/theme.css')
+      await expect(evaluateRuntime(runtime, check, consumer)).rejects.toThrow()
+      await mkdir(join(library, 'theme.css'))
+      await expect(evaluateRuntime(runtime, check, consumer)).rejects.toThrow()
+      await rm(join(library, 'theme.css'), { recursive: true })
+      await writeFile(join(library, 'theme.css'), ':root {}')
+      await evaluateRuntime(runtime, check, consumer)
+    } finally {
+      await rm(consumer, { recursive: true, force: true })
+    }
+  }
+)
+
+test('phase timing preserves successful results when reporting throws', async () => {
+  const result = { verified: true }
+  expect(
+    await measurePhase(
+      'imports',
+      async () => result,
+      () => {
+        throw new Error('report failed')
+      }
+    )
+  ).toBe(result)
+})
+
+test('phase timing preserves the original exception when reporting throws', async () => {
+  const error = new Error('failed import')
+  await expect(
+    measurePhase(
+      'imports',
+      async () => {
+        throw error
+      },
+      () => {
+        throw new Error('report failed')
+      }
+    )
+  ).rejects.toBe(error)
+})
+
+test('phase timing preserves results and exceptions', async () => {
+  const reports: string[] = []
+  const result = { verified: true }
+  expect(
+    await measurePhase(
+      'imports',
+      async () => result,
+      (line) => reports.push(line)
+    )
+  ).toBe(result)
+  const error = new Error('failed import')
+  await expect(
+    measurePhase(
+      'imports',
+      async () => {
+        throw error
+      },
+      (line) => reports.push(line)
+    )
+  ).rejects.toBe(error)
+  expect(reports[0]).toMatch(/^\[package-quality\] imports: completed in \d+\.\d{2}s$/)
+  expect(reports[1]).toMatch(/^\[package-quality\] imports: failed in \d+\.\d{2}s$/)
+})

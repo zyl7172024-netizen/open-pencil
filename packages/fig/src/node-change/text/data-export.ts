@@ -1,0 +1,126 @@
+import type { NodeChange, Paint } from '@open-pencil/kiwi/fig/codec'
+import type { CharacterStyleOverride, SceneNode } from '@open-pencil/scene-graph'
+import { normalizeFontFamily } from '@open-pencil/scene-graph/font-style'
+
+import { applyFontFeaturesToKiwi } from '../font/features'
+import { figmaStyleName, standardStyleNamer, type StyleNamer } from '../font/style'
+import { stringToFigmaAxisTag } from '../font/variations'
+import { exportTextLines } from './lines'
+import { figmaLetterSpacing, figmaLineHeight } from './values'
+
+export function fontVariationToKiwi(variation: SceneNode['fontVariations'][number]) {
+  const axisTag = stringToFigmaAxisTag(variation.axis)
+  return axisTag === undefined
+    ? { axisName: variation.axis, value: variation.value }
+    : { axisTag, axisName: variation.axis, value: variation.value }
+}
+
+function applyTextDecorationOverrideFields(
+  override: Record<string, unknown>,
+  style: CharacterStyleOverride,
+  fillToKiwiPaint: (fill: SceneNode['fills'][number]) => Paint
+): void {
+  if (style.textDecoration) override.textDecoration = style.textDecoration
+  if (style.textDecorationStyle) override.textDecorationStyle = style.textDecorationStyle
+  if (style.textDecorationThickness != null) {
+    override.textDecorationThickness = { value: style.textDecorationThickness, units: 'PIXELS' }
+  }
+  if (style.textDecorationSkipInk !== undefined)
+    override.textDecorationSkipInk = style.textDecorationSkipInk
+  if (style.textUnderlineOffset != null) {
+    override.textUnderlineOffset = { value: style.textUnderlineOffset, units: 'PIXELS' }
+  }
+  if (style.textDecorationFills && style.textDecorationFills.length > 0) {
+    override.textDecorationFillPaints = style.textDecorationFills.map(fillToKiwiPaint)
+  }
+}
+
+function textStyleOverrideToKiwi(
+  id: number,
+  style: CharacterStyleOverride,
+  node: SceneNode,
+  fillToKiwiPaint: (fill: SceneNode['fills'][number]) => Paint,
+  nameFace: StyleNamer
+): NodeChange {
+  const override: Record<string, unknown> = { styleID: id }
+  override.fontName = {
+    family: normalizeFontFamily(style.fontFamily ?? node.fontFamily),
+    style: figmaStyleName(node, style, nameFace),
+    postscript: ''
+  }
+  if (style.fontSize !== undefined) override.fontSize = style.fontSize
+  if (style.fontVariations && style.fontVariations.length > 0) {
+    override.fontVariations = style.fontVariations.map(fontVariationToKiwi)
+  }
+  if (style.opticalSizeFromFontSize !== undefined)
+    override.detachOpticalSizeFromFontSize = !style.opticalSizeFromFontSize
+  if (style.fontFeatures && style.fontFeatures.length > 0) {
+    applyFontFeaturesToKiwi(override, style.fontFeatures)
+  }
+  if (style.letterSpacing !== undefined) {
+    override.letterSpacing = figmaLetterSpacing(style.letterSpacing)
+  }
+  if (style.lineHeight !== undefined) override.lineHeight = figmaLineHeight(style.lineHeight)
+  applyTextDecorationOverrideFields(override, style, fillToKiwiPaint)
+  if (style.textCase) override.textCase = style.textCase
+  if (style.fills && style.fills.length > 0) {
+    override.fillPaints = style.fills.map(fillToKiwiPaint)
+  }
+  return override
+}
+
+function collectTextStyleOverrides(node: SceneNode): {
+  charIds: number[]
+  styleMap: Map<string, { id: number; style: CharacterStyleOverride }>
+} {
+  const charIds = Array.from<number>({ length: node.text.length }).fill(0)
+  const styleMap = new Map<string, { id: number; style: CharacterStyleOverride }>()
+  let nextId = 1
+
+  for (const run of node.styleRuns) {
+    const key = JSON.stringify(run.style)
+    let entry = styleMap.get(key)
+    if (!entry) {
+      entry = { id: nextId++, style: run.style }
+      styleMap.set(key, entry)
+    }
+    for (let i = run.start; i < run.start + run.length && i < charIds.length; i++) {
+      charIds[i] = entry.id
+    }
+  }
+
+  return { charIds, styleMap }
+}
+
+/** The character styles written to the override table, each with its index there. */
+export function textStyleOverrides(
+  node: SceneNode
+): { id: number; style: CharacterStyleOverride }[] {
+  return [...collectTextStyleOverrides(node).styleMap.values()]
+}
+
+/** The style each character is written with, as an index into its override table. */
+export function characterStyleIDs(node: SceneNode): number[] {
+  return collectTextStyleOverrides(node).charIds
+}
+
+export function exportTextData(
+  node: SceneNode,
+  fillToKiwiPaint: (fill: SceneNode['fills'][number]) => Paint,
+  nameFace: StyleNamer = standardStyleNamer
+): NodeChange['textData'] {
+  const { charIds, styleMap } = collectTextStyleOverrides(node)
+  const characterOverrides = [...styleMap.values()].map(({ id, style }) =>
+    textStyleOverrideToKiwi(id, style, node, fillToKiwiPaint, nameFace)
+  )
+  // Paragraph spacing shares the override table, numbered after the character styles.
+  const paragraphs = exportTextLines(node, styleMap.size + 1)
+  const overrideTable = [...characterOverrides, ...paragraphs.overrides]
+  const data: NonNullable<NodeChange['textData']> = {
+    characters: node.text,
+    lines: paragraphs.lines
+  }
+  if (node.styleRuns.length > 0) data.characterStyleIDs = charIds
+  if (overrideTable.length > 0) data.styleOverrideTable = overrideTable
+  return data
+}

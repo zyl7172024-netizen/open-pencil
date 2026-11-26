@@ -1,0 +1,429 @@
+<script setup lang="ts">
+import { useLocalStorage } from '@vueuse/core'
+import { computed, ref, shallowRef } from 'vue'
+
+import type { DocumentKind } from '@open-pencil/scene-graph'
+import { errorMessage } from '@open-pencil/std/errors'
+import { useDocumentWorkspace } from '@open-pencil/vue/document/workspace'
+import { useMessages, useLocale } from '@open-pencil/vue/i18n'
+
+import { CLOUD_INCLUDED, CLOUD_STORAGE_PROVIDER_ID } from '@/app/cloud/integration'
+import { useHomeLocations } from '@/app/home/locations'
+import { useDateFormat } from '@/app/i18n/date'
+import {
+  activeStorageProviderID,
+  readStoragePreferences,
+  storagePreferencesComplete,
+  storageProviderRegistry,
+  type StorageDocument,
+  type StorageLocation
+} from '@/app/integrations/storage'
+import { recentDocumentKind, type RecentDocument } from '@/app/recent-files'
+import {
+  matchingRecentFiles,
+  openRecentDocument,
+  useRecentFilesWorkspace
+} from '@/app/recent-files/workspace'
+import { useCredentialSettings } from '@/app/settings/credentials/preferences/use'
+import { openSettingsDialog } from '@/app/settings/dialog'
+import { createStoredDocument } from '@/app/storage/workspace/create'
+import { activeStorageLocation, createStorageWorkspaceSource } from '@/app/storage/workspace/source'
+import { openStorageDocumentInNewTab } from '@/app/tabs'
+import { recoverable } from '@/app/tabs/recovery'
+import {
+  CloudSharedSection,
+  CloudTrashSection,
+  CloudWorkspaceSection
+} from '@/components/cloud/integration'
+import DocumentDeleteDialog from '@/components/home/document/DocumentDeleteDialog.vue'
+import DocumentEntry from '@/components/home/document/DocumentEntry.vue'
+import { ofKind, type DocumentKindFilter } from '@/components/home/document/filter'
+import HomeLayout from '@/components/home/HomeLayout.vue'
+import RecentFilesSection from '@/components/home/recent/RecentFilesSection.vue'
+import RecoverySection from '@/components/home/recovery/RecoverySection.vue'
+import HomeSearchActions from '@/components/home/search/HomeSearchActions.vue'
+import HomeLocationMenu from '@/components/home/sidebar/HomeLocationMenu.vue'
+import HomeSidebar from '@/components/home/sidebar/HomeSidebar.vue'
+import AppButton from '@/components/ui/button/AppButton.vue'
+import IconButton from '@/components/ui/button/IconButton.vue'
+
+const emit = defineEmits<{ 'new-document': [kind: DocumentKind] }>()
+const storage = useMessages('storage')
+const files = useMessages('files')
+const common = useMessages('common')
+const settings = useMessages('settings')
+const credentials = useMessages('credentials')
+const { locale } = useLocale()
+const view = useLocalStorage<'grid' | 'list'>('open-pencil:home-files-view', 'grid')
+/** Which kind of file Home lists, as Figma's file filter picks; a file of unknown kind shows in all. */
+const kindFilter = useLocalStorage<DocumentKindFilter>('open-pencil:home-files-kind', 'all')
+const query = ref('')
+const openError = ref<string | null>(null)
+const storageConfigured = ref(storagePreferencesComplete(activeStorageProviderID.value))
+const places = useHomeLocations()
+
+/** A new document lands in the place Home shows: a Cloud workspace, the bucket, or a local file. */
+function newDocument(kind: DocumentKind) {
+  // Until Cloud answers, the chosen workspace is unknown, and a local file is not what was meant.
+  if (places.settling.value) return
+  const target = newDesignTarget.value
+  if (target) void createStoredDocument(target.location, kind)
+  else emit('new-document', kind)
+}
+
+const workspace = useRecentFilesWorkspace()
+
+const documents = workspace.documents
+
+const storageWorkspace = useDocumentWorkspace<StorageDocument>({
+  source: createStorageWorkspaceSource((snapshot) => {
+    storageConfigured.value = snapshot.configured
+  }),
+  refreshInterval: 60_000,
+  previewConcurrency: 6
+})
+const storageDocuments = storageWorkspace.documents
+const storageLocation = computed(() => activeStorageLocation())
+const deletingStorageDocument = shallowRef<StorageDocument | null>(null)
+function documentMenu(document: StorageDocument) {
+  return {
+    actions: files.value.documentActions({ name: document.name }),
+    delete: files.value.deleteDocument
+  }
+}
+const storageLoading = storageWorkspace.loading
+// Paused credential access has its own fix, so the card offers it instead of the raw native error.
+const credentialAccess = useCredentialSettings()
+async function retryCredentialAccess() {
+  await credentialAccess.retry()
+  if (!credentialAccess.paused.value) await storageWorkspace.refresh()
+}
+const storageError = computed(() => {
+  const error = storageWorkspace.error.value
+  if (error == null) return null
+  return errorMessage(error)
+})
+const storageDescription = computed(() => {
+  const provider = storageProviderRegistry.get(activeStorageProviderID.value)
+  const preferences = readStoragePreferences(activeStorageProviderID.value)
+  const bucket = preferences.bucket?.trim()
+  const endpoint = preferences.endpoint?.trim()
+  let label = provider.label
+  if (endpoint) {
+    try {
+      const hostname = new URL(endpoint).hostname
+      if (hostname.endsWith('.r2.cloudflarestorage.com')) label = storage.value.providerR2
+      else if (hostname.includes('amazonaws.com')) label = storage.value.providerAmazonS3
+      else if (hostname.includes('backblazeb2.com')) label = storage.value.providerBackblaze
+      else if (hostname) label = storage.value.providerS3
+    } catch {
+      label = provider.label
+    }
+  }
+  return bucket ? `${label} · ${bucket}` : label
+})
+/** The storage bucket as the sidebar lists it, or a prompt to set it up. */
+const sidebarStorage = computed(() => {
+  if (!storageConfigured.value)
+    return { label: storage.value.workspace, detail: settings.value.notConfigured }
+  const bucket = readStoragePreferences(activeStorageProviderID.value).bucket?.trim()
+  return { label: bucket || storage.value.workspace, detail: storageDescription.value }
+})
+/** Where New design creates, named on the button; a local file when this is null. */
+const newDesignTarget = computed<{ location: StorageLocation; label: string } | null>(() => {
+  const workspace = places.workspace.value
+  const serverId = places.serverId.value
+  if (workspace && serverId && workspace.role !== 'viewer' && !workspace.public) {
+    return {
+      location: {
+        providerId: CLOUD_STORAGE_PROVIDER_ID,
+        profileId: serverId,
+        containerId: workspace.id
+      },
+      label: workspace.name
+    }
+  }
+  // Shared documents belong to other people's workspaces, Trash to none, and what is made in the
+  // community gallery is public at once, so a new one goes to the person's own.
+  const own = places.workspaces.value.find((entry) => entry.role !== 'viewer' && !entry.public)
+  const kind = places.location.value.kind
+  if ((kind === 'shared' || kind === 'trash' || workspace?.public) && own && serverId) {
+    return {
+      location: { providerId: CLOUD_STORAGE_PROVIDER_ID, profileId: serverId, containerId: own.id },
+      label: own.name
+    }
+  }
+  if (places.location.value.kind === 'storage' && storageConfigured.value) {
+    return {
+      location: { providerId: activeStorageProviderID.value },
+      label: sidebarStorage.value.label
+    }
+  }
+  return null
+})
+const storagePreviewURL = storageWorkspace.previewURL
+const vStoragePreview = storageWorkspace.previewDirective
+const normalizedQuery = computed(() => query.value.trim().toLocaleLowerCase(locale.value))
+const searchedRecentFiles = computed(() =>
+  matchingRecentFiles(documents.value, normalizedQuery.value, locale.value)
+)
+const filteredRecentFiles = computed(() =>
+  searchedRecentFiles.value.filter((document) =>
+    ofKind(recentDocumentKind(document), kindFilter.value)
+  )
+)
+// Only Recent files offers the kind filter, so storage lists every kind.
+const filteredStorageDocuments = computed(() =>
+  storageDocuments.value.filter(
+    (document) =>
+      !normalizedQuery.value ||
+      document.name.toLocaleLowerCase(locale.value).includes(normalizedQuery.value)
+  )
+)
+const filteredRecoverable = computed(() =>
+  recoverable.value.filter((snapshot) =>
+    snapshot.documentName.toLocaleLowerCase(locale.value).includes(normalizedQuery.value)
+  )
+)
+// Recent files counts matches before its kind filter, so its kind control stays to switch kinds;
+// storage has none to count while its first listing loads. Unsaved work shows in every place.
+const noSearchMatches = computed(() => {
+  if (!normalizedQuery.value || filteredRecoverable.value.length > 0) return false
+  if (places.location.value.kind !== 'storage') return searchedRecentFiles.value.length === 0
+  return (
+    filteredStorageDocuments.value.length === 0 &&
+    !(storageLoading.value && storageDocuments.value.length === 0)
+  )
+})
+
+async function openRecent(document: RecentDocument): Promise<void> {
+  openError.value = null
+  try {
+    // Before the storage list first loads, an empty list would hide the revision to check.
+    const listed = storageWorkspace.lastRefreshedAt.value ? storageDocuments.value : undefined
+    await openRecentDocument(document, listed)
+  } catch (error) {
+    openError.value = errorMessage(error)
+  }
+}
+
+async function openStorageDocument(document: StorageDocument): Promise<void> {
+  openError.value = null
+  try {
+    await openStorageDocumentInNewTab(document)
+  } catch (error) {
+    openError.value = errorMessage(error)
+  }
+}
+
+const dates = useDateFormat()
+/** A file's last change; a file that never reported one shows nothing. */
+function formattedDate(updatedAt: string): string {
+  return Date.parse(updatedAt) === 0 ? '' : dates.format(updatedAt, 'dateTime')
+}
+</script>
+
+<template>
+  <HomeLayout data-test-id="recent-files-home">
+    <template #sidebar>
+      <HomeSidebar
+        :cloud="CLOUD_INCLUDED"
+        :active="places.active.value"
+        :account="places.account.value"
+        :checking="places.checking.value"
+        :workspaces="places.workspaces.value"
+        :storage="sidebarStorage"
+        @select="places.select"
+        @connect="places.connect"
+        @open-account="places.openAccount"
+        @storage-settings="places.storageSettings"
+        @switch-server="places.connect"
+        @new-workspace="places.newWorkspace"
+        @sign-out="places.signOut"
+      />
+    </template>
+    <template #locations>
+      <HomeLocationMenu
+        :cloud="CLOUD_INCLUDED"
+        :active="places.active.value"
+        :account="places.account.value"
+        :checking="places.checking.value"
+        :workspaces="places.workspaces.value"
+        :storage="sidebarStorage"
+        @select="places.select"
+        @connect="places.connect"
+        @new-workspace="places.newWorkspace"
+      />
+    </template>
+    <HomeSearchActions
+      v-model="query"
+      :destination="newDesignTarget?.label ?? null"
+      :creating-disabled="places.settling.value"
+      @new-document="newDocument"
+    />
+
+    <p v-if="openError" class="mb-4 text-xs text-error" role="alert">{{ openError }}</p>
+    <!-- Unsaved work is this device's, so it shows in every place. -->
+    <RecoverySection :view="view" :snapshots="filteredRecoverable" />
+    <!-- Nothing until Cloud says which workspace Home opens on. -->
+    <template v-if="places.settling.value" />
+    <CloudWorkspaceSection
+      v-else-if="places.workspace.value && places.serverId.value"
+      :server-id="places.serverId.value"
+      :workspace="places.workspace.value"
+      :query="normalizedQuery"
+    />
+    <CloudSharedSection
+      v-else-if="places.location.value.kind === 'shared' && places.serverId.value"
+      :server-id="places.serverId.value"
+      :query="normalizedQuery"
+    />
+    <CloudTrashSection
+      v-else-if="places.location.value.kind === 'trash' && places.serverId.value"
+      :server-id="places.serverId.value"
+      :query="normalizedQuery"
+    />
+    <template v-else>
+      <p
+        v-if="noSearchMatches"
+        class="rounded-lg border border-dashed border-border px-4 py-8 text-center text-xs text-muted"
+      >
+        {{ files.noMatchingFiles({ query: query.trim() }) }}
+      </p>
+
+      <RecentFilesSection
+        v-if="!noSearchMatches && places.location.value.kind === 'recent'"
+        v-model:view="view"
+        v-model:kind="kindFilter"
+        :workspace="workspace"
+        :documents="filteredRecentFiles"
+        :query="normalizedQuery"
+        @open="openRecent"
+      />
+
+      <section v-if="places.location.value.kind === 'storage'">
+        <div class="mb-3 flex items-start gap-3">
+          <div class="min-w-0">
+            <h2 class="text-base font-semibold">{{ storage.workspace }}</h2>
+            <p class="mt-0.5 truncate text-xs text-muted sm:whitespace-normal">
+              {{ storageDescription }}
+            </p>
+          </div>
+          <div class="ms-auto flex shrink-0 items-center gap-1">
+            <IconButton
+              :label="common.refresh"
+              class="size-10 sm:size-7"
+              @click="storageWorkspace.refresh"
+            >
+              <icon-lucide-refresh-cw class="size-3.5" />
+            </IconButton>
+            <IconButton
+              :label="settings.title"
+              class="size-10 sm:size-7"
+              @click="openSettingsDialog('storage')"
+            >
+              <icon-lucide-settings-2 class="size-3.5" />
+            </IconButton>
+          </div>
+        </div>
+
+        <div
+          v-if="storageLoading && storageDocuments.length === 0"
+          class="grid grid-cols-1 gap-x-5 gap-y-6 sm:grid-cols-[repeat(auto-fill,minmax(12.5rem,1fr))]"
+          :aria-label="storage.loadingWorkspace"
+        >
+          <div
+            v-for="index in 3"
+            :key="index"
+            class="min-w-0 animate-pulse motion-reduce:animate-none"
+          >
+            <div class="aspect-video rounded-lg border border-border bg-panel-field" />
+            <div class="mt-2 h-3 w-2/3 rounded bg-panel-field" />
+            <div class="mt-1.5 h-2.5 w-1/3 rounded bg-panel-field" />
+          </div>
+        </div>
+
+        <div
+          v-else-if="storageError && storageDocuments.length === 0"
+          class="rounded-lg border border-error/40 px-4 py-6 text-center"
+          role="alert"
+        >
+          <template v-if="credentialAccess.paused.value">
+            <p class="text-xs text-error">{{ credentials.accessPaused }}</p>
+            <AppButton
+              variant="outline"
+              class="mt-3"
+              :loading="credentialAccess.busy.value"
+              data-test-id="home-storage-retry-access"
+              @click="retryCredentialAccess"
+            >
+              {{ credentials.retryAccess }}
+            </AppButton>
+          </template>
+          <template v-else>
+            <p class="text-xs text-error">{{ storageError }}</p>
+            <AppButton variant="outline" class="mt-3" @click="storageWorkspace.refresh">
+              {{ common.refresh }}
+            </AppButton>
+          </template>
+        </div>
+
+        <div
+          v-else-if="filteredStorageDocuments.length && view === 'grid'"
+          class="grid grid-cols-1 gap-x-5 gap-y-6 sm:grid-cols-[repeat(auto-fill,minmax(12.5rem,1fr))]"
+        >
+          <DocumentEntry
+            v-for="document in filteredStorageDocuments"
+            :key="document.id"
+            v-storage-preview="document.id"
+            :name="document.name"
+            :kind="document.kind"
+            :metadata="formattedDate(document.updatedAt)"
+            :previewURL="storagePreviewURL(document.id)"
+            :menu="documentMenu(document)"
+            @open="openStorageDocument(document)"
+            @delete="deletingStorageDocument = document"
+          />
+        </div>
+
+        <div
+          v-else-if="filteredStorageDocuments.length"
+          class="overflow-hidden rounded-lg border border-border"
+        >
+          <DocumentEntry
+            v-for="document in filteredStorageDocuments"
+            :key="document.id"
+            view="list"
+            :name="document.name"
+            :kind="document.kind"
+            :metadata="formattedDate(document.updatedAt)"
+            :menu="documentMenu(document)"
+            @open="openStorageDocument(document)"
+            @delete="deletingStorageDocument = document"
+          />
+        </div>
+
+        <div
+          v-else-if="!storageConfigured"
+          class="rounded-lg border border-dashed border-border px-4 py-4 text-center text-xs text-muted sm:py-6"
+        >
+          <p>{{ storage.notConfigured }}</p>
+          <AppButton variant="outline" class="mt-3" @click="openSettingsDialog('storage')">
+            {{ settings.title }}
+          </AppButton>
+        </div>
+
+        <div
+          v-else-if="!normalizedQuery"
+          class="rounded-lg border border-dashed border-border px-4 py-4 text-center text-xs text-muted sm:py-6"
+        >
+          {{ storage.emptyStorageWorkspace }}
+        </div>
+        <DocumentDeleteDialog
+          v-model:document="deletingStorageDocument"
+          :location="storageLocation"
+        />
+      </section>
+    </template>
+  </HomeLayout>
+</template>

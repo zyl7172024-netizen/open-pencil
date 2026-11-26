@@ -1,0 +1,72 @@
+import type { TreeNode } from '@open-pencil/design-jsx'
+import type { SceneGraph } from '@open-pencil/scene-graph'
+
+import {
+  finishRenderPlacement,
+  resolveRenderPlacement,
+  type RenderPlacementInput
+} from '#core/design-jsx/placement'
+import { renderRoots } from '#core/design-jsx/renderer'
+import { extractPageContext, findPageChildId } from '#core/io/subgraph'
+
+const MAX_PREVIEW_CONTEXT_NODES = 1000
+
+export interface StagedJSXPreview {
+  graph: SceneGraph
+  pageId: string
+  nodeIds: string[]
+  /** The roots the JSX rendered, in source order, even when `nodeIds` names their owner. */
+  renderedIds: string[]
+  /** Existing page child to replace visually, without changing the source graph. */
+  replaceId?: string
+  /** Page insertion slot when the preview adds new top-level nodes. */
+  insertIndex?: number
+}
+
+function contextFits(graph: SceneGraph, rootId: string): boolean {
+  const pending = [rootId]
+  let count = 0
+  while (pending.length > 0) {
+    if (++count > MAX_PREVIEW_CONTEXT_NODES) return false
+    const id = pending.pop()
+    const node = id ? graph.getNode(id) : undefined
+    if (node) for (const childId of node.childIds) pending.push(childId)
+  }
+  return true
+}
+
+/** Clone the whole affected page child, preserving ancestors, siblings, padding and layout modes. */
+export async function stageJSXPreview(
+  source: SceneGraph,
+  tree: TreeNode,
+  input: RenderPlacementInput,
+  pageId: string,
+  signal?: AbortSignal
+): Promise<StagedJSXPreview | null> {
+  signal?.throwIfAborted()
+  const placement = resolveRenderPlacement(source, input, pageId)
+  if (placement.pageId !== pageId) return null
+  const owner =
+    placement.parentId === pageId
+      ? placement.replaceId
+      : (findPageChildId(source, placement.parentId) ?? undefined)
+  if (owner && !contextFits(source, owner)) return null
+  const graph = extractPageContext(source, pageId, owner ? [owner] : [])
+  // Preview props can introduce bindings/images not referenced by the old subtree.
+  graph.images = new Map(source.images)
+  graph.variables = structuredClone(source.variables)
+  graph.variableCollections = structuredClone(source.variableCollections)
+  // One call, so components render before the roots that use them.
+  if (tree.type === '' && !tree.children.some((child) => typeof child !== 'string')) return null
+  const rendered = await renderRoots(graph, tree, placement)
+  signal?.throwIfAborted()
+  const results = finishRenderPlacement(graph, rendered, placement)
+  return {
+    graph,
+    pageId,
+    nodeIds: owner && graph.getNode(owner) ? [owner] : results.map((result) => result.id),
+    renderedIds: results.map((result) => result.id),
+    replaceId: owner,
+    insertIndex: placement.insertIndex
+  }
+}

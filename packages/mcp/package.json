@@ -1,0 +1,86 @@
+{
+  "name": "@open-pencil/mcp",
+  "version": "0.17.0",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/open-pencil/open-pencil.git",
+    "directory": "packages/mcp"
+  },
+  "funding": "https://ko-fi.com/dannote",
+  "bin": {
+    "openpencil-mcp": "./dist/stdio.mjs",
+    "openpencil-mcp-http": "./dist/index.mjs"
+  },
+  "files": [
+    "dist",
+    "src"
+  ],
+  "type": "module",
+  "main": "./dist/server.mjs",
+  "imports": {
+    "#mcp/*": {
+      "types": "./src/*.ts",
+      "bun": "./src/*.ts",
+      "default": "./dist/*.mjs"
+    }
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/server.d.mts",
+      "import": "./dist/server.mjs",
+      "default": "./dist/server.mjs"
+    },
+    "./stdio": {
+      "types": "./dist/stdio.d.mts",
+      "import": "./dist/stdio.mjs",
+      "default": "./dist/stdio.mjs"
+    },
+    "./transport": {
+      "types": "./dist/transport.d.mts",
+      "bun": "./src/transport/paths.ts",
+      "import": "./dist/transport.mjs",
+      "default": "./dist/transport.mjs"
+    },
+    "./discovery": {
+      "types": "./dist/discovery.d.mts",
+      "bun": "./src/transport/discovery.ts",
+      "import": "./dist/discovery.mjs",
+      "default": "./dist/discovery.mjs"
+    },
+    "./tools": {
+      "types": "./dist/tools.d.mts",
+      "bun": "./src/tool/index.ts",
+      "import": "./dist/tools.mjs",
+      "default": "./dist/tools.mjs"
+    }
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "scripts": {
+    "build": "bunx tsdown --config tsdown.config.ts",
+    "prepublishOnly": "bun run build"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.19.17",
+    "@modelcontextprotocol/server": "^2.0.0",
+    "@noble/hashes": "^2.4.0",
+    "@open-pencil/core": "workspace:*",
+    "@open-pencil/scene-graph": "workspace:*",
+    "@open-pencil/std": "workspace:*",
+    "es-toolkit": "^1.52.0",
+    "hono": "^4.13.13",
+    "js-base64": "^3.9.3",
+    "package-manager-detector": "^1.8.0",
+    "valibot": "^1.5.0",
+    "ws": "^8.21.3"
+  },
+  "devDependencies": {
+    "@open-pencil/package-artifacts-tools": "workspace:*",
+    "@open-pencil/test-support": "workspace:*",
+    "@types/node": "^25.9.9",
+    "@types/ws": "^8.18.1"
+  }
+}

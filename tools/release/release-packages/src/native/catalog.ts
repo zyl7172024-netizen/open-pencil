@@ -1,0 +1,137 @@
+import { isNightlyVersion, releaseVersionSchema } from '#release/version'
+import * as v from 'valibot'
+
+/**
+ * The Linux build's environment: Ubuntu 22.04 with the libraries the bundles link and the Rust
+ * toolchain, pinned to the digest `image-native-release.yml` built and bundled the app in, so a
+ * release downloads none of them (`tools/ci/images/native-release`).
+ */
+export const LINUX_RELEASE_IMAGE =
+  'ghcr.io/open-pencil/native-release-ci@sha256:f5a3796ee3242d7b3a0ad39002011dedd95366175e8bbc4bc69b84c966ada2e6'
+
+/** Each desktop build; `container` is the image it runs in, or empty to run on the runner itself. */
+export const desktopBuilds = [
+  {
+    target: 'aarch64-apple-darwin',
+    platform: 'macos-latest',
+    label: 'macos-arm64',
+    saveBunCache: true,
+    container: ''
+  },
+  {
+    target: 'x86_64-apple-darwin',
+    platform: 'macos-latest',
+    label: 'macos-x64',
+    saveBunCache: false,
+    container: ''
+  },
+  {
+    target: 'x86_64-pc-windows-msvc',
+    platform: 'windows-latest',
+    label: 'windows-x64',
+    saveBunCache: true,
+    container: ''
+  },
+  {
+    target: 'aarch64-pc-windows-msvc',
+    platform: 'windows-latest',
+    label: 'windows-arm64',
+    saveBunCache: false,
+    container: ''
+  },
+  {
+    target: 'x86_64-unknown-linux-gnu',
+    platform: 'ubuntu-22.04',
+    label: 'linux-x64',
+    saveBunCache: true,
+    container: LINUX_RELEASE_IMAGE
+  }
+] as const
+
+export const desktopTargets = desktopBuilds.map((build) => build.target)
+
+export type DesktopTarget = (typeof desktopTargets)[number]
+
+export interface DesktopAsset {
+  source: string
+  name: string
+  updaterKeys: string[]
+  signed: boolean
+}
+
+/**
+ * What a nightly bundles: every format but the MSI, whose version must be numbers only, so
+ * Windows nightlies install and update through NSIS. Tauri drops the formats a platform lacks.
+ */
+export const NIGHTLY_BUNDLES = ['app', 'dmg', 'nsis', 'appimage', 'deb', 'rpm'] as const
+
+/**
+ * Required OpenPencil release outputs, not a discovery or packaging implementation. A nightly's
+ * files say `nightly` where a release's say the version, so the rolling release keeps the same
+ * download links from one night to the next and the download page can link to them.
+ */
+export function desktopAssets(target: DesktopTarget, version: string): DesktopAsset[] {
+  const nightly = isNightlyVersion(version)
+  if (!nightly) v.parse(releaseVersionSchema, version)
+  const label = nightly ? 'nightly' : version
+
+  if (target.endsWith('apple-darwin')) {
+    const arch = target.startsWith('aarch64') ? 'aarch64' : 'x64'
+    const platform = arch === 'x64' ? 'darwin-x86_64' : 'darwin-aarch64'
+    return [
+      {
+        source: `OpenPencil_${version}_${arch}.dmg`,
+        name: `OpenPencil_${label}_${arch}.dmg`,
+        updaterKeys: [],
+        signed: false
+      },
+      {
+        source: 'OpenPencil.app.tar.gz',
+        name: `OpenPencil_${arch}.app.tar.gz`,
+        updaterKeys: [platform, `${platform}-app`],
+        signed: true
+      }
+    ]
+  }
+  if (target.endsWith('windows-msvc')) {
+    const arch = target.startsWith('aarch64') ? 'arm64' : 'x64'
+    const platform = target.startsWith('aarch64') ? 'windows-aarch64' : 'windows-x86_64'
+    const nsis = {
+      source: `OpenPencil_${version}_${arch}-setup.exe`,
+      name: `OpenPencil_${label}_${arch}-setup.exe`,
+      // Without an MSI, a nightly's NSIS installer also answers the platform's own updater key.
+      updaterKeys: nightly ? [platform, `${platform}-nsis`] : [`${platform}-nsis`],
+      signed: true
+    }
+    if (nightly) return [nsis]
+    return [
+      nsis,
+      {
+        source: `OpenPencil_${version}_${arch}_en-US.msi`,
+        name: `OpenPencil_${label}_${arch}_en-US.msi`,
+        updaterKeys: [platform, `${platform}-msi`],
+        signed: true
+      }
+    ]
+  }
+  return [
+    {
+      source: `OpenPencil_${version}_amd64.AppImage`,
+      name: `OpenPencil_${label}_amd64.AppImage`,
+      updaterKeys: ['linux-x86_64', 'linux-x86_64-appimage'],
+      signed: true
+    },
+    {
+      source: `OpenPencil_${version}_amd64.deb`,
+      name: `OpenPencil_${label}_amd64.deb`,
+      updaterKeys: ['linux-x86_64-deb'],
+      signed: true
+    },
+    {
+      source: `OpenPencil-${version}-1.x86_64.rpm`,
+      name: `OpenPencil-${label}-1.x86_64.rpm`,
+      updaterKeys: ['linux-x86_64-rpm'],
+      signed: true
+    }
+  ]
+}

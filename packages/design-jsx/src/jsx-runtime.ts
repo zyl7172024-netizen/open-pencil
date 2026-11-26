@@ -1,0 +1,53 @@
+import {
+  FRAGMENT,
+  node,
+  type BaseProps,
+  type EllipseProps,
+  type PolygonProps,
+  type StarProps,
+  type ParagraphProps,
+  type SpanProps,
+  type TreeNode,
+  type TextProps
+} from './tree'
+
+export function jsx(type: string | ((props: BaseProps) => TreeNode), props: BaseProps): TreeNode {
+  if (typeof type === 'function') {
+    return type(props)
+  }
+  return node(type, props)
+}
+
+export const jsxs = jsx
+export const jsxDEV = jsx
+
+/** Groups siblings the way `<>…</>` does in `renderJSX` strings: a node with an empty type. */
+export function Fragment({ children }: { children?: unknown }): TreeNode {
+  return node(FRAGMENT, { children })
+}
+
+export namespace JSX {
+  export type Element = TreeNode
+
+  export interface IntrinsicElements {
+    frame: BaseProps
+    text: TextProps
+    'text-span': SpanProps
+    'text-paragraph': ParagraphProps
+    rectangle: BaseProps
+    ellipse: BaseProps & EllipseProps
+    line: BaseProps
+    star: BaseProps & StarProps
+    polygon: BaseProps & PolygonProps
+    vector: BaseProps
+    group: BaseProps
+    section: BaseProps
+    component: BaseProps
+    'component-set': BaseProps
+    instance: BaseProps & { component?: string; componentId?: string; of?: string }
+  }
+
+  export interface ElementChildrenAttribute {
+    children: unknown
+  }
+}

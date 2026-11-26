@@ -1,0 +1,292 @@
+<script setup lang="ts">
+import type { ChatStatus, UIMessage } from 'ai'
+import { ScrollAreaRoot, ScrollAreaScrollbar, ScrollAreaThumb, ScrollAreaViewport } from 'reka-ui'
+import { computed, provide, ref } from 'vue'
+
+import { useMessages } from '@open-pencil/vue/i18n'
+
+import { attachmentsForMessage } from '@/app/ai/attachment/presentation/store'
+import type { AttachmentPresentation } from '@/app/ai/attachment/presentation/types'
+import { compactionOf } from '@/app/ai/chat/compaction/marker'
+import { usageOf } from '@/app/ai/chat/metadata'
+import type { QueuedMessage } from '@/app/ai/chat/queue'
+import { reviewOf } from '@/app/ai/review/message'
+import type { ReasoningDisplay } from '@/app/settings/preferences/store'
+import ChatReferenceText from '@/components/chat/reference/ChatReferenceText.vue'
+import { CHAT_NODES_LIVE } from '@/components/chat/tool/context'
+import AppButton from '@/components/ui/button/AppButton.vue'
+import IconButton from '@/components/ui/button/IconButton.vue'
+import AppPlaceholder from '@/components/ui/feedback/AppPlaceholder.vue'
+
+import ChatMessage from './ChatMessage.vue'
+import { useScrollFollowing } from './transcript/useScrollFollowing'
+import ChatCompactionDivider from './turn/ChatCompactionDivider.vue'
+import ChatMessageQueued from './turn/ChatMessageQueued.vue'
+import ChatReviewCard from './turn/ChatReviewCard.vue'
+
+const {
+  messages,
+  status,
+  showContinue = false,
+  interrupted = false,
+  presentations,
+  interactive = false,
+  nodesLive = true,
+  reasoningDisplay,
+  queued = [],
+  steers = false,
+  sending = null,
+  compacting = false,
+  reviewing = false,
+  reviewsActionable = false
+} = defineProps<{
+  messages: UIMessage[]
+  status: ChatStatus
+  showContinue?: boolean
+  /** The last reply was cut off before it finished, as by closing the app mid-reply. */
+  interrupted?: boolean
+  presentations?: Record<string, { text?: string; attachments?: AttachmentPresentation[] }>
+  /** Offers regenerating the last reply, retrying an unanswered request, and editing the last request. */
+  interactive?: boolean
+  /** False for a conversation from another document: its layer IDs are not this document's. */
+  nodesLive?: boolean
+  /** Overrides the reasoning display preference, for a surface that always shows it. */
+  reasoningDisplay?: ReasoningDisplay
+  /** Messages written while the agent works, shown after its reply until it takes them in. */
+  queued?: readonly QueuedMessage[]
+  /** Whether the agent takes a waiting message mid-turn. */
+  steers?: boolean
+  /** The text of a message sent but not in the chat yet, shown at once while the chat connects. */
+  sending?: string | null
+  /** The conversation is being compacted, from a `/compact` or before a message goes. */
+  compacting?: boolean
+  /** The Review model is reviewing the design, from a `/review`. */
+  reviewing?: boolean
+  /** Whether a review's findings can be sent on now, which needs no live chat. */
+  reviewsActionable?: boolean
+}>()
+const emit = defineEmits<{
+  continue: []
+  regenerate: []
+  revert: [messageId: string]
+  restore: [messageId: string]
+  edit: [messageId: string, text: string]
+  removeQueued: [id: string]
+  fixReview: [messageId: string]
+}>()
+const ai = useMessages('ai')
+provide(
+  CHAT_NODES_LIVE,
+  computed(() => nodesLive)
+)
+const running = computed(() => status === 'submitted' || status === 'streaming')
+/**
+ * The AI is at work for the whole turn, not only until its first words: agents go quiet while
+ * they think, and most send no thinking text, or send it only once a stretch of it ends.
+ */
+const isThinking = computed(() => (sending !== null && !compacting) || running.value)
+const idle = computed(() => interactive && (status === 'ready' || status === 'error'))
+// A request that failed before any reply is the last message; it is retried, not an older reply.
+const lastMessage = computed(() => messages.at(-1))
+/**
+ * Each message with the compaction it marks, which the transcript draws as a divider, and what
+ * the first reply after that compaction reported its request held, or the design review it is.
+ */
+const entries = computed(() =>
+  messages.map((message, index) => {
+    // A compaction within a reply is drawn by the reply, at the step where it ran.
+    const compaction = message.role === 'user' ? compactionOf(message) : null
+    const review = compaction ? null : reviewOf(message)
+    return { message, compaction, review, tokensAfter: compaction ? tokensAfter(index) : null }
+  })
+)
+/** What the first reply after the compaction at `index` reported, before the next one. */
+function tokensAfter(index: number): number | null {
+  for (const message of messages.slice(index + 1)) {
+    if (compactionOf(message)) return null
+    const usage = usageOf(message)
+    if (usage) return usage.contextTokens
+  }
+  return null
+}
+/**
+ * The newest message the person wrote. A compaction's summary is not one, and a request before
+ * it is no longer the model's to answer, so neither is edited or retried.
+ */
+const lastRequest = computed(() => {
+  const last = messages.findLast((m) => m.role === 'user')
+  return last && compactionOf(last) === null ? last : undefined
+})
+/** Messages with attachments carry context a plain text edit would drop. */
+const editableRequestId = computed(() => {
+  const request = lastRequest.value
+  if (!request) return undefined
+  // Images would be lost when the text is sent again; layer previews follow the edited text.
+  const attachments = [
+    ...(presentations?.[request.id]?.attachments ?? []),
+    ...attachmentsForMessage(request.id).value
+  ]
+  return attachments.some((attachment) => attachment.kind !== 'node') ? undefined : request.id
+})
+const transcriptContent = ref<HTMLDivElement>()
+const viewportComponent = ref<{ viewportElement?: HTMLElement }>()
+const viewport = computed(() => viewportComponent.value?.viewportElement)
+const { arrivedState, resumeFollowing } = useScrollFollowing(
+  viewport,
+  transcriptContent,
+  computed(() => status === 'submitted')
+)
+</script>
+
+<template>
+  <ScrollAreaRoot class="relative min-h-0 flex-1">
+    <!-- Text below the fold fades out at the bottom edge, as tab bars fade at theirs. -->
+    <ScrollAreaViewport
+      ref="viewportComponent"
+      class="h-full px-3 pt-3 data-overflow-end:mask-b-from-[calc(100%-2rem)] [&>div]:h-full"
+      :data-overflow-end="(messages.length && !arrivedState.bottom) || undefined"
+    >
+      <AppPlaceholder
+        v-if="messages.length === 0 && sending === null && !compacting && !reviewing"
+        data-test-id="chat-empty-state"
+        :label="ai.describeCreateOrChange"
+        :ui="{ root: 'h-full' }"
+      >
+        <template #icon>
+          <icon-lucide-message-circle class="size-5" />
+        </template>
+      </AppPlaceholder>
+
+      <!-- Messages -->
+      <div
+        v-else
+        ref="transcriptContent"
+        data-test-id="chat-messages"
+        class="flex flex-col gap-3 pb-5"
+      >
+        <template
+          v-for="({ message: msg, compaction, review, tokensAfter }, index) in entries"
+          :key="msg.id"
+        >
+          <ChatCompactionDivider
+            v-if="compaction"
+            :compaction="compaction"
+            :tokens-after="tokensAfter"
+          />
+          <ChatReviewCard
+            v-else-if="review"
+            :review="review"
+            :can-fix="reviewsActionable"
+            @fix="emit('fixReview', msg.id)"
+          />
+          <ChatMessage
+            v-else
+            :message="msg"
+            :presentation="presentations?.[msg.id]"
+            :streaming="running && msg.role === 'assistant' && index === messages.length - 1"
+            :can-regenerate="idle && msg.id === lastMessage?.id && msg.role === 'assistant'"
+            :can-retry="idle && msg.id === lastMessage?.id && msg.role === 'user'"
+            :can-edit="idle && msg.id === editableRequestId"
+            :reasoning-display="reasoningDisplay"
+            @regenerate="emit('regenerate')"
+            @revert="emit('revert', msg.id)"
+            @restore="emit('restore', msg.id)"
+            @edit="(text) => emit('edit', msg.id, text)"
+          />
+        </template>
+
+        <div v-if="sending !== null" class="flex justify-end" data-test-id="chat-sending-message">
+          <div
+            class="max-w-[85%] rounded-xl rounded-ee-md bg-accent px-3 py-2 text-xs leading-relaxed whitespace-pre-wrap text-on-accent"
+          >
+            <ChatReferenceText :text="sending" />
+          </div>
+        </div>
+
+        <p
+          v-if="compacting"
+          role="status"
+          class="flex items-center justify-center gap-1.5 py-1 text-2xs text-muted"
+          data-test-id="chat-compacting"
+        >
+          <icon-lucide-loader-circle
+            class="size-3 animate-spin motion-reduce:animate-none"
+            aria-hidden="true"
+          />
+          {{ ai.compacting }}
+        </p>
+
+        <p
+          v-if="reviewing"
+          role="status"
+          class="flex items-center justify-center gap-1.5 py-1 text-2xs text-muted"
+          data-test-id="chat-reviewing"
+        >
+          <icon-lucide-loader-circle
+            class="size-3 animate-spin motion-reduce:animate-none"
+            aria-hidden="true"
+          />
+          {{ ai.reviewing }}
+        </p>
+
+        <!-- Shown while the AI works, below whatever it has sent so far. -->
+        <div v-if="isThinking" data-test-id="chat-typing-indicator" class="flex gap-2">
+          <div
+            class="flex size-6 shrink-0 items-center justify-center rounded-full bg-muted/20 text-3xs font-bold text-muted"
+          >
+            AI
+          </div>
+          <div class="flex items-center gap-1 py-2">
+            <span
+              class="size-1.5 animate-bounce motion-reduce:animate-none rounded-full bg-muted"
+            />
+            <span
+              class="size-1.5 animate-bounce motion-reduce:animate-none rounded-full bg-muted"
+              :style="{ animationDelay: '150ms' }"
+            />
+            <span
+              class="size-1.5 animate-bounce motion-reduce:animate-none rounded-full bg-muted"
+              :style="{ animationDelay: '300ms' }"
+            />
+          </div>
+        </div>
+
+        <ChatMessageQueued
+          v-for="item in queued"
+          :key="item.id"
+          :message="item"
+          :steers="steers"
+          @remove="emit('removeQueued', item.id)"
+        />
+
+        <!-- Under the reply it is about, so it scrolls with the conversation. -->
+        <p
+          v-if="interrupted"
+          role="status"
+          class="px-1 text-2xs text-muted"
+          data-test-id="chat-interrupted"
+        >
+          {{ ai.chatInterrupted }}
+        </p>
+
+        <!-- Continue button when step limit reached -->
+        <div v-if="showContinue" class="flex justify-center py-2">
+          <AppButton color="primary" variant="soft" shape="pill" @click="emit('continue')">
+            <template #leading><icon-lucide-play class="size-3" /></template>
+            {{ ai.continueChat }}
+          </AppButton>
+        </div>
+      </div>
+    </ScrollAreaViewport>
+    <ScrollAreaScrollbar orientation="vertical" class="flex w-1.5 touch-none p-px select-none">
+      <ScrollAreaThumb class="relative flex-1 rounded-full bg-muted/30" />
+    </ScrollAreaScrollbar>
+    <IconButton
+      v-if="messages.length && !arrivedState.bottom"
+      :label="ai.jumpToLatest"
+      class="absolute inset-e-3 bottom-3 border border-border bg-panel shadow-sm"
+      @click="resumeFollowing"
+      ><icon-lucide-arrow-down class="size-4"
+    /></IconButton>
+  </ScrollAreaRoot>
+</template>

@@ -1,0 +1,32 @@
+name: PR title
+
+on:
+  # Every base, so stacked pull requests are checked against the PR below them.
+  pull_request:
+    types: [opened, synchronize, reopened, edited]
+  # A queued change was checked as a pull request; the queue still needs the result.
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-title-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pr-title:
+    name: PR title
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup/workspace
+      - name: Validate PR title
+        if: github.event_name == 'pull_request'
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          COMMITLINT_PR_TITLE: '1'
+        run: printf '%s\n' "$PR_TITLE" | bun run check:commits

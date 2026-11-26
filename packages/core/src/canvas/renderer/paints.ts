@@ -1,0 +1,128 @@
+import { colorNodeEditPaints, createNodeEditPaints } from '#core/canvas/overlays/node-edit'
+import type { SkiaRenderer } from '#core/canvas/renderer/skia'
+import {
+  DEFAULT_FONT_SIZE,
+  PARENT_OUTLINE_ALPHA,
+  PEN_PATH_STROKE_WIDTH,
+  RULER_BG_COLOR,
+  RULER_TEXT_COLOR,
+  RULER_TICK_COLOR,
+  SNAP_COLOR
+} from '#core/constants'
+
+export function initializeRendererPaints(r: SkiaRenderer): void {
+  const ck = r.ck
+
+  r.fillPaint = new ck.Paint()
+  r.fillPaint.setStyle(ck.PaintStyle.Fill)
+  r.fillPaint.setAntiAlias(true)
+
+  r.strokePaint = new ck.Paint()
+  r.strokePaint.setStyle(ck.PaintStyle.Stroke)
+  r.strokePaint.setAntiAlias(true)
+
+  r.selectionPaint = new ck.Paint()
+  r.selectionPaint.setStyle(ck.PaintStyle.Stroke)
+  r.selectionPaint.setStrokeWidth(1)
+  r.selectionPaint.setAntiAlias(true)
+
+  r.snapPaint = new ck.Paint()
+  r.snapPaint.setStyle(ck.PaintStyle.Stroke)
+  r.snapPaint.setStrokeWidth(1)
+  r.snapPaint.setColorComponents(SNAP_COLOR.r, SNAP_COLOR.g, SNAP_COLOR.b, 1)
+  r.snapPaint.setAntiAlias(true)
+
+  r.auxFill = new ck.Paint()
+  r.auxFill.setStyle(ck.PaintStyle.Fill)
+  r.auxFill.setAntiAlias(true)
+
+  r.auxStroke = new ck.Paint()
+  r.auxStroke.setStyle(ck.PaintStyle.Stroke)
+  r.auxStroke.setAntiAlias(true)
+
+  r.opacityPaint = new ck.Paint()
+  r.effectLayerPaint = new ck.Paint()
+  r.chromeFonts.text = new ck.Font(null, DEFAULT_FONT_SIZE)
+
+  const bg = RULER_BG_COLOR
+  r.rulerBgPaint = new ck.Paint()
+  r.rulerBgPaint.setColorComponents(bg.r, bg.g, bg.b, 1)
+
+  r.rulerTickPaint = new ck.Paint()
+  r.rulerTickPaint.setColor(
+    ck.Color4f(RULER_TICK_COLOR.r, RULER_TICK_COLOR.g, RULER_TICK_COLOR.b, 1)
+  )
+  r.rulerTickPaint.setStrokeWidth(1)
+  r.rulerTickPaint.setAntiAlias(true)
+
+  const tc = RULER_TEXT_COLOR
+  r.rulerTextPaint = new ck.Paint()
+  r.rulerTextPaint.setColorComponents(tc.r, tc.g, tc.b, 1)
+  r.rulerTextPaint.setAntiAlias(true)
+
+  r.rulerHlPaint = new ck.Paint()
+  r.rulerHlPaint.setAntiAlias(true)
+
+  r.rulerBadgePaint = new ck.Paint()
+  r.rulerBadgePaint.setAntiAlias(true)
+
+  r.rulerLabelPaint = new ck.Paint()
+  r.rulerLabelPaint.setColorComponents(1, 1, 1, 1)
+  r.rulerLabelPaint.setAntiAlias(true)
+
+  r.penPathPaint = new ck.Paint()
+  r.penPathPaint.setStyle(ck.PaintStyle.Stroke)
+  r.penPathPaint.setStrokeWidth(1)
+  r.penPathPaint.setColorComponents(0.698, 0.698, 0.698, 1)
+  r.penPathPaint.setAntiAlias(true)
+
+  r.penLiveStrokePaint = new ck.Paint()
+  r.penLiveStrokePaint.setStyle(ck.PaintStyle.Stroke)
+  r.penLiveStrokePaint.setStrokeWidth(PEN_PATH_STROKE_WIDTH)
+  r.penLiveStrokePaint.setColorComponents(0, 0, 0, 1)
+  r.penLiveStrokePaint.setAntiAlias(true)
+
+  r.pencilStrokePaint = new ck.Paint()
+  r.pencilStrokePaint.setStyle(ck.PaintStyle.Stroke)
+  r.pencilStrokePaint.setStrokeCap(ck.StrokeCap.Round)
+  r.pencilStrokePaint.setStrokeJoin(ck.StrokeJoin.Round)
+  r.pencilStrokePaint.setAntiAlias(true)
+
+  r.penHandlePaint = new ck.Paint()
+  r.penHandlePaint.setStyle(ck.PaintStyle.Stroke)
+  r.penHandlePaint.setStrokeWidth(1)
+  r.penHandlePaint.setAntiAlias(true)
+
+  r.penVertexFill = new ck.Paint()
+  r.penVertexFill.setStyle(ck.PaintStyle.Fill)
+  r.penVertexFill.setColor(ck.WHITE)
+  r.penVertexFill.setAntiAlias(true)
+
+  r.penVertexStroke = new ck.Paint()
+  r.penVertexStroke.setStyle(ck.PaintStyle.Stroke)
+  r.penVertexStroke.setStrokeWidth(1)
+  r.penVertexStroke.setAntiAlias(true)
+
+  r.nodeEditPaints = createNodeEditPaints(ck)
+
+  initializeSelectionPaintColors(r)
+}
+
+/** Colors the long-lived paints drawn in the selection color; rerun when that color changes. */
+export function initializeSelectionPaintColors(r: SkiaRenderer): void {
+  r.selectionPaint.setColor(r.selColor())
+  r.penHandlePaint.setColor(r.selColor(PARENT_OUTLINE_ALPHA))
+  r.penVertexStroke.setColor(r.selColor())
+  colorNodeEditPaints(r.ck, r.nodeEditPaints, r.selectionTheme.color)
+}
+
+/** Colours the ruler paints from the ruler theme, or the defaults without one. */
+export function initializeRulerPaintColors(r: SkiaRenderer): void {
+  const theme = r.rulerTheme
+  const background = theme?.background ?? { ...RULER_BG_COLOR, a: 1 }
+  const tick = theme?.tick ?? { ...RULER_TICK_COLOR, a: 1 }
+  const text = theme?.text ?? { ...RULER_TEXT_COLOR, a: 1 }
+  r.rulerBgPaint.setColorComponents(background.r, background.g, background.b, background.a)
+  r.rulerTickPaint.setColorComponents(tick.r, tick.g, tick.b, tick.a)
+  r.rulerTextPaint.setColorComponents(text.r, text.g, text.b, text.a)
+}

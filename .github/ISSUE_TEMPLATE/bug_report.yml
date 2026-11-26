@@ -1,0 +1,108 @@
+name: Bug report
+description: Report something that is broken or behaves differently than expected
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report a bug. Screenshots, recordings, or files are often enough if exact steps are hard to describe.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: Describe the bug and what you expected to happen instead.
+      placeholder: |
+        When I import this .fig file, text layers are offset by about 20px. I expected them to keep their Figma position.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - Web (app.openpencil.dev)
+        - Web (self-hosted or other address)
+        - macOS (Tauri)
+        - Windows (Tauri)
+        - Linux (Tauri)
+        - CLI
+        - MCP server
+        - Not sure
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: Optional, but very helpful when you know the exact steps.
+      placeholder: |
+        1. Open OpenPencil on …
+        2. Import …
+        3. Select …
+        4. See …
+
+  - type: dropdown
+    id: affected-area
+    attributes:
+      label: Affected area
+      description: Optional triage hint.
+      multiple: true
+      options:
+        - App UI
+        - Canvas rendering
+        - .fig import/export
+        - SVG/PDF/raster export
+        - CLI
+        - MCP / automation
+        - AI assistant
+        - Tauri desktop
+        - Collaboration
+        - Documentation
+        - Not sure
+
+  - type: input
+    id: version
+    attributes:
+      label: Version or build
+      description: App version, commit SHA, package version, or “latest web app”.
+      placeholder: v0.13.2, latest web app, commit abc123
+
+  - type: input
+    id: browser
+    attributes:
+      label: Browser (web only)
+      placeholder: Chrome 131, Safari 18, Firefox 133
+
+  - type: textarea
+    id: files
+    attributes:
+      label: Files, screenshots, or links
+      description: Attach relevant .fig/.pen/SVG files, screenshots, screen recordings, or link to a Figma file if possible.
+      placeholder: Drag files here or paste links.
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Diagnostics
+      description: |
+        In the app, **Settings › Diagnostics › Save diagnostics…** saves recent technical events. It leaves out chat messages and tool payloads and scrubs keys and personal paths from error messages, but an error can still quote a name from your file, so skim it before attaching. For an AI chat problem, the conversation's **… › Save trace…** saves the whole conversation, including your prompts and tool output, so review it before attaching.
+      placeholder: Drag the saved .json files here.
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Diagnostics or logs
+      description: In the app, open Settings → Diagnostics, reproduce the problem, click Copy diagnostics, and paste the result here. Keys and tokens are redacted; review it before posting. Console output works too.
+      render: shell
+
+  - type: checkboxes
+    id: checklist
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues and did not find a duplicate.
+          required: false

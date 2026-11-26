@@ -1,0 +1,142 @@
+# Architecture
+
+## System Overview
+
+For source identity, override evaluation, page sessions, and export contracts, see
+[.fig Reader Architecture](./fig-reader).
+
+```mermaid
+graph TB
+    subgraph Tauri["Tauri v2 Shell"]
+        subgraph Editor["Editor (Web)"]
+            UI["Vue 3 UI<br/>Toolbar · Panels · Properties<br/>Layers · Color Picker"]
+            Skia["Skia CanvasKit (WASM, 7MB)<br/>Vector rendering · Text shaping<br/>Effects · Export"]
+            subgraph Core["Core Engine (TS)"]
+                SG[SceneGraph] --- Layout[Layout - Taffy]
+                SG --- Selection
+                Undo[Undo/Redo] --- Constraints
+                Constraints --- HitTest[Hit Testing]
+            end
+            subgraph FileFormat["File Format Layer"]
+                FigIO[".fig import/export"] --- Kiwi[Kiwi codec]
+                Kiwi --- SVG[SVG export]
+            end
+        end
+        MCP["MCP Server (90 tools, stdio+HTTP)"]
+        Collab["P2P Collab (Trystero + Yjs)"]
+    end
+```
+
+## Editor Layout
+
+The UI follows Figma's UI3 layout — toolbar at the bottom, navigation on the left, properties on the right:
+
+- **Navigation panel (left)** — Layers tree, pages panel
+- **Canvas (center)** — Infinite canvas with CanvasKit rendering, zoom/pan
+- **Properties panel (right)** — Context-sensitive sections: Appearance, Fill, Stroke, Typography, Layout, Position
+- **Toolbar (bottom)** — Tool selection: Select, Frame, Section, Rectangle, Ellipse, Line, Text, Pen, Hand
+
+## Components
+
+### Rendering (CanvasKit WASM)
+
+The same rendering engine as Figma. CanvasKit provides GPU-accelerated 2D drawing with vector shapes, text shaping via Paragraph API, effects (shadows, blurs, blend modes), and export (PNG, SVG). The 7MB WASM binary loads at startup and creates a GPU surface on the HTML canvas.
+
+The renderer is split into focused modules in `packages/core/src/renderer/`: scene traversal, overlays, fills, strokes, shapes, effects, rulers, labels, and remote cursors.
+
+### Scene Graph
+
+Flat `Map<string, Node>` keyed by GUID strings. Tree structure via `parentIndex` references. Provides O(1) lookup, efficient traversal, hit testing, and rectangular area queries for marquee selection.
+
+The graph emits typed events via nanoevents: `node:created`, `node:updated`, `node:deleted`, `node:reparented`, `node:reordered`. Subsystems subscribe to these instead of manual call-site wiring — the editor uses them for render invalidation and microtask-batched component instance sync, while the collab system uses them for Yjs propagation.
+
+See [Scene Graph Reference](/reference/scene-graph) for internals.
+
+### Variable expressions
+
+Scene Graph owns the canonical variable definitions: literals, stable-ID aliases, bounded formula trees that give numbers, Booleans, text or colors, and composed colors. Shared Valibot schemas validate expression structure on FIG import, FIG export, and resolution. The resolver owns mode selection, dependency traversal, cycles, and evaluation; draft validation supplies an override without mutating the document. Canvas callers treat resolution failures as unresolved values, while the inspector retains diagnostics. Core applies edits, undo, binding reconciliation, and layout.
+
+Formula trees name operators in OpenPencil's own terms (`add`, `truthy`, `if`) with Figma's operand signatures and value rules: `+` joins text, `text()`, `truthy()` and `if()` convert and choose as Figma's `STRINGIFY`, `IS_TRUTHY` and `TERNARY` do, and number text follows Figma's two-decimal format. The FIG package alone maps each operator to Figma's `ExpressionFunction`, so other formats read and write the same tree. An expression the reader cannot hold as a formula, such as one naming a variable the file lacks, is kept as the file wrote it. Scene Graph parses formula text into a tree, checking operand types as it goes, and prints a tree back with only the parentheses precedence needs; references are `{name}` in text and IDs in the tree. Editors show references as pills and never ask users to type braces.
+
+A formula in `valuesByMode` is live document behavior. `expressions[modeId].css` is separate, target-specific CSS that replaces the value in CSS alone, edited in its own field. The token stylesheet writes number formulas as `calc()` over `var()` references, checking that units add and multiply as CSS allows, and declares a formula again in each mode scope that changes a variable it uses. Design-token files hold each mode's result with the formula in `$extensions`. Design JSX preserves node bindings through `designVar`, but does not yet bundle the referenced formula definitions; formulas that give Booleans, text or colors, or use `if()`, have no CSS form.
+
+### Layout Engine (Taffy WASM)
+
+[Taffy](https://github.com/DioxusLabs/taffy), a Rust implementation of CSS flexbox and CSS Grid, computes auto layout. It ships as `@open-pencil/taffy`, built to WebAssembly from OpenPencil's [fork](https://github.com/open-pencil/taffy/tree/openpencil/taffy); the same Taffy lays out HTML import through Blitz. Core builds a tree of `LayoutNode`s with CSS-named styles and lays it out with one `computeLayout(root)` call, measuring text leaves through a `measure` callback. `createLayoutNode()` sets auto layout's defaults where they differ from CSS: column direction, `flexShrink: 0`, `alignContent: flex-start`, and minimum sizes of 0. Boxes are border-box and not rounded to pixels.
+
+The adapter in `packages/core/src/layout/` maps Figma properties to CSS styles:
+
+| Figma Property | CSS Style |
+|---|---|
+| `layoutMode: HORIZONTAL` / `VERTICAL` | `flexDirection: row` / `column` |
+| `layoutMode: GRID` | `display: grid` |
+| `layoutWrap: WRAP` | `flexWrap: wrap` |
+| `itemSpacing`, `counterAxisSpacing` | `columnGap`, `rowGap` |
+| `paddingTop/Right/Bottom/Left` (+ included inside strokes) | `padding` |
+| `primaryAxisAlign: MIN/CENTER/MAX/SPACE_BETWEEN` | `justifyContent` |
+| `counterAxisAlign` | `alignItems` |
+| `counterAxisAlignContent: SPACE_BETWEEN` | `alignContent: space-between` |
+| `layoutGrow` | `flexGrow` |
+| `layoutAlignSelf` | `alignSelf` |
+| Sizing `FIXED` / `HUG` / `FILL` | `width`/`height` / auto / `flexGrow: 1` on the main axis, `alignSelf: stretch` across it |
+| `minWidth`, `maxWidth`, `minHeight`, `maxHeight` | `minWidth`, `maxWidth`, `minHeight`, `maxHeight` |
+| `layoutPositioning: ABSOLUTE` | `position: absolute` |
+| `layoutDirection` | `direction: ltr` / `rtl` |
+| `clipsContent` | `overflow: hidden` |
+| `gridTemplateColumns`, `gridTemplateRows` | `gridTemplateColumns`, `gridTemplateRows` (fixed, `fr`, `auto`) |
+| `gridColumnGap`, `gridRowGap` | `columnGap`, `rowGap` |
+| `gridPosition` | `gridColumn`, `gridRow` (start and span) |
+
+### File Format (Kiwi Binary)
+
+Reuses Figma's Kiwi binary codec with 194 message/enum/struct definitions. Import: parse header → Zstd decompress → Kiwi decode → `NodeChange`[] → scene graph. Export reverses the process with thumbnail generation.
+
+See [File Format Reference](/reference/file-format) for details.
+
+### AI & Tools
+
+Tools are defined once in `packages/core/src/tools/`, split by domain: read, create, modify, structure, variables, vector, analyze. Each tool has typed params and an `execute(figma, args)` function. Adapters convert them for:
+
+- **AI chat** — valibot schemas, multi-provider (Anthropic, OpenAI, Google AI, OpenRouter, compatible endpoints)
+- **MCP server** — zod schemas, stdio + HTTP transports
+- **CLI** — available via the `eval` command, whose scripts get the `figma` Plugin API and the `openpencil` API
+
+90+ core tools + 3 MCP file management tools. Includes XPath query (`query_nodes`), JSX inspection (`get_jsx`, `diff_nodes`), semantic description (`describe`), and vision-based verification (`export_image` returns images to the model).
+
+### Behaviours and Preview
+
+A behaviour stored on a main component makes it work as a Reka UI control. Preview runs top-level layers holding controls as live islands: shadow-DOM projections laid over the canvas, with each control mounted as its Reka UI primitive and drawn by the component's variants. See [Behaviours and Preview](./behaviours-and-preview).
+
+### Undo/Redo
+
+Inverse-command pattern. Before applying any change, affected fields are snapshotted. The snapshot becomes the inverse operation. Batching groups rapid changes (like drag) into single undo entries.
+
+### Clipboard
+
+Figma-compatible bidirectional clipboard. Encodes/decodes Kiwi binary (same format as .fig files) via native browser copy/paste events. Handles vector path scaling, instance children, component set detection, and override application.
+
+### P2P Collaboration
+
+Real-time peer-to-peer collaboration via Trystero (WebRTC) + Yjs CRDT. No server relay — signaling over MQTT public brokers, STUN/TURN for NAT traversal. Awareness protocol provides live cursors, selections, and presence. Local persistence via y-indexeddb.
+
+### CLI-to-App RPC Bridge
+
+When the desktop app is running, CLI commands connect to it via WebSocket instead of requiring a .fig file. The automation server runs on `127.0.0.1:7600` (HTTP) and `127.0.0.1:7601` (WebSocket). Commands execute against the live editor state, enabling automation scripts and AI agents to interact with the running app.
+
+## What's Next
+
+### Full figma-use Tool Set
+
+The MCP server currently exposes 90 tools. The reference implementation in [figma-use](https://github.com/dannote/figma-use) has 118. The remaining tools cover advanced layout constraints, prototype connections, advanced component property editing, and bulk document operations.
+
+### CI Design Tooling
+
+The headless CLI already supports `analyze colors/typography/spacing/clusters`. Next: GitHub Actions integration for automated design linting and visual regression in PRs.
+
+### Prototyping
+
+Preview already runs components with behaviours as live controls. Next: reactions and variables that let controls drive the rest of a design, frame-to-frame transitions, interaction triggers, and overlays.
+
+### Windows Code Signing
+
+macOS binaries are signed and notarized since v0.6.0. Windows Authenticode signing via Azure Code Signing is planned to remove the SmartScreen warning.

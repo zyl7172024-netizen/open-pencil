@@ -1,0 +1,126 @@
+# Cloud's plans: the pricing page is billing's own, on its own address, where a visitor signed in
+# to Cloud is known as it opens.
+/pricing https://billing.openpencil.dev/pricing 302
+
+# Legacy documentation routes
+/guide/getting-started /getting-started 301
+/guide/features /overview/features 301
+/guide/architecture /development/architecture 301
+/guide/tech-stack /development/tech-stack 301
+/guide/comparison /overview/comparison 301
+/guide/figma-comparison /reference/figma-compatibility 301
+
+# Localized legacy documentation routes
+/de/guide/getting-started /de/getting-started 301
+/de/guide/features /de/overview/features 301
+/de/guide/architecture /development/architecture 301
+/de/guide/tech-stack /development/tech-stack 301
+/de/guide/comparison /de/overview/comparison 301
+/de/guide/figma-comparison /de/reference/figma-compatibility 301
+/es/guide/getting-started /es/getting-started 301
+/es/guide/features /es/overview/features 301
+/es/guide/architecture /development/architecture 301
+/es/guide/tech-stack /development/tech-stack 301
+/es/guide/comparison /es/overview/comparison 301
+/es/guide/figma-comparison /es/reference/figma-compatibility 301
+/fr/guide/getting-started /fr/getting-started 301
+/fr/guide/features /fr/overview/features 301
+/fr/guide/architecture /development/architecture 301
+/fr/guide/tech-stack /development/tech-stack 301
+/fr/guide/comparison /fr/overview/comparison 301
+/fr/guide/figma-comparison /fr/reference/figma-compatibility 301
+/it/guide/getting-started /it/getting-started 301
+/it/guide/features /it/overview/features 301
+/it/guide/architecture /development/architecture 301
+/it/guide/tech-stack /development/tech-stack 301
+/it/guide/comparison /it/overview/comparison 301
+/it/guide/figma-comparison /it/reference/figma-compatibility 301
+/pl/guide/getting-started /pl/getting-started 301
+/pl/guide/features /pl/overview/features 301
+/pl/guide/architecture /development/architecture 301
+/pl/guide/tech-stack /development/tech-stack 301
+/pl/guide/comparison /pl/overview/comparison 301
+/pl/guide/figma-comparison /pl/reference/figma-compatibility 301
+/ru/guide/getting-started /ru/getting-started 301
+/ru/guide/features /ru/overview/features 301
+/ru/guide/architecture /development/architecture 301
+/ru/guide/tech-stack /development/tech-stack 301
+/ru/guide/comparison /ru/overview/comparison 301
+/ru/guide/figma-comparison /ru/reference/figma-compatibility 301
+
+# Removed SDK variables table APIs
+/developers/sdk/api/composables/use-variables-editor /developers/sdk/api/advanced/use-variables 301
+/developers/sdk/api/advanced/use-variables-dialog-state /developers/sdk/api/advanced/use-variables 301
+/developers/sdk/api/advanced/use-variables-table /developers/sdk/api/advanced/use-variables 301
+/de/developers/sdk/api/composables/use-variables-editor /de/developers/sdk/api/advanced/use-variables 301
+/de/developers/sdk/api/advanced/use-variables-dialog-state /de/developers/sdk/api/advanced/use-variables 301
+/de/developers/sdk/api/advanced/use-variables-table /de/developers/sdk/api/advanced/use-variables 301
+/es/developers/sdk/api/composables/use-variables-editor /es/developers/sdk/api/advanced/use-variables 301
+/es/developers/sdk/api/advanced/use-variables-dialog-state /es/developers/sdk/api/advanced/use-variables 301
+/es/developers/sdk/api/advanced/use-variables-table /es/developers/sdk/api/advanced/use-variables 301
+/fr/developers/sdk/api/composables/use-variables-editor /fr/developers/sdk/api/advanced/use-variables 301
+/fr/developers/sdk/api/advanced/use-variables-dialog-state /fr/developers/sdk/api/advanced/use-variables 301
+/fr/developers/sdk/api/advanced/use-variables-table /fr/developers/sdk/api/advanced/use-variables 301
+/it/developers/sdk/api/composables/use-variables-editor /it/developers/sdk/api/advanced/use-variables 301
+/it/developers/sdk/api/advanced/use-variables-dialog-state /it/developers/sdk/api/advanced/use-variables 301
+/it/developers/sdk/api/advanced/use-variables-table /it/developers/sdk/api/advanced/use-variables 301
+/pl/developers/sdk/api/composables/use-variables-editor /pl/developers/sdk/api/advanced/use-variables 301
+/pl/developers/sdk/api/advanced/use-variables-dialog-state /pl/developers/sdk/api/advanced/use-variables 301
+/pl/developers/sdk/api/advanced/use-variables-table /pl/developers/sdk/api/advanced/use-variables 301
+/ru/developers/sdk/api/composables/use-variables-editor /ru/developers/sdk/api/advanced/use-variables 301
+/ru/developers/sdk/api/advanced/use-variables-dialog-state /ru/developers/sdk/api/advanced/use-variables 301
+/ru/developers/sdk/api/advanced/use-variables-table /ru/developers/sdk/api/advanced/use-variables 301
+
+# OpenPencil Cloud moved to its own section
+/user-guide/openpencil-cloud /cloud/ 301
+/reference/self-hosting-cloud /cloud/self-hosting/ 301
+/overview/legal/terms /cloud/legal/terms 301
+/overview/legal/privacy /cloud/legal/privacy 301
+/overview/legal/subprocessors /cloud/legal/subprocessors 301
+
+# The Programmable section became Developers; its pages about using the editor joined the user guide
+/programmable/ai-chat /user-guide/ai-chat 301
+/programmable/collaboration /user-guide/collaboration 301
+/programmable/coding-agents /user-guide/coding-agents 301
+/programmable/byok-provider-compatibility /user-guide/models-and-providers 301
+/programmable /developers/ 301
+/programmable/* /developers/:splat 301
+/de/programmable/ai-chat /de/user-guide/ai-chat 301
+/de/programmable/collaboration /de/user-guide/collaboration 301
+/de/programmable/coding-agents /user-guide/coding-agents 301
+/de/programmable/byok-provider-compatibility /user-guide/models-and-providers 301
+/de/programmable /de/developers/ 301
+/de/programmable/* /de/developers/:splat 301
+/es/programmable/ai-chat /es/user-guide/ai-chat 301
+/es/programmable/collaboration /es/user-guide/collaboration 301
+/es/programmable/coding-agents /user-guide/coding-agents 301
+/es/programmable/byok-provider-compatibility /user-guide/models-and-providers 301
+/es/programmable /es/developers/ 301
+/es/programmable/* /es/developers/:splat 301
+/fr/programmable/ai-chat /fr/user-guide/ai-chat 301
+/fr/programmable/collaboration /fr/user-guide/collaboration 301
+/fr/programmable/coding-agents /user-guide/coding-agents 301
+/fr/programmable/byok-provider-compatibility /user-guide/models-and-providers 301
+/fr/programmable /fr/developers/ 301
+/fr/programmable/* /fr/developers/:splat 301
+/it/programmable/ai-chat /it/user-guide/ai-chat 301
+/it/programmable/collaboration /it/user-guide/collaboration 301
+/it/programmable/coding-agents /user-guide/coding-agents 301
+/it/programmable/byok-provider-compatibility /user-guide/models-and-providers 301
+/it/programmable /it/developers/ 301
+/it/programmable/* /it/developers/:splat 301
+/pl/programmable/ai-chat /pl/user-guide/ai-chat 301
+/pl/programmable/collaboration /pl/user-guide/collaboration 301
+/pl/programmable/coding-agents /user-guide/coding-agents 301
+/pl/programmable/byok-provider-compatibility /user-guide/models-and-providers 301
+/pl/programmable /pl/developers/ 301
+/pl/programmable/* /pl/developers/:splat 301
+/ru/programmable/ai-chat /ru/user-guide/ai-chat 301
+/ru/programmable/collaboration /ru/user-guide/collaboration 301
+/ru/programmable/coding-agents /user-guide/coding-agents 301
+/ru/programmable/byok-provider-compatibility /user-guide/models-and-providers 301
+/ru/programmable /ru/developers/ 301
+/ru/programmable/* /ru/developers/:splat 301
+
+# BYOK compatibility became Models and Providers, its test method a contributor page
+/user-guide/byok-provider-compatibility /user-guide/models-and-providers 301

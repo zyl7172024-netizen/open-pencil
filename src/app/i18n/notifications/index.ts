@@ -1,0 +1,91 @@
+import { createI18n, params } from '@nanostores/i18n'
+import type { ComponentsJSON } from '@nanostores/i18n'
+import { useStore } from '@nanostores/vue'
+
+import {
+  directedTranslations,
+  locale,
+  type Locale,
+  type TranslatedLocale
+} from '@open-pencil/vue/i18n'
+
+export const notificationMessageDefaults = {
+  chatInitializationFailed: params('Could not initialize chat: {error}'),
+  linkCopied: 'Link copied to clipboard.',
+  clipboardMissingDesignData: 'Clipboard does not contain design data.',
+  clipboardAccessBlocked: 'Clipboard access is blocked in this browser context.',
+  copiedAs: params('Copied as {format}.'),
+  copiedProperties: 'Copied properties.',
+  tokensLeftOut: params('Left out of the stylesheet: {names}.'),
+  designTokensLeftOut: params('Left out of the design tokens: {names}.'),
+  designTokensAmbiguous: params(
+    'These styles refer to a variable whose path another collection also has, so other tools may read the wrong one: {names}.'
+  ),
+  designTokensImported: params('Imported {count} design tokens.'),
+  unsupportedVariableExpressions: params(
+    'OpenPencil can’t evaluate these variables yet, so layers keep the values saved in the file: {names}.'
+  ),
+  nodeID: 'node ID',
+  nodeIDs: 'node IDs',
+  xPath: 'XPath',
+  xPaths: 'XPaths',
+  pngClipboardUnavailable: 'PNG clipboard export is not available in this browser.',
+  openFileFailed: params('Could not open “{name}”: {error}'),
+  openTourFailed: params('Could not open the tour: {error}'),
+  viewDiagnostics: 'View diagnostics',
+  importedDOMCSS: 'Imported DOM/CSS document.',
+  importDOMCSSFailed: params('Could not import DOM/CSS: {error}'),
+  openDOMCSSFailed: params('Could not open DOM/CSS file: {error}'),
+  vectorizeCredentialRequired: params('Add a {provider} API key in Settings → Image services.'),
+  vectorizeImageMissing: 'Image data is missing for this layer.',
+  vectorizingImage: 'Vectorizing image…',
+  imageConvertedToVectors: 'Image converted to vectors.',
+  vectorizeCredentialFailed: params('{error}. Update it in Settings → Image services.'),
+  vectorizeFailed: params('{provider} could not vectorize this image: {error}'),
+  savingDocument: 'Saving document…',
+  operationFailed: params('Operation failed: {error}'),
+  saveFailedRetry: 'Retry save',
+  autosaveFailed: params('Could not save “{name}”: {error}'),
+  saveFailedTitle: params('Could not save “{name}”'),
+  notifySaveFailed: 'Failed saves',
+  notifySaveFailedHint: 'An open document could not be saved automatically.',
+  fileChangedOnDisk: params(
+    '“{name}” changed on disk. Your unsaved changes are kept; saving replaces the file.'
+  ),
+  reloadDiscardingChanges: 'Reload',
+  storageConnected: 'Connected. Storage namespace is ready.',
+  storageConnectionFailed: params('Could not connect to storage: {error}'),
+  deepLinkLocateFile: params('Locate “{file}” to follow this link.'),
+  deepLinkPickerDismissed: 'Link cancelled: no file was chosen.',
+  deepLinkCancelled: params('Link cancelled: expected a file ending in “{file}”.'),
+  deepLinkNodeNotFound: params('Node “{node}” was not found in “{file}”.'),
+  openQueuedFilesFailed: params('Could not open the files handed to OpenPencil: {error}')
+} as const
+
+const localeLoaders = {
+  ar: () => import('./locales/ar.json'),
+  de: () => import('./locales/de.json'),
+  es: () => import('./locales/es.json'),
+  fr: () => import('./locales/fr.json'),
+  it: () => import('./locales/it.json'),
+  ja: () => import('./locales/ja.json'),
+  pl: () => import('./locales/pl.json'),
+  'pt-BR': () => import('./locales/pt-br.json'),
+  ru: () => import('./locales/ru.json'),
+  'zh-CN': () => import('./locales/zh-cn.json')
+} satisfies Record<TranslatedLocale, () => Promise<{ default: Record<string, string> }>>
+
+const appI18n = createI18n<Locale, 'en'>(locale, {
+  baseLocale: 'en',
+  async get(code): Promise<ComponentsJSON> {
+    if (code === 'en') return {}
+    const loaded = await localeLoaders[code]()
+    return directedTranslations(code, { notifications: loaded.default })
+  }
+})
+
+export const notificationMessages = appI18n('notifications', notificationMessageDefaults)
+
+export function useNotificationMessages() {
+  return useStore(notificationMessages)
+}

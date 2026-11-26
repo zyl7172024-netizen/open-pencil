@@ -1,0 +1,48 @@
+<script setup lang="ts">
+import { computed } from 'vue'
+
+import { useMessages } from '@open-pencil/vue/i18n'
+
+import { useModelRoleAssignments } from '@/app/ai/models/settings/assignments'
+import { AI_MODEL_ROLES, isModelRoleInUse } from '@/app/ai/models/types'
+import SettingsGroup from '@/components/settings/layout/SettingsGroup.vue'
+import SettingsRow from '@/components/settings/layout/SettingsRow.vue'
+import AppSelect from '@/components/ui/select/AppSelect.vue'
+import { SETTINGS_SELECT_WIDTH } from '@/theme/settings/controls'
+
+import { useModelRoleLabels } from './role-labels'
+
+const ai = useMessages('ai')
+
+const roleLabel = useModelRoleLabels()
+const roleDefinitions = computed(() =>
+  AI_MODEL_ROLES.map((role) => ({ role, inUse: isModelRoleInUse(role), ...roleLabel(role) }))
+)
+
+const { assignmentValue, optionsForRole, updateAssignment } = useModelRoleAssignments(ai)
+</script>
+
+<template>
+  <SettingsGroup>
+    <SettingsRow
+      v-for="definition in roleDefinitions"
+      :key="definition.role"
+      class="max-sm:flex-col max-sm:items-stretch"
+      :label="definition.label"
+      :description="definition.description"
+      :data-model-role="definition.role"
+    >
+      <AppSelect
+        v-if="definition.inUse"
+        :class="SETTINGS_SELECT_WIDTH"
+        :model-value="assignmentValue(definition.role)"
+        :options="optionsForRole(definition.role)"
+        :label="definition.label"
+        :data-test-id="`settings-model-assignment-${definition.role}`"
+        @update:model-value="updateAssignment(definition.role, String($event))"
+      />
+      <!-- Nothing reads the role yet, so there is nothing to choose for it. -->
+      <span v-else class="text-xs text-muted">{{ ai.modelRoleNotUsed }}</span>
+    </SettingsRow>
+  </SettingsGroup>
+</template>

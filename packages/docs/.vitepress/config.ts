@@ -1,0 +1,125 @@
+import { mkdir, writeFile } from 'node:fs/promises'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+import { transformerTwoslash } from '@shikijs/vitepress-twoslash'
+import { createFileSystemTypesCache } from '@shikijs/vitepress-twoslash/cache-fs'
+import tailwindcss from '@tailwindcss/vite'
+import ts from 'typescript'
+import { defineConfig } from 'vitepress'
+import llmstxt from 'vitepress-plugin-llms'
+
+import { ensureBrandAssets } from '@open-pencil/brand-tools'
+import { landingPosterFingerprint } from '@open-pencil/landing-posters-tools/fingerprint'
+import { appSourceConfig } from '@open-pencil/vite-config/app-source'
+
+import { landingPreloads } from './landing-head.ts'
+import { docsLocales } from './locales/docs.ts'
+import { rootThemeConfig } from './root-theme.ts'
+import { securityTxt } from './security-txt.ts'
+import { BASE, LOCALE_PREFIXES, applyPageSeo, siteHead, withAlternateSitemapLinks } from './seo.ts'
+
+await ensureBrandAssets(['docs'])
+
+const configDir = dirname(fileURLToPath(import.meta.url))
+const docsRoot = dirname(configDir)
+const packagesRoot = dirname(docsRoot)
+const repoRoot = dirname(packagesRoot)
+// The landing page mounts the app's own components, compiled from source.
+const appSource = appSourceConfig()
+const fastBuild = process.env.OPENPENCIL_DOCS_FAST_BUILD === '1'
+// Production builds show stills of the landing's stages until they are live. The build names
+// the stills by this fingerprint, and `tools/generate/landing-posters` captures them afterwards.
+const posterFingerprint =
+  process.env.OPENPENCIL_LANDING_POSTERS === '1' ? await landingPosterFingerprint(repoRoot) : null
+
+const llmsPlugin = llmstxt({
+  domain: BASE,
+  ignoreFiles: LOCALE_PREFIXES.map((locale) => `${locale}/**`),
+  generateLLMsTxt: !fastBuild,
+  generateLLMsFullTxt: !fastBuild,
+  generateLLMFriendlyDocsForEachPage: !fastBuild,
+  injectLLMHint: false,
+  customTemplateVariables: {
+    title: 'OpenPencil',
+    description:
+      'Open-source, AI-native design editor and toolkit. Opens Figma .fig files, provides a programmable scene graph, CLI, MCP server, and Vue SDK for custom editor shells.',
+    details:
+      'Use this file as the compact map for agents. For complete Markdown content, fetch https://openpencil.dev/llms-full.txt.'
+  }
+})
+
+export default defineConfig({
+  title: 'OpenPencil',
+  description:
+    'Open-source, AI-native design editor. Figma alternative built from scratch with full .fig file compatibility.',
+  cleanUrls: true,
+  lastUpdated: true,
+  appearance: 'dark',
+
+  sitemap: {
+    hostname: BASE,
+    transformItems: withAlternateSitemapLinks
+  },
+
+  head: siteHead,
+
+  transformPageData(pageData) {
+    applyPageSeo(pageData)
+    if (posterFingerprint && pageData.frontmatter.landing === true) {
+      pageData.frontmatter.posters = posterFingerprint
+    }
+  },
+  transformHead: landingPreloads,
+
+  // Security reports go to GitHub Security Advisories; the file's expiry moves with each build.
+  async buildEnd({ outDir }) {
+    await mkdir(resolve(outDir, '.well-known'), { recursive: true })
+    await writeFile(resolve(outDir, '.well-known/security.txt'), securityTxt(BASE, new Date()))
+  },
+
+  markdown: {
+    codeTransformers: [
+      transformerTwoslash({
+        typesCache: createFileSystemTypesCache({
+          dir: resolve(configDir, 'cache/twoslash')
+        }),
+        twoslashOptions: {
+          // `typescript` resolves to a wrapper package without lib files, which is where
+          // Twoslash looks unless told; ask the compiler where its own libs are.
+          tsLibDirectory: dirname(ts.getDefaultLibFilePath({})),
+          compilerOptions: {
+            baseUrl: repoRoot,
+            paths: {
+              '@open-pencil/vue': ['packages/vue/src/index.ts'],
+              '@open-pencil/vue/*': ['packages/vue/src/*'],
+              '#vue/*': ['packages/vue/src/*'],
+              '@open-pencil/std/*': ['packages/std/src/*'],
+              '@open-pencil/theme': ['packages/theme/src/index.ts'],
+              '@open-pencil/theme/*': ['packages/theme/src/*'],
+              '@open-pencil/scene-graph': ['packages/scene-graph/src/index.ts'],
+              '@open-pencil/scene-graph/*': ['packages/scene-graph/src/*'],
+              '#scene-graph/*': ['packages/scene-graph/src/*']
+            }
+          }
+        }
+      })
+    ]
+  },
+
+  vite: {
+    resolve: {
+      alias: [
+        { find: '#docs-api', replacement: resolve(docsRoot, 'developers/sdk/api') },
+        { find: '#docs', replacement: configDir },
+        ...appSource.alias
+      ]
+    },
+    define: appSource.define,
+    plugins: [...appSource.plugins, tailwindcss(), llmsPlugin]
+  },
+
+  locales: docsLocales,
+
+  themeConfig: rootThemeConfig()
+})

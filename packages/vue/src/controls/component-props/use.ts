@@ -1,0 +1,206 @@
+import { uniq } from 'es-toolkit/array'
+import { computed, onScopeDispose, watch } from 'vue'
+
+import type { ComponentPropertyDefinition, SceneNode } from '@open-pencil/scene-graph'
+import { exposedInstances, findComponentPropertyTargets } from '@open-pencil/scene-graph/components'
+
+import {
+  compatibleComponentPropertyDefinitions,
+  instanceSwapOptions,
+  mergedComponentPropertyValue,
+  variantOptions,
+  type ComponentPropertyControl,
+  type ComponentPropertyOption
+} from '#vue/controls/component-props/model'
+import { MIXED } from '#vue/controls/node-props/helpers'
+import { useUndoBatch } from '#vue/controls/undo-batch/use'
+import { useEditor } from '#vue/editor/context'
+import { useSceneComputed } from '#vue/internal/scene-computed/use'
+import { useRetainedActivity } from '#vue/lifecycle/retention/context'
+
+interface ResolvedEdit {
+  definition: ComponentPropertyDefinition
+  targets: SceneNode[]
+  label: string
+}
+
+/** One batch per property and target set, so a new selection starts a new entry. */
+function batchKey(propertyId: string, targets: SceneNode[]): string {
+  return [propertyId, ...targets.map((node) => node.id)].join(':')
+}
+
+/**
+ * Value controls for the selected instances, or for `targets` when given, such as an exposed
+ * nested instance shown under the instance that contains it.
+ */
+export function useComponentProperties(targets?: () => SceneNode[]) {
+  const editor = useEditor()
+  const batch = useUndoBatch(editor.undo, editor.beginInteractiveEdit)
+  const retainedActivity = useRetainedActivity()
+  /**
+   * A variant load still pending applies its choice only while it is the property's latest, and
+   * leaving the selection, the page, or the panel drops every pending one.
+   */
+  const choices = new Map<string, number>()
+  let scope = 0
+  const choose = (propertyId: string) => {
+    const choice = (choices.get(propertyId) ?? 0) + 1
+    choices.set(propertyId, choice)
+    return choice
+  }
+  const leave = () => {
+    scope++
+    batch.flush()
+  }
+  // A batch never spans a page change, a new selection, or a paused retained scope.
+  watch([() => editor.state.currentPageId, () => editor.state.selectedIds], leave, {
+    flush: 'sync'
+  })
+  if (retainedActivity) {
+    watch(
+      retainedActivity,
+      (active) => {
+        if (!active) leave()
+      },
+      { flush: 'sync' }
+    )
+  }
+  onScopeDispose(() => {
+    scope++
+  })
+  const instances = useSceneComputed(() =>
+    (targets ? targets() : editor.getSelectedNodes()).filter((node) => node.type === 'INSTANCE')
+  )
+  const selectedCount = computed(() => editor.state.selectedIds.size)
+  const allSelectedAreInstances = computed(
+    () =>
+      instances.value.length > 0 && (!!targets || instances.value.length === selectedCount.value)
+  )
+  const definitionSets = useSceneComputed(() =>
+    instances.value.map((instance) => editor.getInstanceComponentPropertyDefinitions(instance.id))
+  )
+  // Slots render as their own rows (useSlotProperties), not as value controls.
+  const definitions = computed(() =>
+    compatibleComponentPropertyDefinitions(definitionSets.value).filter(
+      (definition) => definition.type !== 'SLOT'
+    )
+  )
+  const active = computed(() => allSelectedAreInstances.value && definitions.value.length > 0)
+  const controls = useSceneComputed<ComponentPropertyControl[]>(() => {
+    if (!active.value || instances.value.length === 0) return []
+    const firstInstance = instances.value[0]
+    // Swap options scan the graph, so resolve that list once for every swap control.
+    let componentNodes: SceneNode[] | null = null
+    return definitions.value.map((definition) => {
+      const values = instances.value.map((instance) =>
+        editor.getInstanceComponentPropertyValue(instance.id, definition)
+      )
+      const value = mergedComponentPropertyValue(values)
+      let options: ComponentPropertyOption[] = []
+      if (definition.type === 'VARIANT') {
+        options = variantOptions(editor, firstInstance, definition.name)
+      } else if (definition.type === 'INSTANCE_SWAP') {
+        componentNodes ??= [...editor.graph.getAllNodes()]
+        // Each layer the property swaps, in every selected instance, must not hold its own choice.
+        const parentIds = instances.value.flatMap((instance) =>
+          findComponentPropertyTargets(editor.graph, instance, definition.id).flatMap((target) =>
+            target.node.parentId ? [target.node.parentId] : []
+          )
+        )
+        options = instanceSwapOptions(
+          editor.graph,
+          componentNodes,
+          definition,
+          value === MIXED ? '' : value,
+          parentIds
+        )
+      }
+      return {
+        id: definition.id,
+        name: definition.name,
+        type: definition.type,
+        value,
+        options
+      }
+    })
+  })
+
+  function resolveEdit(propertyId: string): ResolvedEdit | null {
+    if (!active.value) return null
+    const definition = definitions.value.find((item) => item.id === propertyId)
+    if (!definition) return null
+    return { definition, targets: [...instances.value], label: `Change ${definition.name}` }
+  }
+
+  function commitToInstances(edit: ResolvedEdit, propertyId: string, value: string) {
+    const apply = () => {
+      for (const instance of edit.targets) {
+        editor.setInstanceComponentProperty(instance.id, propertyId, value)
+      }
+    }
+    if (edit.targets.length > 1) editor.undo.runBatch(edit.label, apply)
+    else apply()
+  }
+
+  function applyDiscrete(edit: ResolvedEdit, propertyId: string, value: string) {
+    batch.flush()
+    commitToInstances(edit, propertyId, value)
+  }
+
+  function hasValueEverywhere(edit: ResolvedEdit, value: string): boolean {
+    return edit.targets.every(
+      (instance) => editor.getInstanceComponentPropertyValue(instance.id, edit.definition) === value
+    )
+  }
+
+  function setValue(propertyId: string, value: string) {
+    const choice = choose(propertyId)
+    const chosenIn = scope
+    const edit = resolveEdit(propertyId)
+    if (!edit) return
+    const toLoad = uniq(
+      edit.targets.flatMap((instance) => editor.variantsToLoad(instance.id, propertyId, value))
+    )
+    if (toLoad.length === 0) {
+      applyDiscrete(edit, propertyId, value)
+      return
+    }
+    // A variant the file holds but no page built is built in the reader worker first, so the
+    // switch neither blocks on it nor opens a reader on this thread.
+    void editor.loadSavedVariants(toLoad).then((loaded) => {
+      if (!loaded || scope !== chosenIn || choices.get(propertyId) !== choice) return undefined
+      const targets = edit.targets.filter((instance) => editor.graph.getNode(instance.id))
+      if (targets.length > 0) applyDiscrete({ ...edit, targets }, propertyId, value)
+      return undefined
+    })
+  }
+
+  /** Apply typing immediately, grouping rapid changes until blur, Enter, or idle. */
+  function setTextValue(propertyId: string, value: string) {
+    const edit = resolveEdit(propertyId)
+    if (!edit) return
+    if (edit.definition.type !== 'TEXT') {
+      setValue(propertyId, value)
+      return
+    }
+    choose(propertyId)
+    if (hasValueEverywhere(edit, value)) return
+    batch.ensure(batchKey(propertyId, edit.targets), edit.label)
+    commitToInstances(edit, propertyId, value)
+  }
+
+  return { active, controls, setValue, setTextValue, flush: batch.flush }
+}
+
+/** The exposed nested instances of the one selected instance, each shown as its own group. */
+export function useExposedInstances() {
+  const editor = useEditor()
+  return useSceneComputed(() => {
+    const selected = editor.getSelectedNodes()
+    if (selected.length !== 1 || selected[0].type !== 'INSTANCE') return []
+    return exposedInstances(editor.graph, selected[0]).map((node) => ({
+      id: node.id,
+      name: node.name
+    }))
+  })
+}

@@ -1,0 +1,54 @@
+<script setup lang="ts">
+import { panelNumber } from '@open-pencil/core/geometry'
+import { useRetainedPopup } from '@open-pencil/vue/lifecycle/retention'
+import { useLayoutControlsContext } from '@open-pencil/vue/primitives/LayoutControls'
+
+import type { SizeLimitFieldProps } from '@/components/properties/layout/size/types'
+import VariableNumberField from '@/components/properties/VariableNumberField.vue'
+import Tip from '@/components/ui/overlay/Tip.vue'
+import AppSelectContent from '@/components/ui/select/AppSelectContent.vue'
+import AppSelectItem from '@/components/ui/select/AppSelectItem.vue'
+import AppSelectRoot from '@/components/ui/select/AppSelectRoot.vue'
+import SelectFieldTrigger from '@/components/ui/select/SelectFieldTrigger.vue'
+
+const { item } = defineProps<SizeLimitFieldProps>()
+
+const ctx = useLayoutControlsContext()
+const { open: popupOpen, portalActive } = useRetainedPopup()
+
+function handleSelect(value: string) {
+  if (value === 'CURRENT') ctx.setSizeLimitToCurrent(item.prop)
+  else if (value === 'REMOVE') ctx.removeSizeLimit(item.prop)
+}
+</script>
+
+<template>
+  <Tip :label="item.label">
+    <VariableNumberField
+      :round="panelNumber"
+      :icon="item.icon"
+      :aria-label="item.label"
+      :model-value="panelNumber(ctx.node[item.prop] ?? 0)"
+      :min="0"
+      :node-id="ctx.node.id"
+      :binding-path="item.prop"
+      @update:model-value="ctx.updateSizeLimit(item.prop, $event)"
+      @commit="(value: number, previous: number) => ctx.commitSizeLimit(item.prop, value, previous)"
+      @cancel="ctx.cancelPreview"
+    >
+      <template #menu>
+        <AppSelectRoot
+          v-model:open="popupOpen"
+          :model-value="'VALUE'"
+          @update:model-value="handleSelect($event as string)"
+        >
+          <SelectFieldTrigger data-slot="limit-trigger" :label="item.label" />
+          <AppSelectContent v-if="portalActive" align="end">
+            <AppSelectItem value="CURRENT">{{ item.setLabel }}</AppSelectItem>
+            <AppSelectItem value="REMOVE">{{ item.removeLabel }}</AppSelectItem>
+          </AppSelectContent>
+        </AppSelectRoot>
+      </template>
+    </VariableNumberField>
+  </Tip>
+</template>

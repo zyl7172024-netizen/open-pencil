@@ -1,0 +1,226 @@
+import { describe, expect, spyOn, test } from 'bun:test'
+
+import { createCloudServer, type SiteFiles } from '#cloud/runtime/site/server'
+import type { CloudErrorContext } from '#cloud/server'
+
+const files: Record<string, string> = {
+  '/cloud.html': '<!doctype html><title>Portal</title>',
+  '/index.html': '<!doctype html><title>Editor</title>',
+  '/assets/cloud-abc.js': 'export {}',
+  '/favicon.svg': '<svg/>'
+}
+
+const TYPES: Record<string, string> = { svg: 'image/svg+xml', html: 'text/html' }
+const typeOf = (path: string) => TYPES[path.split('.').at(-1) ?? ''] ?? 'text/plain'
+
+const site: SiteFiles = async (path) => {
+  const text = files[path]
+  return text === undefined
+    ? null
+    : { body: Uint8Array.from(new TextEncoder().encode(text)), type: typeOf(path) }
+}
+
+const api = {
+  fetch: (request: Request) =>
+    new URL(request.url).pathname === '/api/session'
+      ? Response.json({ ok: true })
+      : new Response('Not found', { status: 404 })
+}
+
+const server = createCloudServer(api, {
+  site,
+  indexingPolicy: 'deny',
+  publicURL: 'https://cloud.example'
+})
+const request = (path: string, init: RequestInit = {}) =>
+  server.request(new Request(`https://cloud.example${path}`, init))
+const navigate = (path: string) => request(path, { headers: { Accept: 'text/html' } })
+/** The directives of a response's Content-Security-Policy. */
+const policy = (response: Response) =>
+  response.headers.get('Content-Security-Policy')?.split('; ') ?? []
+
+describe('Cloud server', () => {
+  test('serves the portal at portal paths, never framed and never cached', async () => {
+    const page = await request('/auth/device?user_code=ABCD')
+    expect(await page.text()).toContain('Portal')
+    expect(policy(page)).toContain("frame-ancestors 'none'")
+    expect(page.headers.get('Strict-Transport-Security')).toBe('max-age=31536000')
+    expect(page.headers.get('Cache-Control')).toBe('no-cache')
+    expect((await request('/account')).status).toBe(200)
+    expect(await (await request('/welcome')).text()).toContain('Portal')
+  })
+
+  test('serves the editor at the root and at any other page, never framed', async () => {
+    for (const path of ['/', '/demo', '/documents/abc', '/share/abc']) {
+      const page = await navigate(path)
+      expect(await page.text()).toContain('Editor')
+      expect(policy(page)).toContain("frame-ancestors 'none'")
+      expect(page.headers.get('Cache-Control')).toBe('no-cache')
+    }
+  })
+
+  test('leaves popups their opener, as OpenRouter’s sign-in closes its own', async () => {
+    expect((await navigate('/')).headers.get('Cross-Origin-Opener-Policy')).toBeNull()
+  })
+
+  test('names only its origin to other sites, so a form posted to one still has an Origin', async () => {
+    // `no-referrer` or `same-origin` would send `Origin: null` with billing's sign-in form.
+    for (const path of ['/account/plan', '/share/abc']) {
+      expect((await navigate(path)).headers.get('Referrer-Policy')).toBe('strict-origin')
+    }
+  })
+
+  test('keeps page headers off files and API answers, which other sites and the desktop app load', async () => {
+    for (const response of [
+      await request('/assets/cloud-abc.js'),
+      await request('/favicon.svg'),
+      await navigate('/api/session')
+    ]) {
+      expect(response.headers.get('Content-Security-Policy')).toBeNull()
+      expect(response.headers.get('Cross-Origin-Resource-Policy')).toBeNull()
+    }
+  })
+
+  test('leaves other paths and methods to the API', async () => {
+    expect(await (await navigate('/api/session')).json()).toEqual({ ok: true })
+    expect((await request('/account', { method: 'POST' })).status).toBe(404)
+    expect((await request('/missing.json')).status).toBe(404)
+  })
+
+  test('serves hashed assets as immutable and other files briefly cached where the API has nothing', async () => {
+    const asset = await request('/assets/cloud-abc.js')
+    expect(await asset.text()).toBe('export {}')
+    expect(asset.headers.get('Cache-Control')).toContain('immutable')
+    const icon = await request('/favicon.svg')
+    expect(icon.headers.get('Content-Type')).toBe('image/svg+xml')
+    expect(icon.headers.get('Cache-Control')).not.toContain('immutable')
+    expect((await request('/assets/missing.js')).status).toBe(404)
+    // The service worker fetches the pages it keeps by their file names.
+    expect((await request('/index.html')).headers.get('Cache-Control')).toBe('no-cache')
+  })
+
+  test('applies the indexing policy to every answer', async () => {
+    for (const path of ['/', '/account', '/api/session', '/favicon.svg']) {
+      expect((await navigate(path)).headers.get('X-Robots-Tag')).toContain('noindex')
+    }
+  })
+
+  test('keeps gallery thumbnails open to crawlers where indexing is allowed', async () => {
+    const path = 'https://cloud.example/api/community/thumbnails/document/revision'
+    const allowed = createCloudServer(api, {
+      indexingPolicy: 'allow',
+      publicURL: 'https://cloud.example'
+    })
+    expect((await allowed.request(path)).headers.get('X-Robots-Tag')).toBeNull()
+    expect((await server.request(path)).headers.get('X-Robots-Tag')).toContain('noindex')
+  })
+
+  test('answers only the API without a site build', async () => {
+    const bare = createCloudServer(api, {
+      indexingPolicy: 'allow',
+      publicURL: 'https://cloud.example'
+    })
+    expect((await bare.request('https://cloud.example/account')).status).toBe(404)
+    expect(
+      (await bare.request('https://cloud.example/', { headers: { Accept: 'text/html' } })).status
+    ).toBe(404)
+  })
+
+  test('reports a site file it fails to read and answers 500', async () => {
+    const logged = spyOn(console, 'error').mockImplementation(() => undefined)
+    const reported: { error: unknown; context: CloudErrorContext }[] = []
+    const failure = new Error('assets unavailable')
+    try {
+      const failing = createCloudServer(api, {
+        site: async () => {
+          throw failure
+        },
+        indexingPolicy: 'deny',
+        publicURL: 'https://cloud.example',
+        reportError: async (error, context) => {
+          reported.push({ error, context })
+        }
+      })
+      const response = await failing.request(new Request('https://cloud.example/favicon.svg'))
+      expect(response.status).toBe(500)
+      expect(reported).toEqual([
+        {
+          error: failure,
+          context: {
+            source: 'request',
+            method: 'GET',
+            route: '/*',
+            message: 'Request failed',
+            requestId: expect.any(String)
+          }
+        }
+      ])
+    } finally {
+      logged.mockRestore()
+    }
+  })
+
+  test('finds no embed where the deployment does not allow them', async () => {
+    for (const path of ['/embed', '/embed/share/abc', '/embed/community/abc']) {
+      expect((await navigate(path)).status).toBe(404)
+    }
+  })
+
+  test('serves embeds as the editor, framed by any site or only the allowed ones', async () => {
+    const anySite = createCloudServer(api, {
+      site,
+      indexingPolicy: 'allow',
+      publicURL: 'https://cloud.example',
+      embedding: { allowedOrigins: [] }
+    })
+    const page = await anySite.request('https://cloud.example/embed/share/abc', {
+      headers: { Accept: 'text/html' }
+    })
+    expect(await page.text()).toContain('Editor')
+    expect(policy(page)).toContain('frame-ancestors *')
+    expect(page.headers.get('X-Frame-Options')).toBeNull()
+    expect(page.headers.get('Cross-Origin-Resource-Policy')).toBe('cross-origin')
+    expect(page.headers.get('Cache-Control')).toBe('no-cache')
+    // The page around the frame is the one to index, whatever the server's policy.
+    expect(page.headers.get('X-Robots-Tag')).toContain('noindex')
+
+    const listed = createCloudServer(api, {
+      site,
+      indexingPolicy: 'deny',
+      publicURL: 'https://cloud.example',
+      embedding: { allowedOrigins: ['https://intranet.example/wiki/'] }
+    })
+    const framed = await listed.request('https://cloud.example/embed/community/abc')
+    expect(policy(framed)).toContain('frame-ancestors https://intranet.example')
+    // Every other page stays unframeable.
+    const editor = await listed.request('https://cloud.example/share/abc', {
+      headers: { Accept: 'text/html' }
+    })
+    expect(policy(editor)).toContain("frame-ancestors 'none'")
+  })
+
+  test('lets embeds run what any page runs', async () => {
+    const embedding = createCloudServer(api, {
+      site,
+      indexingPolicy: 'deny',
+      publicURL: 'https://cloud.example',
+      embedding: { allowedOrigins: ['https://a.example'] }
+    })
+    const embed = await embedding.request('https://cloud.example/embed/share/abc')
+    const page = await embedding.request('https://cloud.example/account')
+    const runs = (response: Response) =>
+      policy(response).filter((directive) => !directive.startsWith('frame-ancestors'))
+    expect(runs(embed)).toEqual(runs(page))
+  })
+
+  test('lets only the site’s own scripts run, never frames or plugins', async () => {
+    const directives = policy(await navigate('/'))
+    expect(directives).toContain(
+      "script-src 'self' 'unsafe-eval' 'wasm-unsafe-eval' blob: https://challenges.cloudflare.com"
+    )
+    expect(directives).toContain("worker-src 'self' blob:")
+    expect(directives).toContain("object-src 'none'")
+    expect(directives).toContain("base-uri 'self'")
+    expect(directives).toContain("frame-ancestors 'none'")
+  })
+})

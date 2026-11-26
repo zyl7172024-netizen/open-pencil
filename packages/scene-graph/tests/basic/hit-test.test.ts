@@ -1,0 +1,228 @@
+import { describe, expect, test } from 'bun:test'
+
+import { SceneGraph } from '@open-pencil/scene-graph'
+import { expectDefined } from '@open-pencil/test-support/assert'
+
+import { pageId, rect, SOLID_FILL } from './helpers'
+
+describe('hitTest', () => {
+  test('hits a rectangle', () => {
+    const graph = new SceneGraph()
+    const id = rect(graph, 'R', 10, 10, 50, 50)
+    expect(graph.hitTest(35, 35, pageId(graph))?.id).toBe(id)
+  })
+
+  test('misses empty space', () => {
+    const graph = new SceneGraph()
+    rect(graph, 'R', 10, 10, 50, 50)
+    expect(graph.hitTest(200, 200, pageId(graph))).toBeNull()
+  })
+
+  test('frame without fills is click-through', () => {
+    const graph = new SceneGraph()
+    graph.createNode('FRAME', pageId(graph), {
+      name: 'Empty Frame',
+      x: 0,
+      y: 0,
+      width: 200,
+      height: 200,
+      fills: []
+    })
+    expect(graph.hitTest(100, 100, pageId(graph))).toBeNull()
+  })
+
+  test('frame with visible fill is hittable', () => {
+    const graph = new SceneGraph()
+    const frame = graph.createNode('FRAME', pageId(graph), {
+      name: 'Filled Frame',
+      x: 0,
+      y: 0,
+      width: 200,
+      height: 200,
+      fills: [
+        {
+          type: 'SOLID',
+          color: { r: 1, g: 0, b: 0, a: 1 },
+          opacity: 1,
+          visible: true,
+          blendMode: 'NORMAL'
+        }
+      ]
+    })
+    expect(graph.hitTest(100, 100, pageId(graph))?.id).toBe(frame.id)
+  })
+
+  test('group returns group on hit, not child (Figma-style)', () => {
+    const graph = new SceneGraph()
+    const groupId = graph.createNode('GROUP', pageId(graph), {
+      name: 'Group',
+      x: 0,
+      y: 0,
+      width: 200,
+      height: 200
+    }).id
+    graph.createNode('RECTANGLE', groupId, {
+      name: 'Child',
+      fills: [SOLID_FILL],
+      x: 10,
+      y: 10,
+      width: 30,
+      height: 30
+    })
+    // Hit returns group (single click selects group, dblclick enters)
+    expect(graph.hitTest(20, 20, pageId(graph))?.id).toBe(groupId)
+    // Miss in group's empty area
+    expect(graph.hitTest(201, 200, pageId(graph))).toBeNull()
+  })
+
+  test('clipsContent prevents hits outside parent bounds', () => {
+    const graph = new SceneGraph()
+    const frame = graph.createNode('FRAME', pageId(graph), {
+      name: 'Clip Frame',
+      x: 0,
+      y: 0,
+      width: 100,
+      height: 100,
+      clipsContent: true,
+      fills: []
+    })
+    const childId = graph.createNode('RECTANGLE', frame.id, {
+      name: 'Overflow Child',
+      fills: [SOLID_FILL],
+      x: 50,
+      y: 50,
+      width: 200,
+      height: 200
+    }).id
+    // Inside both frame and child — hit
+    expect(graph.hitTest(75, 75, pageId(graph))?.id).toBe(childId)
+    // Inside child but outside clipping frame — miss
+    expect(graph.hitTest(150, 150, pageId(graph))).toBeNull()
+  })
+
+  test('instance and component bodies take clicks whatever their fill', () => {
+    const graph = new SceneGraph()
+    const compId = graph.createNode('COMPONENT', pageId(graph), {
+      name: 'Comp',
+      x: 0,
+      y: 0,
+      width: 200,
+      height: 200,
+      fills: []
+    }).id
+    graph.createNode('RECTANGLE', compId, {
+      name: 'Inner',
+      fills: [SOLID_FILL],
+      x: 10,
+      y: 10,
+      width: 30,
+      height: 30
+    })
+    const instId = expectDefined(
+      graph.createInstance(compId, pageId(graph), { x: 300, y: 0 }),
+      'instance'
+    ).id
+    // Hit on instance's child area — returns instance (opaque container)
+    expect(graph.hitTest(320, 20, pageId(graph))?.id).toBe(instId)
+    // A plain click takes its empty area too, with no fill, as in Figma.
+    expect(graph.hitTest(450, 150, pageId(graph))?.id).toBe(instId)
+    // Reaching past containers, its empty area shows no paint and is passed through.
+    expect(graph.hitTestDeep(450, 150, pageId(graph))).toBeNull()
+    // A main component's empty area always counts.
+    expect(graph.hitTestDeep(150, 150, pageId(graph))?.id).toBe(compId)
+  })
+
+  test('hidden node is not hittable', () => {
+    const graph = new SceneGraph()
+    const page = pageId(graph)
+    graph.createNode('RECTANGLE', page, {
+      name: 'Hidden',
+      x: 0,
+      y: 0,
+      width: 100,
+      height: 100,
+      fills: [{ type: 'SOLID', color: { r: 1, g: 0, b: 0, a: 1 }, opacity: 1, visible: true }],
+      visible: false
+    })
+    // Hidden nodes should be skipped during hit testing
+    expect(graph.hitTest(50, 50, page)).toBeNull()
+  })
+
+  test('a locked layer is invisible to the pointer, as in Figma', () => {
+    const graph = new SceneGraph()
+    const page = pageId(graph)
+    graph.createNode('RECTANGLE', page, {
+      name: 'Locked',
+      x: 0,
+      y: 0,
+      width: 100,
+      height: 100,
+      fills: [{ type: 'SOLID', color: { r: 1, g: 0, b: 0, a: 1 }, opacity: 1, visible: true }],
+      locked: true
+    })
+    expect(graph.hitTest(50, 50, page)).toBeNull()
+  })
+
+  test('zero-opacity node with visible fill IS hittable', () => {
+    const graph = new SceneGraph()
+    const page = pageId(graph)
+    const rectId = graph.createNode('RECTANGLE', page, {
+      name: 'ZeroOpacity',
+      x: 0,
+      y: 0,
+      width: 100,
+      height: 100,
+      fills: [{ type: 'SOLID', color: { r: 1, g: 0, b: 0, a: 1 }, opacity: 1, visible: true }],
+      opacity: 0
+    }).id
+    // Zero opacity does NOT affect hit testing (opacity is a visual property, not a structural one)
+    // The fill is "visible: true" which is what hasVisibleFillOrStroke checks
+    expect(graph.hitTest(50, 50, page)?.id).toBe(rectId)
+  })
+})
+
+describe('reaching past containers', () => {
+  test('a nested frame whose fill is at 0% passes the click to its parent', () => {
+    const graph = new SceneGraph()
+    const top = graph.createNode('FRAME', pageId(graph), {
+      name: 'Top',
+      width: 300,
+      height: 300,
+      fills: [SOLID_FILL]
+    })
+    const nested = graph.createNode('FRAME', top.id, {
+      name: 'Nested',
+      x: 20,
+      y: 20,
+      width: 200,
+      height: 200,
+      fills: [{ ...SOLID_FILL, opacity: 0 }]
+    })
+    expect(graph.hitTestDeep(150, 150, pageId(graph))?.id).toBe(top.id)
+    graph.updateNode(nested.id, { fills: [{ ...SOLID_FILL, opacity: 0.01 }] })
+    expect(graph.hitTestDeep(150, 150, pageId(graph))?.id).toBe(nested.id)
+  })
+})
+
+describe('hitTest on drawn shapes', () => {
+  test('a click inside an unfilled line reaches the layer under it', () => {
+    const graph = new SceneGraph()
+    const below = rect(graph, 'Below', 0, 0, 300, 100)
+    const line = graph.createNode('VECTOR', pageId(graph), {
+      name: 'Line',
+      width: 300,
+      height: 100,
+      strokes: [{ ...SOLID_FILL, weight: 2, align: 'CENTER' }],
+      vectorNetwork: {
+        vertices: [
+          { x: 0, y: 100 },
+          { x: 300, y: 0 }
+        ],
+        segments: [{ start: 0, end: 1, tangentStart: { x: 0, y: 0 }, tangentEnd: { x: 0, y: 0 } }],
+        regions: []
+      }
+    }).id
+    expect(graph.hitTestDeep(150, 50, pageId(graph), 3.5)?.id).toBe(line)
+    expect(graph.hitTestDeep(30, 30, pageId(graph), 3.5)?.id).toBe(below)
+  })
+})

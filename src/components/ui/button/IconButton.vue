@@ -1,0 +1,68 @@
+<script setup lang="ts">
+import { tv } from 'tailwind-variants'
+import { computed, normalizeClass, useAttrs, useTemplateRef } from 'vue'
+
+import Tip from '@/components/ui/overlay/Tip.vue'
+import theme from '@/theme/button/icon-button'
+import type { ControlSize } from '@/theme/control'
+
+const {
+  active = false,
+  disabled = false,
+  label,
+  menu = false,
+  side = 'top',
+  size = 'xs',
+  toggle = false,
+  type = 'button'
+} = defineProps<{
+  active?: boolean
+  disabled?: boolean
+  /** Accessible name and tooltip; every icon-only button needs one. */
+  label: string
+  /**
+   * Opens a menu: a chevron follows the icon. Its slot is `menu-button`, so rows that square their
+   * icon buttons leave it its width.
+   */
+  menu?: boolean
+  side?: 'top' | 'bottom' | 'left' | 'right'
+  size?: ControlSize
+  /** A toggle button: `aria-pressed` says whether it is on, off included. */
+  toggle?: boolean
+  type?: 'button' | 'submit' | 'reset'
+}>()
+
+const attrs = useAttrs()
+const button = useTemplateRef<HTMLButtonElement>('button')
+defineExpose({ focus: (options?: FocusOptions) => button.value?.focus(options) })
+
+defineOptions({ inheritAttrs: false })
+
+const buttonAttrs = computed(() => {
+  const { class: _class, ...rest } = attrs
+  return rest
+})
+
+const cls = computed(() =>
+  tv(theme)({ size, menu, active, disabled, class: normalizeClass(attrs.class) })
+)
+</script>
+
+<template>
+  <Tip as-child :label="label" :side="side" :disabled="disabled">
+    <button
+      ref="button"
+      v-bind="buttonAttrs"
+      :data-slot="menu ? 'menu-button' : 'icon-button'"
+      :type="type"
+      :disabled="disabled"
+      :aria-label="label"
+      :aria-pressed="active ? 'true' : toggle ? 'false' : undefined"
+      :data-state="active ? 'on' : 'off'"
+      :class="cls"
+    >
+      <slot />
+      <icon-lucide-chevron-down v-if="menu" class="size-3 shrink-0" />
+    </button>
+  </Tip>
+</template>

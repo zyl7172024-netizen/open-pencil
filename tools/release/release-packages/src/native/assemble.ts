@@ -1,0 +1,131 @@
+import { copyFile, mkdir, readdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { join } from 'node:path'
+
+import { readReleaseNotes, releaseChangelogPath } from '#release/release-notes/read'
+import { sourceMapsAssetName } from '#release/sourcemaps/bundle'
+import { isEqual } from 'es-toolkit'
+import { decode } from 'js-base64'
+import * as v from 'valibot'
+
+import { nightlyNotes } from '../nightly/notes.ts'
+import { desktopAssets } from './catalog.ts'
+import { createReleaseContext, isNightly } from './context.ts'
+import { digestFile, validateTargetManifests } from './manifest.ts'
+import { minisignPublicKey, verifyMinisign } from './minisign.ts'
+import { assertSignedVersion } from './signature.ts'
+
+const { identity, repository, version, paths } = createReleaseContext()
+
+const directories = (await readdir(paths.nativeArtifacts)).sort()
+const manifests = validateTargetManifests(
+  await Promise.all(
+    directories.map(async (directory) =>
+      JSON.parse(await readFile(join(paths.nativeArtifacts, directory, 'manifest.json'), 'utf8'))
+    )
+  ),
+  identity
+)
+
+const nightly = isNightly(identity)
+const notes = await readFile(paths.notes, 'utf8')
+// A nightly has no changelog section; its notes name the commit it builds.
+const sourceNotes = nightly
+  ? nightlyNotes(version, identity.sourceCommit, repository)
+  : await readReleaseNotes(await releaseChangelogPath(), version)
+if (notes !== sourceNotes) throw new Error('Release notes do not match their source')
+const config = v.parse(
+  v.object({ plugins: v.object({ updater: v.object({ pubkey: v.string() }) }) }),
+  JSON.parse(await readFile(paths.tauriConfig, 'utf8'))
+)
+
+const output = paths.output
+await rm(output, { recursive: true, force: true })
+await mkdir(output, { recursive: true })
+
+const platforms: Record<string, { signature: string; url: string }> = {}
+
+const publicKey = minisignPublicKey(decode(config.plugins.updater.pubkey))
+
+for (const [index, manifest] of manifests.entries()) {
+  const directory = directories[index]
+  if (!directory) throw new Error('Missing artifact directory')
+
+  const source = join(paths.nativeArtifacts, directory)
+  const actualNames = (await readdir(source)).filter((name) => name !== 'manifest.json').sort()
+  const expectedNames = manifest.files.map((file) => file.name).sort()
+
+  if (!isEqual(actualNames, expectedNames)) {
+    throw new Error(`Unexpected files in ${directory}`)
+  }
+
+  for (const file of manifest.files) {
+    const path = join(source, file.name)
+    const actual = await digestFile(path)
+
+    if (actual.sha256 !== file.sha256 || actual.size !== file.size) {
+      throw new Error(`Corrupt artifact: ${file.name}`)
+    }
+
+    await copyFile(path, join(output, file.name))
+  }
+
+  for (const asset of desktopAssets(manifest.target, version)) {
+    if (!asset.signed) continue
+
+    const signature = (await readFile(join(source, `${asset.name}.sig`), 'utf8')).trim()
+    const trusted = await verifyMinisign(join(source, asset.name), publicKey, decode(signature))
+    assertSignedVersion(trusted, version, asset.name)
+
+    for (const platform of asset.updaterKeys) {
+      if (platforms[platform]) throw new Error(`Duplicate updater platform: ${platform}`)
+      platforms[platform] = {
+        signature,
+        url: `https://github.com/${repository}/releases/download/${identity.tag}/${asset.name}`
+      }
+    }
+  }
+}
+
+// The frontend job archived the source maps PostHog symbolicates error reports with.
+const sourceMaps = sourceMapsAssetName(version)
+await copyFile(join(paths.root, sourceMaps), join(output, sourceMaps))
+
+const pubDate = new Date().toISOString()
+await writeFile(
+  join(output, 'latest.json'),
+  JSON.stringify({ version, notes, pub_date: pubDate, platforms }, null, 2)
+)
+
+// Nightlies publish no npm packages.
+const packageFiles = nightly
+  ? []
+  : (await readdir(paths.packages)).filter((name) => name.endsWith('.tgz')).sort()
+if (!nightly && packageFiles.length === 0) throw new Error('Missing npm artifacts')
+
+const packages = await Promise.all(
+  packageFiles.map(async (name) => ({ name, ...(await digestFile(join(paths.packages, name))) }))
+)
+await writeFile(
+  join(output, 'release-manifest.json'),
+  JSON.stringify(
+    {
+      ...identity,
+      repository,
+      workflow: `${repository}/.github/workflows/build.yml@${identity.workflowCommit}`,
+      run: `https://github.com/${repository}/actions/runs/${identity.runId}/attempts/${identity.runAttempt}`,
+      targets: manifests,
+      packages
+    },
+    null,
+    2
+  )
+)
+
+const checksums = await Promise.all(
+  (await readdir(output))
+    .sort()
+    .map(async (name) => `${(await digestFile(join(output, name))).sha256}  ${name}`)
+)
+
+await writeFile(join(output, 'SHA256SUMS'), `${checksums.join('\n')}\n`)
+console.log(`Verified all ${manifests.length} native targets and updater signatures`)

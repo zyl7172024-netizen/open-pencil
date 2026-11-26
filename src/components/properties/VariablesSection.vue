@@ -1,0 +1,38 @@
+<script setup lang="ts">
+import { computed } from 'vue'
+
+import { useMessages } from '@open-pencil/vue/i18n'
+import { useSceneComputed } from '@open-pencil/vue/internal/scene-computed'
+
+import { useEditorStore } from '@/app/editor/active-store'
+import IconButton from '@/components/ui/button/IconButton.vue'
+import PanelSection from '@/components/ui/panel/PanelSection.vue'
+
+const emit = defineEmits<{ openDialog: [] }>()
+
+const editor = useEditorStore()
+const collectionCount = useSceneComputed(() => {
+  void editor.state.sceneVersion
+  return editor.getCollectionCount()
+})
+const variableCount = useSceneComputed(() => {
+  void editor.state.sceneVersion
+  return editor.getVariableCount()
+})
+const hasVariables = computed(() => variableCount.value > 0)
+const panels = useMessages('panels')
+</script>
+
+<template>
+  <PanelSection :label="panels.variables" :empty="!hasVariables">
+    <template #actions>
+      <IconButton :label="panels.openVariables" @click="emit('openDialog')">
+        <icon-lucide-square-arrow-out-up-right class="size-3.5" />
+      </IconButton>
+    </template>
+    <div v-if="hasVariables" class="mt-1 text-2xs text-muted">
+      {{ variableCount }} / {{ collectionCount }}
+    </div>
+    <div v-else class="mt-1 text-2xs text-muted">{{ panels.noLocalVariables }}</div>
+  </PanelSection>
+</template>

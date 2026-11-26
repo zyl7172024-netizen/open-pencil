@@ -1,0 +1,210 @@
+import { open } from '@tauri-apps/plugin-dialog'
+import { readFile } from '@tauri-apps/plugin-fs'
+import { useFileDialog } from '@vueuse/core'
+import { uniq } from 'es-toolkit/array'
+import { basename } from 'pathe'
+import { decode } from 'ufo'
+
+import { BUILTIN_IO_FORMATS, IORegistry } from '@open-pencil/core/io'
+import { MAX_REMOTE_FILE_BYTES, readBoundedBody } from '@open-pencil/core/io/remote'
+import { errorMessage, isAbortError } from '@open-pencil/std/errors'
+import { anySignal } from '@open-pencil/std/timing'
+
+import { setOpenPencilOpenFileHandler } from '@/app/browser-bridge'
+import { resolveBrowserFileURL } from '@/app/document/io/browser'
+import type { EditorStore } from '@/app/editor/active-store'
+import { notificationMessages } from '@/app/i18n/notifications'
+import { rememberRecentFile } from '@/app/recent-files'
+import { toast } from '@/app/shell/ui'
+import { getTabsSnapshot, openFileInNewTab, switchTab } from '@/app/tabs'
+import { findTabByFileIdentity } from '@/app/tabs/open/identity'
+import { isTauri } from '@/app/tauri/env'
+import { IS_BROWSER } from '@/constants'
+
+const io = new IORegistry(BUILTIN_IO_FORMATS)
+/** HTML pages, which open as documents or are placed as layers. */
+export const DOM_DOCUMENT_EXTENSIONS = ['html', 'htm', 'xhtml'] as const
+const READABLE_DOCUMENT_EXTENSIONS = uniq([
+  ...io.listReadableFormats().flatMap((format) => format.extensions),
+  ...DOM_DOCUMENT_EXTENSIONS
+])
+const DESIGN_FILE_ACCEPT = READABLE_DOCUMENT_EXTENSIONS.map((extension) => `.${extension}`).join(
+  ','
+)
+
+const fileDialog = useFileDialog({
+  accept: DESIGN_FILE_ACCEPT,
+  multiple: true,
+  reset: true
+})
+
+fileDialog.onChange((files) => {
+  if (!files) return
+  void openDesignFileBatch(
+    files,
+    (file) => file.name,
+    (file) => openDesignFile(file)
+  )
+})
+
+/**
+ * Opens a picked or dropped document in a new tab, rejecting formats OpenPencil cannot read.
+ * A file system handle, when the browser provides one, lets the tab save back to the file.
+ */
+export async function openDesignFile(file: File, handle?: FileSystemFileHandle): Promise<void> {
+  assertSupportedDesignFile(file.name)
+  await openFileInNewTab(file, { handle })
+}
+
+if (IS_BROWSER && 'window' in globalThis) {
+  setOpenPencilOpenFileHandler(async (path: string) => {
+    await openBrowserFileFromURL(resolveBrowserFileURL(path))
+  })
+}
+
+/**
+ * The file name a URL ends in, decoded, so `my%20design.fig` opens as "my design"; a malformed
+ * escape stays as written.
+ */
+function fileNameFromURL(url: URL): string {
+  return decode(basename(url.pathname)) || 'file.fig'
+}
+
+/** Fetches a document over HTTP and opens it in a new tab. Browser builds only. */
+/** Opens the design file at `url` in a new tab, and resolves with that tab's store. */
+export async function openBrowserFileFromURL(url: URL, init?: RequestInit): Promise<EditorStore> {
+  // The cap needs a controller of its own, so a caller's signal is combined with it
+  // rather than replaced: dropping it would leave the caller unable to cancel.
+  const controller = new AbortController()
+  const signal = anySignal([init?.signal, controller.signal])
+  const response = await fetch(url, { ...init, signal })
+  if (!response.ok)
+    throw new Error(`Failed to fetch file: ${response.status} ${response.statusText}`)
+  const bytes = await readBoundedBody(response, MAX_REMOTE_FILE_BYTES, {
+    onExceeded: () => controller.abort()
+  })
+  if (bytes.byteLength === 0) {
+    throw new Error('Failed to fetch file: the response carried no body')
+  }
+  const name = fileNameFromURL(url)
+  assertSupportedDesignFile(name)
+  const file = new File([bytes], name, { type: 'application/octet-stream' })
+  return openFileInNewTab(file, { path: url.href })
+}
+
+function isSupportedDesignFile(fileName: string): boolean {
+  return io.findReader(fileName) !== null || isDOMDocumentFile(fileName)
+}
+
+/** Whether a file is an HTML page by its name, which opens or is placed as layers. */
+export function isDOMDocumentFile(fileName: string): boolean {
+  const lowerName = fileName.toLowerCase()
+  return DOM_DOCUMENT_EXTENSIONS.some((extension) => lowerName.endsWith(`.${extension}`))
+}
+
+function assertSupportedDesignFile(fileName: string): void {
+  if (!isSupportedDesignFile(fileName)) {
+    throw new Error(`Unsupported document format: ${fileName}`)
+  }
+}
+
+export async function openDesignFileBatch<T>(
+  items: Iterable<T>,
+  displayName: (item: T) => string,
+  openItem: (item: T) => Promise<unknown>
+): Promise<void> {
+  for (const item of items) {
+    try {
+      await openItem(item)
+    } catch (error) {
+      const name = displayName(item)
+      const detail = errorMessage(error)
+      console.error(`Failed to open ${name}:`, error)
+      toast.error(notificationMessages.get().openFileFailed({ name, error: detail }))
+    }
+  }
+}
+
+export async function readTauriDesignFile(path: string): Promise<File> {
+  assertSupportedDesignFile(path)
+  const bytes = await readFile(path)
+  return new File([bytes], basename(path) || 'file.fig')
+}
+
+export async function chooseTauriOpenPaths(): Promise<string[]> {
+  const paths = await open({
+    filters: [{ name: 'Design file', extensions: READABLE_DOCUMENT_EXTENSIONS }],
+    multiple: true
+  })
+  if (!paths) return []
+  return typeof paths === 'string' ? [paths] : paths
+}
+
+/** Opens the design file at `path` on desktop, and resolves with its tab's store. */
+export async function openFileFromPath(path: string): Promise<EditorStore | undefined> {
+  if (!isTauri()) return undefined
+  const file = await readTauriDesignFile(path)
+  const store = await openFileInNewTab(file, { path })
+  rememberRecentFile(path, store.state.documentKind)
+  return store
+}
+
+/**
+ * Focuses the tab already showing `path` without touching the disk. False when no tab
+ * holds it, which lets a caller fall back to opening the file. `openFileFromPath` would
+ * also land on the existing tab, but only after re-reading the file, so a document that
+ * moved or lost its permissions since it opened would reject instead of being focused.
+ */
+export async function activateTabForPath(path: string): Promise<boolean> {
+  const tab = await findTabByFileIdentity(getTabsSnapshot(), { handle: null, path })
+  if (!tab) return false
+  // The tab can close while the identity lookup awaits, and `switchTab` then does nothing:
+  // reporting success here would make the caller skip opening the file.
+  return switchTab(tab.id)
+}
+
+export async function openFileDialog() {
+  if (isTauri()) {
+    const paths = await chooseTauriOpenPaths()
+    await openDesignFileBatch(paths, (path) => basename(path) || path, openFileFromPath)
+    return
+  }
+
+  if (window.showOpenFilePicker) {
+    try {
+      const handles = await window.showOpenFilePicker({
+        multiple: true,
+        types: [
+          {
+            description: 'Design file',
+            accept: {
+              'application/octet-stream': ['.fig', '.jam', '.deck'],
+              'application/json': ['.pen'],
+              'text/html': ['.html', '.htm'],
+              'application/xhtml+xml': ['.xhtml'],
+              'text/plain': ['.pen']
+            }
+          }
+        ]
+      })
+      await openDesignFileBatch(
+        handles,
+        (handle) => handle.name,
+        async (handle) => {
+          const file = await handle.getFile()
+          assertSupportedDesignFile(file.name)
+          await openFileInNewTab(file, { handle })
+        }
+      )
+      return
+    } catch (e) {
+      if (isAbortError(e)) return
+    }
+  }
+
+  fileDialog.open()
+}
+
+export async function importFileDialog() {
+  await openFileDialog()
+}

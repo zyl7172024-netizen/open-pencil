@@ -1,0 +1,342 @@
+import { describe, expect, test } from 'bun:test'
+
+import { SceneGraph, type ColorProfile } from '@open-pencil/scene-graph'
+import { convertColor } from '@open-pencil/scene-graph/color'
+import { pixelLength } from '@open-pencil/scene-graph/text'
+
+import {
+  defaultTokenImportOptions,
+  exportDesignTokens,
+  planTokenImport,
+  readDesignTokens,
+  RESOLVER_FILE,
+  STYLES_FILE
+} from '#core/io/formats/design-tokens'
+
+const blue = { r: 0, g: 0.4, b: 0.8, a: 1 }
+const white = { r: 1, g: 1, b: 1, a: 1 }
+
+function designSystem() {
+  const graph = new SceneGraph()
+  const page = graph.getPages()[0].id
+  const primitives = graph.createCollection('Primitives')
+  const brand = graph.createVariable('Blue/500', 'COLOR', primitives.id, blue)
+  const theme = graph.createCollection('Theme')
+  const light = theme.defaultModeId
+  graph.renameMode(theme.id, light, 'Light')
+  const dark = graph.createMode(theme.id, 'Dark') ?? ''
+  const accent = graph.createVariable('Accent', 'COLOR', theme.id, { aliasId: brand.id })
+  accent.valuesByMode[dark] = white
+  accent.description = 'Buttons and links'
+  const gutter = graph.createVariable('Space', 'FLOAT', theme.id, 24)
+  gutter.unit = 'rem'
+  graph.createVariable('Space/Small', 'FLOAT', theme.id, 8)
+  const fast = graph.createVariable('Motion/Fast', 'FLOAT', theme.id, 150)
+  fast.unit = 'ms'
+  graph.createVariable('Flags/Rounded', 'BOOLEAN', theme.id, true)
+  const family = graph.createVariable('Font/Body', 'STRING', theme.id, 'Inter')
+  family.scopes = ['FONT_FAMILY']
+  graph.createVariable('Ratio 1.5', 'FLOAT', theme.id, 1.5)
+
+  const heading = graph.createNode('TEXT', page, {
+    name: 'Heading/H1',
+    fontFamily: 'Inter',
+    fontWeight: 700,
+    fontSize: 32,
+    lineHeight: pixelLength(40),
+    letterSpacing: pixelLength(-0.5),
+    sharedStyleType: 'TEXT',
+    internalOnly: true,
+    boundVariables: { fontFamily: family.id }
+  })
+  heading.source.id = 'style:heading'
+  const card = graph.createNode('RECTANGLE', page, {
+    name: 'Elevation/Card',
+    sharedStyleType: 'EFFECT',
+    internalOnly: true,
+    effects: [
+      {
+        type: 'DROP_SHADOW',
+        color: { r: 0, g: 0, b: 0, a: 0.25 },
+        offset: { x: 0, y: 4 },
+        radius: 12,
+        spread: 0,
+        visible: true
+      }
+    ]
+  })
+  card.source.id = 'style:card'
+  return graph
+}
+
+function file(graph: SceneGraph, path: string) {
+  const found = exportDesignTokens(graph).files.find((entry) => entry.path === path)
+  if (!found) throw new Error(`missing ${path}`)
+  return found.content
+}
+
+describe('design token export', () => {
+  test('writes one file per mode, the styles, and a resolver', () => {
+    expect(exportDesignTokens(designSystem()).files.map((entry) => entry.path)).toEqual([
+      'Primitives/Mode 1.tokens.json',
+      'Theme/Light.tokens.json',
+      'Theme/Dark.tokens.json',
+      STYLES_FILE,
+      RESOLVER_FILE
+    ])
+  })
+
+  test('writes values the way Figma imports them', () => {
+    const light = file(designSystem(), 'Theme/Light.tokens.json')
+
+    expect(light.Accent).toEqual({
+      $type: 'color',
+      $value: '{Blue.500}',
+      $description: 'Buttons and links',
+      $extensions: {
+        'com.figma.aliasData': {
+          targetVariableName: 'Blue/500',
+          targetVariableSetName: 'Primitives'
+        }
+      }
+    })
+    expect(light.Space).toEqual({
+      $root: {
+        $type: 'dimension',
+        $value: { value: 24, unit: 'px' },
+        $extensions: { 'dev.openpencil': { unit: 'rem' } }
+      },
+      Small: { $type: 'dimension', $value: { value: 8, unit: 'px' } }
+    })
+    expect(light.Motion).toEqual({
+      Fast: {
+        $type: 'duration',
+        $value: { value: 0.15, unit: 's' },
+        $extensions: { 'dev.openpencil': { unit: 'ms' } }
+      }
+    })
+    expect(light.Flags).toEqual({
+      Rounded: { $type: 'number', $value: 1, $extensions: { 'com.figma.type': 'boolean' } }
+    })
+    expect(light.Font).toEqual({
+      Body: {
+        $type: 'fontFamily',
+        $value: 'Inter',
+        $extensions: { 'dev.openpencil': { scopes: ['FONT_FAMILY'] } }
+      }
+    })
+  })
+
+  test('keeps a name a token path cannot hold, and the mode it belongs to', () => {
+    const dark = file(designSystem(), 'Theme/Dark.tokens.json')
+
+    expect(dark['Ratio 1-5']).toEqual({
+      $type: 'dimension',
+      $value: { value: 1.5, unit: 'px' },
+      $extensions: { 'dev.openpencil': { name: 'Ratio 1.5' } }
+    })
+    expect(dark.Accent).toMatchObject({
+      $value: { colorSpace: 'srgb', components: [1, 1, 1], alpha: 1, hex: '#ffffff' }
+    })
+    expect(dark.$extensions).toEqual({
+      'dev.openpencil': { collection: 'Theme', mode: 'Dark', default: false }
+    })
+  })
+
+  test('writes text and effect styles as typography and shadow tokens', () => {
+    const styles = file(designSystem(), STYLES_FILE)
+
+    expect(styles.Heading).toMatchObject({
+      H1: {
+        $type: 'typography',
+        $value: {
+          fontFamily: '{Font.Body}',
+          fontSize: { value: 32, unit: 'px' },
+          fontWeight: 700,
+          lineHeight: 1.25,
+          letterSpacing: { value: -0.5, unit: 'px' }
+        }
+      }
+    })
+    expect(styles.Elevation).toEqual({
+      Card: {
+        $type: 'shadow',
+        $value: {
+          color: { colorSpace: 'srgb', components: [0, 0, 0], alpha: 0.25, hex: '#000000' },
+          offsetX: { value: 0, unit: 'px' },
+          offsetY: { value: 4, unit: 'px' },
+          blur: { value: 12, unit: 'px' },
+          spread: { value: 0, unit: 'px' }
+        }
+      }
+    })
+  })
+
+  test('a collection named like the styles set gets a name of its own in the resolver', () => {
+    const graph = designSystem()
+    const styles = graph.createCollection('Styles')
+    graph.createVariable('Gap', 'FLOAT', styles.id, 4)
+
+    const resolver = exportDesignTokens(graph).files.find((file) => file.path === RESOLVER_FILE)
+    const content = resolver?.content as { sets?: object } | undefined
+
+    expect(Object.keys(content?.sets ?? {})).toEqual(['Primitives', 'Styles 2', 'Styles'])
+  })
+
+  test('without styles, a collection named Styles keeps its name in the resolver', () => {
+    const graph = new SceneGraph()
+    const styles = graph.createCollection('Styles')
+    graph.createVariable('Gap', 'FLOAT', styles.id, 4)
+
+    const resolver = exportDesignTokens(graph).files.find((file) => file.path === RESOLVER_FILE)
+    const content = resolver?.content as { sets?: object } | undefined
+
+    expect(Object.keys(content?.sets ?? {})).toEqual(['Styles'])
+  })
+
+  test('the resolver switches collections with several modes and layers the rest', () => {
+    expect(file(designSystem(), RESOLVER_FILE)).toEqual({
+      version: '2025-11-01',
+      sets: {
+        Primitives: { sources: [{ $ref: 'Primitives/Mode 1.tokens.json' }] },
+        Styles: { sources: [{ $ref: STYLES_FILE }] }
+      },
+      modifiers: {
+        Theme: {
+          contexts: {
+            Light: [{ $ref: 'Theme/Light.tokens.json' }],
+            Dark: [{ $ref: 'Theme/Dark.tokens.json' }]
+          },
+          default: 'Light'
+        }
+      },
+      resolutionOrder: [
+        { $ref: '#/sets/Primitives' },
+        { $ref: '#/modifiers/Theme' },
+        { $ref: '#/sets/Styles' }
+      ]
+    })
+  })
+})
+
+describe('color tokens of a document in a color profile', () => {
+  test('a Display P3 document writes its colors as P3 with an sRGB hex, and reads them back', () => {
+    const graph = new SceneGraph()
+    graph.documentColorSpace = 'display-p3'
+    const collection = graph.createCollection('Theme')
+    graph.createVariable('Brand', 'COLOR', collection.id, { r: 1, g: 0, b: 0, a: 1 })
+    const exported = exportDesignTokens(graph)
+    const brand = exported.files
+      .map((entry) => (entry.content as Record<string, { $value?: unknown }>).Brand)
+      .find((token) => token !== undefined)
+    expect(brand?.$value).toMatchObject({ colorSpace: 'display-p3', components: [1, 0, 0] })
+    // The hex is the nearest sRGB red, inside sRGB, not the P3 numbers read as sRGB.
+    expect(brand?.$value).not.toMatchObject({ hex: '#ff0000' })
+
+    const target = new SceneGraph()
+    target.documentColorSpace = 'display-p3'
+    const bundle = readDesignTokens(
+      exported.files.map((entry) => ({ path: entry.path, text: JSON.stringify(entry.content) }))
+    )
+    const plan = planTokenImport(target, bundle, defaultTokenImportOptions(target, bundle))
+    expect(plan.collections[0].variables[0].values[0]).toMatchObject({
+      value: { r: 1, g: 0, b: 0 }
+    })
+  })
+
+  describe('a shadow style imported into a document in another profile', () => {
+    /** The effects an effect style with a multiplied P3-red shadow plans to in `to`. */
+    function importedShadow(from: ColorProfile, to: ColorProfile) {
+      const graph = new SceneGraph()
+      graph.documentColorSpace = from
+      const style = graph.createNode('RECTANGLE', graph.getPages()[0].id, {
+        name: 'Elevation/Glow',
+        sharedStyleType: 'EFFECT',
+        internalOnly: true,
+        effects: [
+          {
+            type: 'DROP_SHADOW',
+            color: { r: 1, g: 0, b: 0, a: 0.5 },
+            offset: { x: 0, y: 4 },
+            radius: 12,
+            spread: 0,
+            visible: true,
+            blendMode: 'MULTIPLY',
+            showShadowBehindNode: true
+          }
+        ]
+      })
+      style.source.id = 'style:glow'
+      const target = new SceneGraph()
+      target.documentColorSpace = to
+      const bundle = readDesignTokens(
+        exportDesignTokens(graph).files.map((entry) => ({
+          path: entry.path,
+          text: JSON.stringify(entry.content)
+        }))
+      )
+      const plan = planTokenImport(target, bundle, defaultTokenImportOptions(target, bundle))
+      return plan.styles[0]?.fields.effects?.[0]
+    }
+
+    test('keeps what only the recorded effects hold, such as the blend mode', () => {
+      for (const [from, to] of [
+        ['srgb', 'display-p3'],
+        ['display-p3', 'srgb']
+      ] as const) {
+        expect(importedShadow(from, to)).toMatchObject({
+          blendMode: 'MULTIPLY',
+          showShadowBehindNode: true
+        })
+      }
+    })
+
+    test('an edited shadow color leaves the recorded ones in the profile they were written in', () => {
+      const graph = new SceneGraph()
+      const shadow = {
+        type: 'DROP_SHADOW' as const,
+        color: { r: 0, g: 0, b: 0, a: 1 },
+        offset: { x: 0, y: 4 },
+        radius: 12,
+        spread: 0,
+        visible: true
+      }
+      const style = graph.createNode('RECTANGLE', graph.getPages()[0].id, {
+        name: 'Elevation/Glow',
+        sharedStyleType: 'EFFECT',
+        internalOnly: true,
+        effects: [shadow, { ...shadow, color: { r: 1, g: 0, b: 0, a: 1 }, visible: false }]
+      })
+      style.source.id = 'style:glow'
+      const files = exportDesignTokens(graph).files.map((entry) => {
+        const text = JSON.stringify(entry.content)
+        // The visible shadow's color edited in the file, to Display P3 green.
+        return {
+          path: entry.path,
+          text: text.replace(
+            '"colorSpace":"srgb","components":[0,0,0]',
+            '"colorSpace":"display-p3","components":[0,1,0]'
+          )
+        }
+      })
+      // Read into an sRGB document, where a color taken for P3 would be converted.
+      const target = new SceneGraph()
+      const bundle = readDesignTokens(files)
+      const plan = planTokenImport(target, bundle, defaultTokenImportOptions(target, bundle))
+      const effects = plan.styles[0]?.fields.effects
+      // The edited P3 green is brought inside sRGB.
+      const green = convertColor({ r: 0, g: 1, b: 0, a: 1 }, 'display-p3', 'srgb', 'map')
+      expect(effects?.[0]?.color.b).toBeCloseTo(green.b, 4)
+      // The hidden sRGB red keeps its numbers, not converted as if it were P3.
+      expect(effects?.[1]).toMatchObject({ visible: false, color: { r: 1, g: 0, b: 0, a: 1 } })
+    })
+
+    test('reads the colors as the token does: sRGB numbers kept, P3 converted', () => {
+      expect(importedShadow('srgb', 'display-p3')?.color).toEqual({ r: 1, g: 0, b: 0, a: 0.5 })
+      const mapped = importedShadow('display-p3', 'srgb')?.color
+      expect(mapped?.r).toBeCloseTo(1, 1)
+      expect(mapped?.g).toBeLessThan(0.2)
+      expect(mapped?.g).toBeGreaterThan(0)
+    })
+  })
+})

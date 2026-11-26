@@ -1,0 +1,21 @@
+{
+  "move": "Sposta",
+  "frame": "Cornice",
+  "section": "Sezione",
+  "rectangle": "Rettangolo",
+  "ellipse": "Ellisse",
+  "line": "Linea",
+  "polygon": "Poligono",
+  "star": "Stella",
+  "pen": "Penna",
+  "pencil": "Matita",
+  "text": "Testo",
+  "sticky": "Nota adesiva",
+  "shape": "Forma",
+  "connector": "Connettore",
+  "hand": "Mano",
+  "comment": "Commento",
+  "eyedropper": "Contagocce",
+  "eyedropperSample": "Preleva un colore dalla tela",
+  "scale": "Scala"
+}

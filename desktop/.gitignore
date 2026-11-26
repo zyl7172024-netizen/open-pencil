@@ -1,0 +1,11 @@
+# Harness sidecar build output
+/binaries/
+
+# Cargo build output
+/target/
+
+# Tauri-generated capability schema files
+/gen/
+
+# Written by the release (`notices` in tools/release/release-packages).
+/generated/THIRD-PARTY-NOTICES.md

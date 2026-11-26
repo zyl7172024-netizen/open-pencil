@@ -1,0 +1,268 @@
+import { uniq } from 'es-toolkit/array'
+
+import type { ComponentPropertyDefinition, ComponentPropertyType } from '@open-pencil/scene-graph'
+import { buildVariantName, parseVariantName } from '@open-pencil/scene-graph/variant-name'
+
+import { assertNodeEditable } from '#core/editor/capabilities'
+import { reapplyInstanceComponentProperties } from '#core/editor/components/properties'
+import {
+  applyDocumentChange,
+  isEmptyDocumentChange,
+  type DocumentChange
+} from '#core/editor/history/document-change'
+import { recordEdit } from '#core/editor/history/edit'
+import { restoreSubtree, snapshotSubtree } from '#core/editor/history/subtree'
+import type { EditorContext } from '#core/editor/types'
+
+import { addVariant, appendVariant } from './add'
+import {
+  addPropertyDefinition,
+  removePropertyDefinition,
+  renamePropertyDefinition,
+  renameVariantValue,
+  reorderPropertyDefinitions,
+  reorderVariantValues,
+  setVariantPropertyValue
+} from './definitions'
+import {
+  collectVariantOptions,
+  findExactVariant,
+  findVariantByValues,
+  getComponentSet,
+  getComponentSetVariantConflicts,
+  getComponentSetVariants,
+  getDefaultVariantForComponentSet,
+  getVariantDefinitions,
+  getVariantOptions,
+  validateComponentSet,
+  variantValues,
+  type VariantOptionAvailability,
+  type VariantTransitionResult
+} from './model'
+import { addVariantValue, removeVariantValue } from './options'
+import {
+  findOrBuildVariant,
+  loadSavedVariants,
+  savedVariantValues,
+  unbuiltVariantWith
+} from './saved'
+
+export type {
+  VariantConflict,
+  VariantMutationResult,
+  VariantOptionAvailability,
+  VariantTransitionResult,
+  VariantValidationIssue
+} from './model'
+
+/**
+ * Variant authoring on component sets: property definitions and values (in `definitions`), the
+ * set's variants, and switching an instance between them. Each edit is one undo step.
+ */
+export function createVariantActions(ctx: EditorContext) {
+  function getComponentSetPropertyDefs(componentSetId: string): ComponentPropertyDefinition[] {
+    return getComponentSet(ctx.graph, componentSetId)?.componentPropertyDefinitions ?? []
+  }
+
+  function getVariantOptionAvailability(
+    instanceId: string,
+    propertyName: string
+  ): VariantOptionAvailability[] {
+    const instance = ctx.graph.getNode(instanceId)
+    const component = instance?.componentId ? ctx.graph.getNode(instance.componentId) : undefined
+    const componentSetId = component?.parentId
+    if (instance?.type !== 'INSTANCE' || component?.type !== 'COMPONENT' || !componentSetId) {
+      return []
+    }
+    const definitions = getVariantDefinitions(ctx.graph, componentSetId)
+    const saved = savedVariantValues(ctx.graph, componentSetId)
+    const unbuilt = saved.filter((variant) => !variant.built)
+    const options = uniq([
+      ...saved.flatMap(({ values }) => values[propertyName] || []),
+      ...(collectVariantOptions(ctx.graph, componentSetId).get(propertyName) ?? [])
+    ])
+    const current = variantValues(ctx.graph, componentSetId, component)
+    return options.map((value) => {
+      const requested = { ...current, [propertyName]: value }
+      const unbuiltMatch = unbuilt.some(({ values }) =>
+        definitions.every(({ name }) => values[name] === requested[name])
+      )
+      return {
+        value,
+        available: Boolean(findExactVariant(ctx.graph, componentSetId, requested)) || unbuiltMatch
+      }
+    })
+  }
+
+  function pushSwitchStep(change: DocumentChange) {
+    if (isEmptyDocumentChange(change)) {
+      return
+    }
+    const show = (side: 'before' | 'after') => {
+      applyDocumentChange(ctx.graph, change, side)
+      ctx.setSelectedIds(new Set())
+      ctx.state.hoveredNodeId = null
+      ctx.requestRender()
+    }
+    ctx.undo.push({
+      label: 'Switch variant',
+      forward: () => show('after'),
+      inverse: () => show('before')
+    })
+  }
+
+  function switchInstanceVariant(
+    instanceId: string,
+    propertyName: string,
+    newValue: string
+  ): VariantTransitionResult {
+    assertNodeEditable(ctx.graph, instanceId)
+    const instance = ctx.graph.getNode(instanceId)
+    if (instance?.type !== 'INSTANCE' || !instance.componentId) return { kind: 'invalid' }
+    const component = ctx.graph.getNode(instance.componentId)
+    const componentSetId = component?.parentId
+    if (
+      component?.type !== 'COMPONENT' ||
+      !componentSetId ||
+      !getComponentSet(ctx.graph, componentSetId)
+    ) {
+      return { kind: 'invalid' }
+    }
+
+    const requested = {
+      ...variantValues(ctx.graph, componentSetId, component),
+      [propertyName]: newValue
+    }
+    const target = findOrBuildVariant(ctx.graph, componentSetId, requested)
+    if (!target) return { kind: 'unavailable', requested }
+    if (target.id === instance.componentId) return { kind: 'unchanged', componentId: target.id }
+
+    const options = {
+      label: 'Switch variant',
+      push: false,
+      onRecorded: pushSwitchStep
+    }
+    recordEdit(ctx, options, () => {
+      ctx.graph.swapInstanceComponent(instanceId, target.id)
+      reapplyInstanceComponentProperties(ctx, instanceId)
+      ctx.runLayoutForNode(instanceId)
+    })
+    ctx.requestRender()
+    return { kind: 'changed', componentId: target.id }
+  }
+
+  /**
+   * The saved variants setting an instance's variant property to `value` would build first:
+   * none when that variant is built, or the property is not a variant property. Loading them with
+   * `loadSavedVariants` before the switch builds them in the reader worker instead of on this
+   * thread.
+   */
+  function variantsToLoad(instanceId: string, propertyId: string, value: string): string[] {
+    const instance = ctx.graph.getNode(instanceId)
+    const component = instance?.componentId ? ctx.graph.getNode(instance.componentId) : undefined
+    const componentSetId = component?.parentId
+    if (component?.type !== 'COMPONENT' || !componentSetId) return []
+    const definition = getVariantDefinitions(ctx.graph, componentSetId).find(
+      (item) => item.id === propertyId
+    )
+    if (!definition) return []
+    const requested = {
+      ...variantValues(ctx.graph, componentSetId, component),
+      [definition.name]: value
+    }
+    if (findExactVariant(ctx.graph, componentSetId, requested)) return []
+    const unbuilt = unbuiltVariantWith(ctx.graph, componentSetId, requested)
+    return unbuilt ? [unbuilt.id] : []
+  }
+
+  /** A copy of a variant with its values, below the set's last variant, for the caller to set. */
+  function duplicateVariant(variantId: string): string | undefined {
+    const variant = ctx.graph.getNode(variantId)
+    const setId = variant?.parentId
+    if (variant?.type !== 'COMPONENT' || !setId || !getComponentSet(ctx.graph, setId))
+      return undefined
+    return appendVariant(ctx, setId, variant, false)
+  }
+
+  function removeVariant(variantId: string): boolean {
+    assertNodeEditable(ctx.graph, variantId)
+    const variant = ctx.graph.getNode(variantId)
+    const componentSetId = variant?.parentId
+    if (variant?.type !== 'COMPONENT' || !componentSetId) return false
+    if (getComponentSetVariants(ctx.graph, componentSetId).length <= 1) return false
+    const snapshots = snapshotSubtree(ctx.graph, variantId)
+    ctx.graph.deleteNode(variantId)
+    ctx.setSelectedIds(new Set([componentSetId]))
+    ctx.undo.push({
+      label: 'Remove variant',
+      forward: () => {
+        ctx.graph.deleteNode(variantId)
+        ctx.setSelectedIds(new Set([componentSetId]))
+        ctx.requestRender()
+      },
+      inverse: () => {
+        const root = snapshots.get(variantId)
+        if (root) restoreSubtree(ctx.graph, root, componentSetId, snapshots)
+        ctx.setSelectedIds(new Set([variantId]))
+        ctx.requestRender()
+      }
+    })
+    ctx.requestRender()
+    return true
+  }
+
+  return {
+    getComponentSetPropertyDefs,
+    addPropertyDefinition: (
+      componentSetId: string,
+      name: string,
+      type?: ComponentPropertyType,
+      defaultValue?: string
+    ) => addPropertyDefinition(ctx, componentSetId, name, type, defaultValue),
+    removePropertyDefinition: (componentSetId: string, propertyId: string) =>
+      removePropertyDefinition(ctx, componentSetId, propertyId),
+    renamePropertyDefinition: (componentSetId: string, propertyId: string, newName: string) =>
+      renamePropertyDefinition(ctx, componentSetId, propertyId, newName),
+    reorderPropertyDefinitions: (componentSetId: string, propertyIds: string[]) =>
+      reorderPropertyDefinitions(ctx, componentSetId, propertyIds),
+    renameVariantValue: (
+      componentSetId: string,
+      propertyId: string,
+      previousValue: string,
+      newValue: string
+    ) => renameVariantValue(ctx, componentSetId, propertyId, previousValue, newValue),
+    reorderVariantValues: (componentSetId: string, propertyId: string, values: string[]) =>
+      reorderVariantValues(ctx, componentSetId, propertyId, values),
+    setVariantPropertyValue: (variantId: string, propertyId: string, value: string) =>
+      setVariantPropertyValue(ctx, variantId, propertyId, value),
+    parseVariantName,
+    buildVariantName,
+    collectVariantOptions: (componentSetId: string) =>
+      collectVariantOptions(ctx.graph, componentSetId),
+    findVariantByValues: (componentSetId: string, values: Record<string, string>) =>
+      findVariantByValues(ctx.graph, componentSetId, values),
+    getDefaultVariantForComponentSet: (componentSetId: string) =>
+      getDefaultVariantForComponentSet(ctx.graph, componentSetId),
+    getComponentSetVariantConflicts: (componentSetId: string) =>
+      getComponentSetVariantConflicts(ctx.graph, componentSetId),
+    validateComponentSet: (componentSetId: string) =>
+      validateComponentSet(ctx.graph, componentSetId),
+    getVariantOptionAvailability,
+    switchInstanceVariant,
+    variantsToLoad,
+    loadSavedVariants: (variantIds: readonly string[]) => loadSavedVariants(ctx.graph, variantIds),
+    addVariant: (nodeId: string) => addVariant(ctx, nodeId),
+    getVariantOptions: (componentSetId: string, propertyId: string) =>
+      getVariantOptions(ctx.graph, componentSetId, propertyId),
+    addVariantValue: (componentSetId: string, propertyId: string, value: string) =>
+      addVariantValue(ctx, componentSetId, propertyId, value),
+    removeVariantValue: (
+      componentSetId: string,
+      propertyId: string,
+      value: string,
+      replacement?: string
+    ) => removeVariantValue(ctx, componentSetId, propertyId, value, replacement),
+    duplicateVariant,
+    removeVariant
+  }
+}

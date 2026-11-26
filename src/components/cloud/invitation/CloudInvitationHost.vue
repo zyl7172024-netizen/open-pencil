@@ -1,0 +1,70 @@
+<script setup lang="ts">
+import { useNow } from '@vueuse/core'
+import { computed, watch } from 'vue'
+import { useRouter } from 'vue-router'
+
+import { useLocale } from '@open-pencil/vue/i18n'
+
+import { cloudSignedIn } from '@/app/cloud/connect/flow'
+import {
+  acceptCloudInvitation,
+  checkCloudInvitation,
+  cloudInvitation,
+  cloudInvitationAccount,
+  cloudInvitationOpen,
+  cloudInvitationState,
+  dismissCloudInvitation,
+  openCloudInvitationInDesktop,
+  signInForCloudInvitation,
+  switchCloudInvitationAccount
+} from '@/app/cloud/invitations/flow'
+import { canOfferDesktopApp } from '@/app/cloud/links'
+import { useHeldContent } from '@/components/ui/overlay/held'
+
+import CloudInvitationDialog from './CloudInvitationDialog.vue'
+
+/** The invitation an opened link names, until it is accepted or dismissed. */
+const { locale } = useLocale()
+const router = useRouter()
+const now = useNow({ interval: 60_000 })
+const HOUR = 3_600_000
+
+const summary = computed(() => {
+  const invitation = cloudInvitation.value
+  if (!invitation) return null
+  const left = Date.parse(invitation.expiresAt) - now.value.getTime()
+  const days = left >= 24 * HOUR
+  const expiresIn = new Intl.NumberFormat(locale.value, {
+    style: 'unit',
+    unit: days ? 'day' : 'hour',
+    unitDisplay: 'long'
+  }).format(Math.max(1, Math.ceil(left / (days ? 24 * HOUR : HOUR))))
+  return { ...invitation, expiresIn }
+})
+
+// Dismissing clears the invitation; the dialog keeps drawing it while it animates closed.
+const shownInvitation = useHeldContent(summary, cloudInvitationOpen)
+const shownState = useHeldContent(cloudInvitationState, cloudInvitationOpen)
+const shownAccount = useHeldContent(cloudInvitationAccount, cloudInvitationOpen)
+
+// Signing in for the invitation comes back here; check it again with the new account.
+watch(cloudSignedIn, () => {
+  if (cloudInvitationOpen.value) void checkCloudInvitation()
+})
+</script>
+
+<template>
+  <CloudInvitationDialog
+    :open="cloudInvitationOpen"
+    :state="shownState"
+    :invitation="shownInvitation"
+    :account="shownAccount"
+    :offer-desktop="canOfferDesktopApp()"
+    @update:open="(open) => !open && dismissCloudInvitation()"
+    @accept="acceptCloudInvitation(router)"
+    @sign-in="signInForCloudInvitation"
+    @switch-account="switchCloudInvitationAccount"
+    @open-in-desktop="openCloudInvitationInDesktop"
+    @cancel="dismissCloudInvitation"
+  />
+</template>

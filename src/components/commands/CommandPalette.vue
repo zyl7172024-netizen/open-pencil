@@ -1,0 +1,85 @@
+<script setup lang="ts">
+import { matchesKeyboardEvent, type HotkeyChord } from '@tanstack/hotkeys'
+import { useEventListener } from '@vueuse/core'
+import { DialogDescription, DialogTitle, VisuallyHidden } from 'reka-ui'
+import { computed } from 'vue'
+import Search from '~icons/lucide/search'
+import X from '~icons/lucide/x'
+
+import { useMessages } from '@open-pencil/vue/i18n'
+import { CommandPaletteRoot } from '@open-pencil/vue/primitives/CommandPalette'
+
+import { usePagePaletteGroup } from '@/app/editor/pages/palette'
+import { useAppMenu } from '@/app/shell/menu/app-menu'
+import IconButton from '@/components/ui/button/IconButton.vue'
+import AppDialogRoot from '@/components/ui/dialog/AppDialogRoot.vue'
+import { IS_BROWSER } from '@/constants'
+
+import { useCommandPaletteUI } from './ui'
+
+const COMMAND_PALETTE_SHORTCUT: HotkeyChord = 'Mod+K'
+
+const { commandGroups } = useAppMenu()
+const pageGroup = usePagePaletteGroup()
+const groups = computed(() =>
+  pageGroup.value ? [pageGroup.value, ...commandGroups.value] : commandGroups.value
+)
+const commands = useMessages('commands')
+const common = useMessages('common')
+const paletteUI = useCommandPaletteUI()
+const labels = computed(() => ({
+  searchPlaceholder: commands.value.paletteSearchPlaceholder,
+  searchLabel: commands.value.paletteSearchAriaLabel,
+  paletteLabel: commands.value.paletteAriaLabel,
+  empty: commands.value.paletteNoCommands,
+  back: commands.value.paletteBack
+}))
+const open = defineModel<boolean>('open', { default: false })
+
+function close() {
+  open.value = false
+}
+
+if (IS_BROWSER) {
+  useEventListener(window, 'keydown', (event) => {
+    if (!matchesKeyboardEvent(event, COMMAND_PALETTE_SHORTCUT)) return
+    event.preventDefault()
+    open.value = true
+  })
+}
+</script>
+
+<template>
+  <AppDialogRoot
+    v-model:open="open"
+    size="md"
+    :ui="{
+      content: 'w-[min(40rem,94vw)] p-0',
+      overlay: 'bg-black/40'
+    }"
+    @escape-key-down="close"
+  >
+    <VisuallyHidden>
+      <DialogTitle>{{ commands.paletteAriaLabel }}</DialogTitle>
+      <DialogDescription>{{ commands.paletteDescription }}</DialogDescription>
+    </VisuallyHidden>
+    <CommandPaletteRoot :groups="groups" :labels="labels" :ui="paletteUI" @select="open = false">
+      <template #search-leading>
+        <Search class="mx-2 size-5 shrink-0 text-muted" />
+      </template>
+      <template #search-trailing>
+        <IconButton class="ms-2" size="md" :label="common.close" @click="close">
+          <X class="size-5" />
+        </IconButton>
+      </template>
+      <template #empty>
+        <p class="px-4 py-8 text-center text-xs text-muted">
+          {{ commands.paletteNoCommands }}
+        </p>
+      </template>
+      <template #item-icon="{ item }">
+        <component :is="item.icon" v-if="item.icon" class="size-4" />
+      </template>
+    </CommandPaletteRoot>
+  </AppDialogRoot>
+</template>

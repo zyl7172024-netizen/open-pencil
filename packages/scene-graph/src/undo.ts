@@ -1,0 +1,323 @@
+export interface UndoEntry {
+  label: string
+  forward: () => void
+  inverse: () => void
+  coalesceKey?: string
+}
+
+/**
+ * Why committed history changed: a new step, a change joining the newest step, undo, redo, or
+ * clearing it.
+ */
+export type HistoryChange = 'record' | 'join' | 'undo' | 'redo' | 'clear'
+
+export interface UndoManagerOptions {
+  limit?: number
+  /**
+   * Called after recording, joining, undoing, redoing, or clearing committed history, with which,
+   * and with the step recorded or joined for `'record'` and `'join'`.
+   */
+  onChange?: (change: HistoryChange, step?: UndoEntry) => void
+  /**
+   * Called when an edit ends without a step, its changes undone or amounting to nothing: a batch
+   * rolled back, or an edit reported with `discardEdit`. History is unchanged, so `onChange` is not.
+   */
+  onDiscard?: () => void
+  /**
+   * Runs an undo or a redo, which the editor runs outside edits in progress
+   * (`SceneGraph.runOutsideEdits`), so an agent's edit open meanwhile does not record it.
+   */
+  runReplay?: (replay: () => void) => void
+}
+
+interface UndoBatch {
+  label: string
+  entries: UndoEntry[]
+  coalesceKey?: string
+}
+
+/** How many edits undo keeps by default. */
+export const DEFAULT_HISTORY_LIMIT = 200
+
+export class UndoManager {
+  private undoStack: UndoEntry[] = []
+  private redoStack: UndoEntry[] = []
+  private batches: UndoBatch[] = []
+  private replaying = 0
+  private openEdits = 0
+  private readonly settlers = new Set<() => void>()
+  private readonly limit: number
+  private readonly onChange: ((change: HistoryChange, step?: UndoEntry) => void) | undefined
+  private readonly onDiscard: (() => void) | undefined
+  private readonly runReplay: (replay: () => void) => void
+
+  constructor(options: UndoManagerOptions = {}) {
+    this.limit = options.limit ?? DEFAULT_HISTORY_LIMIT
+    this.onChange = options.onChange
+    this.onDiscard = options.onDiscard
+    this.runReplay = options.runReplay ?? ((replay) => replay())
+  }
+
+  apply(entry: UndoEntry): void {
+    this.execute(entry)
+  }
+
+  execute(entry: UndoEntry): void {
+    entry.forward()
+    this.record(entry)
+  }
+
+  push(entry: UndoEntry): void {
+    this.record(entry)
+  }
+
+  record(entry: UndoEntry): void {
+    const batch = this.currentBatch
+    if (batch) {
+      batch.entries.push(entry)
+      return
+    }
+    this.pushUndoEntry(entry)
+  }
+
+  /**
+   * Records an entry as a step of its own, outside the batches being built, such as an agent's
+   * edit made while a colour picker is open. Batches settle first, so the step follows the
+   * changes they hold so far.
+   */
+  pushStep(entry: UndoEntry): void {
+    this.settle()
+    this.pushUndoEntry(entry)
+  }
+
+  /**
+   * Registers a hook that commits an edit still being coalesced, such as a run of picker changes.
+   * Undo and redo run every hook first, so they act on the newest change.
+   */
+  onBeforeHistory(settle: () => void): () => void {
+    this.settlers.add(settle)
+    return () => this.settlers.delete(settle)
+  }
+
+  private settle() {
+    for (const settle of this.settlers) settle()
+  }
+
+  undo(): string | null {
+    this.settle()
+    const entry = this.undoStack.pop()
+    if (!entry) return null
+    this.replay(() => entry.inverse())
+    this.redoStack.push(entry)
+    this.onChange?.('undo')
+    return entry.label
+  }
+
+  redo(): string | null {
+    this.settle()
+    const entry = this.redoStack.pop()
+    if (!entry) return null
+    this.replay(() => entry.forward())
+    this.undoStack.push(entry)
+    this.onChange?.('redo')
+    return entry.label
+  }
+
+  beginBatch(label: string, coalesceKey?: string): void {
+    this.batches.push({ label, entries: [], coalesceKey })
+  }
+
+  commitBatch(): void {
+    const batch = this.batches.pop()
+    if (!batch || batch.entries.length === 0) return
+
+    const entry = this.createBatchEntry(batch)
+    const parentBatch = this.currentBatch
+    if (parentBatch) parentBatch.entries.push(entry)
+    else this.pushUndoEntry(entry)
+  }
+
+  runBatch<T>(label: string, fn: () => T, coalesceKey?: string): T {
+    this.beginBatch(label, coalesceKey)
+    try {
+      const result = fn()
+      this.commitBatch()
+      return result
+    } catch (error) {
+      this.rollbackBatch()
+      throw error
+    }
+  }
+
+  rollbackBatch(): void {
+    const batch = this.batches.at(-1)
+    if (!batch) return
+    // Still open while it rolls back, so what the rollback changes belongs to the batch.
+    try {
+      for (const entry of batch.entries.toReversed()) entry.inverse()
+    } finally {
+      this.batches.pop()
+    }
+    this.onDiscard?.()
+  }
+
+  /**
+   * Reports an edit that ended without a step, rolled back or changing nothing, as a rolled-back
+   * batch does. Called once the edit has closed, so `isRecording` tells whether another is open.
+   */
+  discardEdit(): void {
+    this.onDiscard?.()
+  }
+
+  /** Abandon provisional history without replaying it or changing committed undo/redo entries. */
+  discardBatches(): void {
+    this.batches = []
+  }
+
+  clear(): void {
+    this.undoStack = []
+    this.redoStack = []
+    this.discardBatches()
+    this.onChange?.('clear')
+  }
+
+  /** Whether undo or redo is replaying a step, whose changes are history rather than new edits. */
+  get isReplaying(): boolean {
+    return this.replaying > 0
+  }
+
+  /**
+   * Adds a change that the newest step caused, as one an editor makes in response to it, so undo
+   * and redo apply them together. Inside a batch it joins the batch. False with no step to join.
+   */
+  extendLastStep(entry: UndoEntry): boolean {
+    if (this.currentBatch) {
+      this.currentBatch.entries.push(entry)
+      return true
+    }
+    const last = this.undoStack.at(-1)
+    if (!last) return false
+    // The step keeps its identity, so callers that hold it still find it in the history.
+    const { forward, inverse } = last
+    last.forward = () => {
+      forward()
+      entry.forward()
+    }
+    last.inverse = () => {
+      entry.inverse()
+      inverse()
+    }
+    this.onChange?.('join', last)
+    return true
+  }
+
+  private replay(step: () => void) {
+    this.replaying++
+    try {
+      this.runReplay(step)
+    } finally {
+      this.replaying--
+    }
+  }
+
+  get isBatching(): boolean {
+    return this.batches.length > 0
+  }
+
+  /**
+   * Marks an edit whose step is recorded when it ends, such as an agent's call that awaits fonts
+   * or a layout before it finishes. Returns the function that ends it; ending it twice is a no-op.
+   */
+  openEdit(): () => void {
+    this.openEdits++
+    let open = true
+    return () => {
+      if (!open) return
+      open = false
+      this.openEdits--
+    }
+  }
+
+  /**
+   * Whether a batch or an edit opened with `openEdit` will record a step for the changes made now,
+   * so they are not edits outside the history.
+   */
+  get isRecording(): boolean {
+    return this.isBatching || this.openEdits > 0
+  }
+
+  /** Committed history, or changes in an open batch that a settling hook commits first. */
+  get canUndo(): boolean {
+    if (this.undoStack.length > 0) return true
+    return this.settlers.size > 0 && this.batches.some((batch) => batch.entries.length > 0)
+  }
+
+  get canRedo(): boolean {
+    return this.redoStack.length > 0
+  }
+
+  /**
+   * The entry `depth` steps below the top of the undo stack, so a caller that pushed entries
+   * can tell whether they are still the most recent ones.
+   */
+  peekUndo(depth = 0): UndoEntry | undefined {
+    return this.undoStack.at(-1 - depth)
+  }
+
+  /** The entry `depth` steps below the top of the redo stack, the next one Redo applies at 0. */
+  peekRedo(depth = 0): UndoEntry | undefined {
+    return this.redoStack.at(-1 - depth)
+  }
+
+  /**
+   * Whether `entry` is applied (on the undo stack) or undone (on the redo stack); null once it
+   * left the history, trimmed or dropped when an edit cleared Redo.
+   */
+  stateOf(entry: UndoEntry): 'applied' | 'undone' | null {
+    if (this.undoStack.includes(entry)) return 'applied'
+    if (this.redoStack.includes(entry)) return 'undone'
+    return null
+  }
+
+  get undoLabel(): string | null {
+    return this.undoStack.at(-1)?.label ?? null
+  }
+
+  get redoLabel(): string | null {
+    return this.redoStack.at(-1)?.label ?? null
+  }
+
+  private get currentBatch(): UndoBatch | null {
+    return this.batches.at(-1) ?? null
+  }
+
+  private createBatchEntry(batch: UndoBatch): UndoEntry {
+    return {
+      label: batch.label,
+      forward: () => batch.entries.forEach((entry) => entry.forward()),
+      inverse: () => batch.entries.toReversed().forEach((entry) => entry.inverse()),
+      coalesceKey: batch.coalesceKey
+    }
+  }
+
+  private pushUndoEntry(entry: UndoEntry): void {
+    const previous = this.undoStack.at(-1)
+    if (entry.coalesceKey && previous?.coalesceKey === entry.coalesceKey) {
+      this.undoStack[this.undoStack.length - 1] = {
+        ...entry,
+        inverse: previous.inverse
+      }
+    } else {
+      this.undoStack.push(entry)
+    }
+    this.redoStack = []
+    this.trimUndoStack()
+    this.onChange?.('record', this.undoStack.at(-1))
+  }
+
+  private trimUndoStack(): void {
+    if (!Number.isFinite(this.limit) || this.limit <= 0) return
+    const overflow = this.undoStack.length - this.limit
+    if (overflow > 0) this.undoStack.splice(0, overflow)
+  }
+}

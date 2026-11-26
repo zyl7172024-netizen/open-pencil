@@ -1,0 +1,44 @@
+import { resolveEditorProfile, type Editor } from '@open-pencil/core'
+import { canvasLabelForeground } from '@open-pencil/core/canvas'
+import type { SceneNode } from '@open-pencil/scene-graph'
+import { normalizeColor } from '@open-pencil/scene-graph/color'
+import { figJamSectionTitleColors } from '@open-pencil/scene-graph/figjam'
+import type { Color } from '@open-pencil/scene-graph/primitives'
+import type { CanvasLabelKind } from '@open-pencil/vue/canvas/labels'
+
+export interface CanvasLabelPresentation {
+  /** In the document's profile, as its layers store colors; neutral greys read the same in any. */
+  background: Color
+  foreground: 'dark' | 'light'
+}
+
+const DEFAULT_LABEL_BACKGROUND: Color = { r: 0.37, g: 0.37, b: 0.37, a: 1 }
+
+/** Figma renames a frame or component name in a white field, a section title on its own fill. */
+const NAME_FIELD: CanvasLabelPresentation = {
+  background: { r: 1, g: 1, b: 1, a: 1 },
+  foreground: 'dark'
+}
+
+export function canvasLabelPresentation(
+  editor: Editor,
+  node: SceneNode | null,
+  kind: CanvasLabelKind | undefined
+): CanvasLabelPresentation {
+  if (kind && kind !== 'section-title') return NAME_FIELD
+  // A board draws the title on the section's outline colour, as FigJam does.
+  const figJam =
+    node && resolveEditorProfile(editor.state).sectionTitles === 'outline'
+      ? figJamSectionTitleColors(node)
+      : null
+  if (figJam) {
+    const outline = node?.strokes[figJam.strokeIndex]
+    const background = outline ? normalizeColor(outline.color) : figJam.background
+    // Opaque, as the pill it edits is.
+    return { background: { ...background, a: 1 }, foreground: figJam.lightText ? 'light' : 'dark' }
+  }
+  const fill = node?.fills[0]
+  const background = node && fill?.visible ? normalizeColor(fill.color) : DEFAULT_LABEL_BACKGROUND
+  const foreground = canvasLabelForeground(background, editor.state.pageColor)
+  return { background, foreground: foreground.r === 0 ? 'dark' : 'light' }
+}

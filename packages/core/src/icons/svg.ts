@@ -1,0 +1,399 @@
+import { DOMImplementation, type Document as XMLDocument, type Element } from '@xmldom/xmldom'
+import { compact } from 'es-toolkit'
+
+import {
+  dimension,
+  parseCSSURLReferences,
+  parseFragmentReference
+} from '@open-pencil/scene-graph/css'
+import { parseSVGViewBoxValue } from '@open-pencil/scene-graph/parse-path'
+
+import { parseSVGFragment } from '#core/io/formats/svg/document'
+import { parseSVGGradients, type SVGGradients } from '#core/vector/vectorize/svg/gradients'
+
+import {
+  combinedTransform,
+  DEFAULT_PRESENTATION,
+  isElement,
+  normalizeSVGPaint,
+  num,
+  opacityValue,
+  presentationFor,
+  presentationVisible
+} from './svg/presentation'
+import { elementLayer, type Scope, type Traversal } from './svg/scope'
+import { textInfo } from './svg/text'
+import type { IconPathInfo, SVGClipPathRegion, SVGElementLayer, SVGTextInfo } from './types'
+
+interface SVGElementInput {
+  type: string
+  props: Readonly<Record<string, unknown>>
+  children: readonly (SVGElementInput | string)[]
+}
+
+const SVG_NAMESPACE = 'http://www.w3.org/2000/svg'
+/** The SVG attributes behind the camelCase props JSX spells them with, for each one SVG import reads. */
+const JSX_ATTRIBUTE_NAMES: Readonly<Record<string, string>> = {
+  className: 'class',
+  clipPath: 'clip-path',
+  fillOpacity: 'fill-opacity',
+  fillRule: 'fill-rule',
+  fontFamily: 'font-family',
+  fontSize: 'font-size',
+  fontStyle: 'font-style',
+  fontWeight: 'font-weight',
+  letterSpacing: 'letter-spacing',
+  stopColor: 'stop-color',
+  stopOpacity: 'stop-opacity',
+  strokeLinecap: 'stroke-linecap',
+  strokeLinejoin: 'stroke-linejoin',
+  strokeOpacity: 'stroke-opacity',
+  strokeWidth: 'stroke-width',
+  textAnchor: 'text-anchor',
+  textDecoration: 'text-decoration',
+  xlinkHref: 'xlink:href'
+}
+
+const SHAPE_NAMES = new Set(['path', 'circle', 'ellipse', 'rect', 'line', 'polygon', 'polyline'])
+const NON_RENDERED_CONTAINERS = new Set(['defs', 'clipPath', 'mask', 'symbol'])
+
+function circleToD(element: Element): string | null {
+  const cx = num(element, 'cx')
+  const cy = num(element, 'cy')
+  const r = num(element, 'r')
+  return r > 0
+    ? `M${cx - r},${cy}A${r},${r},0,1,0,${cx + r},${cy}A${r},${r},0,1,0,${cx - r},${cy}Z`
+    : null
+}
+
+function ellipseToD(element: Element): string | null {
+  const cx = num(element, 'cx')
+  const cy = num(element, 'cy')
+  const rx = num(element, 'rx')
+  const ry = num(element, 'ry')
+  return rx > 0 && ry > 0
+    ? `M${cx - rx},${cy}A${rx},${ry},0,1,0,${cx + rx},${cy}A${rx},${ry},0,1,0,${cx - rx},${cy}Z`
+    : null
+}
+
+function rectToD(element: Element): string | null {
+  const x = num(element, 'x')
+  const y = num(element, 'y')
+  const width = num(element, 'width')
+  const height = num(element, 'height')
+  if (width <= 0 || height <= 0) return null
+  const rx = Math.min(num(element, 'rx'), width / 2)
+  const ry = Math.min(num(element, 'ry', rx), height / 2)
+  if (rx > 0 || ry > 0) {
+    const arcX = rx || ry
+    const arcY = ry || rx
+    return `M${x + arcX},${y}H${x + width - arcX}A${arcX},${arcY},0,0,1,${x + width},${y + arcY}V${y + height - arcY}A${arcX},${arcY},0,0,1,${x + width - arcX},${y + height}H${x + arcX}A${arcX},${arcY},0,0,1,${x},${y + height - arcY}V${y + arcY}A${arcX},${arcY},0,0,1,${x + arcX},${y}Z`
+  }
+  return `M${x},${y}H${x + width}V${y + height}H${x}Z`
+}
+
+function pointsToD(element: Element, close: boolean): string | null {
+  const points = element.getAttribute('points')
+  if (!points) return null
+  const values = points
+    .trim()
+    .split(/[\s,]+/)
+    .map(Number)
+  if (values.length < 4 || values.length % 2 !== 0) return null
+  let path = `M${values[0]},${values[1]}`
+  for (let index = 2; index < values.length; index += 2) {
+    path += `L${values[index]},${values[index + 1]}`
+  }
+  return close ? `${path}Z` : path
+}
+
+function shapeToD(tagName: string, element: Element): string | null {
+  switch (tagName) {
+    case 'circle':
+      return circleToD(element)
+    case 'ellipse':
+      return ellipseToD(element)
+    case 'rect':
+      return rectToD(element)
+    case 'line':
+      return `M${num(element, 'x1')},${num(element, 'y1')}L${num(element, 'x2')},${num(element, 'y2')}`
+    case 'polygon':
+      return pointsToD(element, true)
+    case 'polyline':
+      return pointsToD(element, false)
+    default:
+      return null
+  }
+}
+
+function appendShapePath(
+  tagName: string,
+  element: Element,
+  scope: Scope,
+  layer: SVGElementLayer,
+  result: IconPathInfo[]
+): void {
+  const pathData = tagName === 'path' ? element.getAttribute('d') : shapeToD(tagName, element)
+  if (!pathData) return
+  const { presentation } = scope
+  const strokeWidth = Number.parseFloat(presentation.strokeWidth)
+  result.push({
+    d: pathData,
+    fill: normalizeSVGPaint(presentation.fill, presentation.color),
+    stroke: normalizeSVGPaint(presentation.stroke, presentation.color),
+    strokeWidth: Number.isFinite(strokeWidth) ? strokeWidth : 1,
+    strokeCap: presentation.strokeCap,
+    strokeJoin: presentation.strokeJoin,
+    fillRule: presentation.fillRule === 'evenodd' ? 'EVENODD' : 'NONZERO',
+    fillOpacity: opacityValue(presentation.fillOpacity),
+    strokeOpacity: opacityValue(presentation.strokeOpacity),
+    transform: scope.transform,
+    clipPaths: scope.clipPaths.length > 0 ? scope.clipPaths : undefined,
+    elements: [...scope.elements, layer]
+  })
+}
+
+/**
+ * A length attribute in user units, a percentage resolving against `viewport`, or null when it
+ * is missing or not a number.
+ */
+function lengthAttribute(element: Element | null, name: string, viewport?: number): number | null {
+  const length = dimension(element?.getAttribute(name)?.trim() ?? '')
+  if (!length) return null
+  if (length.unit === '%') return viewport === undefined ? null : (length.number / 100) * viewport
+  return length.unit === '' || length.unit === 'px' ? length.number : null
+}
+
+/**
+ * How a `<use>` draws a `<symbol>` with a viewBox (SVG 2 §5.6): the viewBox fits the `<use>`'s
+ * width and height, which percentages take of the viewport, else the whole viewport the
+ * outermost `<svg>` sets, centered as the default `preserveAspectRatio` (`xMidYMid meet`)
+ * centers it. Other targets draw as they are.
+ */
+function symbolViewBox(use: Element, target: Element, traversal: Traversal): string {
+  if ((target.localName || target.tagName) !== 'symbol') return ''
+  const viewBox = parseSVGViewBoxValue(target.getAttribute('viewBox'))
+  if (!viewBox) return ''
+  const svg = traversal.viewport
+  const outer = parseSVGViewBoxValue(svg?.getAttribute('viewBox') ?? null)
+  const viewportWidth = outer?.width ?? lengthAttribute(svg, 'width')
+  const viewportHeight = outer?.height ?? lengthAttribute(svg, 'height')
+  const width = lengthAttribute(use, 'width', viewportWidth ?? undefined) ?? viewportWidth
+  const height = lengthAttribute(use, 'height', viewportHeight ?? undefined) ?? viewportHeight
+  if (!width || !height) return ''
+  const scale = Math.min(width / viewBox.width, height / viewBox.height)
+  const dx = (width - viewBox.width * scale) / 2 - viewBox.x * scale
+  const dy = (height - viewBox.height * scale) / 2 - viewBox.y * scale
+  return `translate(${dx} ${dy}) scale(${scale})`
+}
+
+function collectUsePaths(
+  element: Element,
+  scope: Scope,
+  traversal: Traversal,
+  result: IconPathInfo[]
+): void {
+  const x = num(element, 'x')
+  const y = num(element, 'y')
+  const href = element.getAttribute('href') ?? element.getAttribute('xlink:href')
+  const id = parseFragmentReference(href)
+  const target = id ? traversal.elementsById.get(id) : null
+  const moved = x !== 0 || y !== 0 ? `translate(${x} ${y})` : ''
+  const placed = [scope.transform, moved, target ? symbolViewBox(element, target, traversal) : '']
+  const transform = compact(placed).join(' ') || null
+  if (target && !scope.useStack.has(target)) {
+    collectPaths(
+      target,
+      { ...scope, transform, useStack: new Set([...scope.useStack, target]), referenced: true },
+      traversal,
+      result
+    )
+  }
+}
+
+function collectClipPath(
+  value: string | null,
+  parentTransform: string | null,
+  traversal: Traversal
+): SVGClipPathRegion | null {
+  const [id] = parseCSSURLReferences(value ?? undefined)
+  const target = id ? traversal.elementsById.get(id) : null
+  if (!target || (target.localName || target.tagName) !== 'clipPath') return null
+
+  const units =
+    target.getAttribute('clipPathUnits') === 'objectBoundingBox'
+      ? 'objectBoundingBox'
+      : 'userSpaceOnUse'
+  const paths: IconPathInfo[] = []
+  collectPaths(
+    target,
+    {
+      presentation: { ...DEFAULT_PRESENTATION, fill: '#000000' },
+      transform: units === 'objectBoundingBox' ? null : parentTransform,
+      clipPaths: [],
+      elements: [],
+      useStack: new Set([target]),
+      referenced: true
+    },
+    traversal,
+    paths
+  )
+  return {
+    id,
+    paths: paths.map((path) => ({
+      d: path.d,
+      fillRule: path.fillRule,
+      transform: path.transform,
+      visible: isSVGPathShown(path)
+    })),
+    units,
+    visible: presentationVisible(presentationFor(target, DEFAULT_PRESENTATION))
+  }
+}
+
+function collectPaths(
+  element: Element,
+  inherited: Scope,
+  traversal: Traversal,
+  result: IconPathInfo[]
+): void {
+  const tagName = element.localName || element.tagName
+  if (NON_RENDERED_CONTAINERS.has(tagName) && !inherited.referenced) return
+
+  const transform =
+    element === traversal.viewport
+      ? inherited.transform
+      : combinedTransform(inherited.transform, element)
+  const ownClipPath = collectClipPath(element.getAttribute('clip-path'), transform, traversal)
+  const clipPaths = ownClipPath ? [...inherited.clipPaths, ownClipPath] : inherited.clipPaths
+  const clip = ownClipPath ? clipPaths.length - 1 : null
+  const scope: Scope = {
+    ...inherited,
+    presentation: presentationFor(element, inherited.presentation),
+    transform,
+    clipPaths
+  }
+
+  if (tagName === 'text') {
+    const text = textInfo(element, scope, result.length)
+    if (text) {
+      const layer = elementLayer(traversal, element, 'shape', scope, clip)
+      traversal.texts.push({ ...text, elements: [...scope.elements, layer] })
+    }
+    return
+  }
+  if (SHAPE_NAMES.has(tagName)) {
+    appendShapePath(
+      tagName,
+      element,
+      scope,
+      elementLayer(traversal, element, 'shape', scope, clip),
+      result
+    )
+    return
+  }
+  // A group is a layer; another container only becomes one to keep its clip or opacity.
+  const layer = elementLayer(traversal, element, 'group', scope, clip)
+  const isLayer =
+    tagName === 'g' || clip !== null || (layer.opacity !== 1 && element !== traversal.root)
+  const childScope = isLayer ? { ...scope, elements: [...scope.elements, layer] } : scope
+  if (tagName === 'use') {
+    collectUsePaths(element, childScope, traversal, result)
+    return
+  }
+  for (const child of Array.from(element.childNodes)) {
+    if (isElement(child)) collectPaths(child, childScope, traversal, result)
+  }
+}
+
+function appendSVGElement(svgDocument: XMLDocument, parent: Element, input: SVGElementInput): void {
+  if (!/^[A-Za-z][\w:.-]*$/.test(input.type)) return
+  const element = svgDocument.createElementNS(SVG_NAMESPACE, input.type)
+  for (const [propName, value] of Object.entries(input.props)) {
+    if (typeof value !== 'string' && typeof value !== 'number') continue
+    const attributeName = JSX_ATTRIBUTE_NAMES[propName] ?? propName
+    element.setAttribute(attributeName, String(value))
+  }
+  if (input.type === 'path' && !element.hasAttribute('d') && typeof input.props.body === 'string') {
+    element.setAttribute('d', input.props.body)
+  }
+  for (const child of input.children) {
+    if (typeof child !== 'string') appendSVGElement(svgDocument, element, child)
+  }
+  parent.appendChild(element)
+}
+
+/** The shapes and text an SVG draws, in drawing order, and the gradients they paint with. */
+export interface SVGContent {
+  paths: IconPathInfo[]
+  texts: SVGTextInfo[]
+  gradients: SVGGradients
+}
+
+const NO_CONTENT: SVGContent = { paths: [], texts: [], gradients: new Map() }
+
+/** The one `<svg>` inside the wrapper root, which is the artwork's own outermost `<svg>`. */
+function outermostSVG(root: Element): Element | null {
+  const children = Array.from(root.childNodes).filter(isElement)
+  if (children.length !== 1) return null
+  const [only] = children
+  return (only.localName || only.tagName) === 'svg' ? only : null
+}
+
+function collectDocument(root: Element): SVGContent {
+  const elementsById = new Map<string, Element>()
+  for (const element of Array.from(root.getElementsByTagName('*'))) {
+    const id = element.getAttribute('id')
+    if (id) elementsById.set(id, element)
+  }
+  const paths: IconPathInfo[] = []
+  const traversal: Traversal = {
+    root,
+    viewport: outermostSVG(root),
+    elementsById,
+    nextKey: 0,
+    texts: []
+  }
+  collectPaths(
+    root,
+    {
+      presentation: DEFAULT_PRESENTATION,
+      transform: null,
+      clipPaths: [],
+      elements: [],
+      useStack: new Set(),
+      referenced: false
+    },
+    traversal,
+    paths
+  )
+  return { paths, texts: traversal.texts, gradients: parseSVGGradients(root) }
+}
+
+/** The content of SVG shapes given as parsed elements, such as design JSX `<svg>` children. */
+export function extractSVGContentFromElements(
+  elements: readonly SVGElementInput[],
+  rootProps: Readonly<Record<string, unknown>> = {}
+): SVGContent {
+  const svgDocument = new DOMImplementation().createDocument(SVG_NAMESPACE, 'svg')
+  const root = svgDocument.documentElement
+  if (!root) return NO_CONTENT
+  appendSVGElement(svgDocument, root, { type: 'svg', props: rootProps, children: elements })
+  return collectDocument(root)
+}
+
+/** The content of SVG markup, a whole `<svg>` or the shapes inside one. */
+export function extractSVGContent(svgBody: string): SVGContent {
+  const root = parseSVGFragment(svgBody)?.documentElement
+  return root ? collectDocument(root) : NO_CONTENT
+}
+
+/** Whether a shape shows: a hidden element hides everything in it, as a hidden layer does. */
+export function isSVGPathShown(path: Pick<IconPathInfo, 'elements'>): boolean {
+  return path.elements.every((element) => element.visible)
+}
+
+/** The shapes an SVG shows, for drawing it as one icon rather than importing its layers. */
+export function extractPaths(svgBody: string): IconPathInfo[] {
+  return extractSVGContent(svgBody).paths.filter(isSVGPathShown)
+}

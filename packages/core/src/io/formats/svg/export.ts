@@ -1,0 +1,594 @@
+import { compact } from 'es-toolkit'
+
+import {
+  getNodeRotationOrigin,
+  getWorldMatrix,
+  localTransformFromWorld
+} from '@open-pencil/scene-graph/coordinate'
+import { nodeHasRadius, nodeHasSmoothCorners } from '@open-pencil/scene-graph/corners'
+import { CSS_BLEND_MODE } from '@open-pencil/scene-graph/css'
+import Matrix from '@open-pencil/scene-graph/matrix'
+
+import { normalizeDashPattern } from '#core/canvas/strokes/draw'
+import { lineStrokePath } from '#core/canvas/strokes/line'
+import { fittedDashPattern } from '#core/canvas/strokes/sides'
+import { exportBounds } from '#core/io/formats/raster'
+
+import {
+  nextDefId,
+  drawnFills,
+  resolveFill,
+  solidFillOpacity,
+  svgStrokeAttrs,
+  type SVGExportContext
+} from './defs'
+import { layerEffects, withLayerEffects, type ExportEffectWarning } from './effects'
+import {
+  round,
+  geometryBlobToSVGPath,
+  makePolygonPoints,
+  roundedPolygonPath,
+  boxOutlinePath,
+  arcPath,
+  shapeWithTextOutlinePath
+} from './paths'
+
+export { geometryBlobToSVGPath, nodeOutlinePath, type OutlineNode } from './paths'
+
+import type {
+  ColorProfile,
+  Fill,
+  SceneGraph,
+  SceneNode,
+  Stroke,
+  VectorNetwork
+} from '@open-pencil/scene-graph'
+import { clipsChildren } from '@open-pencil/scene-graph/node-defaults'
+import {
+  hasRegionFills,
+  looseSegments,
+  regionSVGPaths
+} from '@open-pencil/scene-graph/vector-network'
+import { appendAll } from '@open-pencil/std/arrays'
+
+import { arrowHeadElements, openPathElements, vectorArrowHeads } from './arrows'
+import { booleanOutlines, type SVGBooleanOutlines } from './boolean/outline'
+import { renderMaskedChildren } from './masks'
+import { svg, svgElement, renderSVGNode } from './node'
+import type { SVGNode } from './node'
+import { fillOutlines, outlineElements } from './regions'
+import { alignedStroke, alignedStrokeElement, shapeWithTextDetailElements } from './strokes'
+import { renderTextNode } from './text/export'
+import type { SVGTextLayout } from './text/lines'
+
+// --- Node rendering ---
+
+/**
+ * A vector network's paths: its regions as they are traced, and its open segments as the canvas
+ * strokes them, rounded and pulled back under their heads.
+ */
+function networkElements(
+  node: SceneNode,
+  network: VectorNetwork,
+  common: Record<string, string | number | undefined>
+): SVGNode[] {
+  const regions = regionSVGPaths(network).map((d) => svg('path', { d, ...common }))
+  if (looseSegments(network).length === 0) return regions
+  return [...regions, ...openPathElements(node, network, common, looseSegments)]
+}
+
+type SVGAttrs = Record<string, string | number | undefined>
+
+function vectorShapeElements(
+  node: SceneNode,
+  common: SVGAttrs,
+  strokeAttrs: SVGAttrs,
+  ctx: SVGExportContext,
+  fallbackFills?: Fill[]
+): SVGNode[] {
+  const elements: SVGNode[] = []
+  const filled = fillOutlines(node)
+  // Saved stroke geometry draws the stroke below, filled; stroking the fill too would paint it twice.
+  const stroked =
+    node.strokeGeometry.length > 0 && !!strokeAttrs.stroke && strokeAttrs.stroke !== 'none'
+  const outline = stroked ? { ...common, stroke: 'none' } : common
+  appendAll(elements, outlineElements(node, filled?.outlines ?? [], outline, ctx, fallbackFills))
+  const network = node.vectorNetwork
+  if (network && !filled) appendAll(elements, networkElements(node, network, common))
+  // Traced regions leave the open segments, which the canvas strokes, to add here.
+  else if (network && filled?.traced && looseSegments(network).length > 0)
+    appendAll(elements, openPathElements(node, network, common, looseSegments))
+  if (stroked) {
+    for (const geo of node.strokeGeometry) {
+      const d = geometryBlobToSVGPath(geo.commandsBlob)
+      if (d) {
+        elements.push(
+          svg('path', {
+            d,
+            fill: strokeAttrs.stroke,
+            'fill-opacity': strokeAttrs['stroke-opacity'],
+            stroke: 'none'
+          })
+        )
+      }
+    }
+  }
+  if (node.vectorNetwork)
+    appendAll(elements, vectorArrowHeads(node, node.vectorNetwork, strokeAttrs))
+  return elements.length > 0
+    ? elements
+    : [svg('rect', { width: round(node.width), height: round(node.height), ...common })]
+}
+
+/** A line's dashes stretched along it as the canvas lays them, half a dash at each end. */
+function lineDashAttrs(stroke: Stroke | undefined, length: number) {
+  const fitted = fittedDashPattern(length, normalizeDashPattern(stroke?.dashPattern))
+  if (!fitted) return {}
+  return {
+    'stroke-dasharray': fitted.intervals.map((size) => round(size)).join(' '),
+    'stroke-dashoffset': round(fitted.offset)
+  }
+}
+
+function nodeShapeElements(
+  node: SceneNode,
+  fillAttr: string | null,
+  fillOpacity: number | undefined,
+  strokeAttrs: Record<string, string | number | undefined>,
+  ctx: SVGExportContext
+): SVGNode[] {
+  const common: Record<string, string | number | undefined> = {
+    fill: fillAttr ?? 'none',
+    'fill-opacity': fillOpacity,
+    ...strokeAttrs
+  }
+
+  switch (node.type) {
+    case 'ELLIPSE': {
+      // Saved geometry first, as the canvas and hit testing draw an ellipse.
+      if (node.fillGeometry.length > 0) return vectorShapeElements(node, common, strokeAttrs, ctx)
+      if (node.arcData) {
+        return [svg('path', { d: arcPath(node), ...common })]
+      }
+      return [
+        svg('ellipse', {
+          cx: round(node.width / 2),
+          cy: round(node.height / 2),
+          rx: round(node.width / 2),
+          ry: round(node.height / 2),
+          ...common
+        })
+      ]
+    }
+
+    case 'LINE': {
+      // Where the canvas strokes it: to one side of the line, with its caps inside its length.
+      const stroke = node.strokes.find((item) => item.visible)
+      const {
+        network,
+        from: start,
+        to: end
+      } = lineStrokePath(node, stroke?.weight ?? 0, stroke?.cap ?? node.strokeCap)
+      return [
+        svg('line', {
+          x1: round(start.x),
+          y1: round(start.y),
+          x2: round(end.x),
+          y2: round(end.y),
+          fill: 'none',
+          ...strokeAttrs,
+          ...lineDashAttrs(stroke, Math.hypot(end.x - start.x, end.y - start.y))
+        }),
+        ...arrowHeadElements(node, network, stroke, strokeAttrs)
+      ]
+    }
+
+    case 'STAR':
+    case 'POLYGON':
+      return node.cornerRadius > 0
+        ? [svg('path', { d: roundedPolygonPath(node), ...common })]
+        : [svg('polygon', { points: makePolygonPoints(node), ...common })]
+
+    case 'VECTOR':
+      return vectorShapeElements(node, common, strokeAttrs, ctx)
+
+    case 'SHAPE_WITH_TEXT':
+      return shapeWithTextElements(node, common, strokeAttrs, ctx)
+
+    case 'BOOLEAN_OPERATION': {
+      const outlines = booleanOutlines(node, ctx)
+      return outlines
+        ? outlineElements(node, outlines, common, ctx, undefined)
+        : [boxOutlineElement(node, common)]
+    }
+
+    default:
+      return [boxOutlineElement(node, common)]
+  }
+}
+
+/**
+ * A box layer's outline as one element: a rect, a rect with `rx`/`ry` for one radius, or the
+ * shared box path for independent or smoothed corners, so fills and clips follow the same edge.
+ */
+function boxOutlineElement(
+  node: SceneNode,
+  attrs: Record<string, string | number | undefined>
+): SVGNode {
+  const width = round(node.width)
+  const height = round(node.height)
+  if (!nodeHasRadius(node)) return svg('rect', { width, height, ...attrs })
+  if (node.independentCorners || nodeHasSmoothCorners(node)) {
+    return svg('path', { d: boxOutlinePath(node), ...attrs })
+  }
+  // SVG clamps rx and ry to their own sides; the canvas keeps a too-large radius circular.
+  const radius = round(Math.min(node.cornerRadius, node.width / 2, node.height / 2))
+  return svg('rect', { width, height, rx: radius, ry: radius, ...attrs })
+}
+
+/**
+ * A FigJam shape's outline, and its inner lines, such as a database's front rim, stroked as the
+ * canvas strokes them: at the stroke's own weight, ending where the outline does.
+ */
+function shapeWithTextElements(
+  node: SceneNode,
+  common: Record<string, string | number | undefined>,
+  strokeAttrs: Record<string, string | number | undefined>,
+  ctx: SVGExportContext
+): SVGNode[] {
+  return [
+    svg('path', { d: shapeWithTextOutlinePath(node), ...common }),
+    ...shapeWithTextDetailElements(node, strokeAttrs, ctx)
+  ]
+}
+
+// --- Main recursive renderer ---
+
+function buildTransformAttr(node: SceneNode): string | undefined {
+  const transforms: string[] = []
+  if (node.x !== 0 || node.y !== 0) transforms.push(`translate(${round(node.x)}, ${round(node.y)})`)
+  if (node.flipX || node.flipY) {
+    const tx = node.flipX ? node.width : 0
+    const ty = node.flipY ? node.height : 0
+    const sx = node.flipX ? -1 : 1
+    const sy = node.flipY ? -1 : 1
+    transforms.push(`translate(${round(tx)}, ${round(ty)}) scale(${sx}, ${sy})`)
+  }
+  if (node.rotation !== 0) {
+    const pivot = getNodeRotationOrigin(node)
+    transforms.push(`rotate(${round(node.rotation)}, ${round(pivot.x)}, ${round(pivot.y)})`)
+  }
+  return transforms.length > 0 ? transforms.join(' ') : undefined
+}
+
+function buildGroupAttrs(
+  node: SceneNode,
+  ctx: SVGExportContext
+): { attrs: Record<string, string | number | undefined>; clipId?: string } {
+  const attrs: Record<string, string | number | undefined> = {}
+
+  const transform = buildTransformAttr(node)
+  if (transform) attrs.transform = transform
+
+  if (node.opacity < 1) attrs.opacity = round(node.opacity)
+
+  const blend = CSS_BLEND_MODE[node.blendMode]
+  if (blend && blend !== 'normal' && node.blendMode !== 'PASS_THROUGH') {
+    attrs.style = `mix-blend-mode: ${blend}`
+  }
+
+  let clipId: string | undefined
+  if (clipsChildren(node) && node.childIds.length > 0) {
+    clipId = nextDefId(ctx, 'clip')
+    ctx.defs.push(svg('clipPath', { id: clipId }, boxOutlineElement(node, {})))
+  }
+
+  return { attrs, clipId }
+}
+
+function hasPathLevelFills(node: SceneNode): boolean {
+  return node.type === 'VECTOR' && hasRegionFills(node.vectorNetwork)
+}
+
+function buildShapeChildren(
+  node: SceneNode,
+  visibleFills: Fill[],
+  fillAttr: string | null,
+  fillOpacity: number | undefined,
+  strokeAttrs: Record<string, string | number | undefined>,
+  visibleStrokes: Stroke[],
+  ctx: SVGExportContext
+): SVGNode[] {
+  const aligned = hasPathLevelFills(node) ? null : alignedStroke(node, visibleStrokes[0], ctx)
+  if (!aligned) {
+    return fillAndStrokeElements(
+      node,
+      visibleFills,
+      fillAttr,
+      fillOpacity,
+      strokeAttrs,
+      visibleStrokes.length,
+      ctx
+    )
+  }
+  // The fill goes as it is, and the stroke over it inside or outside the outline.
+  return [
+    ...fillAndStrokeElements(node, visibleFills, fillAttr, fillOpacity, {}, 0, ctx),
+    ...alignedStrokeElement(node, aligned, strokeAttrs, ctx),
+    ...(node.type === 'SHAPE_WITH_TEXT' ? shapeWithTextDetailElements(node, strokeAttrs, ctx) : [])
+  ]
+}
+
+function fillAndStrokeElements(
+  node: SceneNode,
+  visibleFills: Fill[],
+  fillAttr: string | null,
+  fillOpacity: number | undefined,
+  strokeAttrs: Record<string, string | number | undefined>,
+  visibleStrokeCount: number,
+  ctx: SVGExportContext
+): SVGNode[] {
+  if (hasPathLevelFills(node)) {
+    return vectorShapeElements(
+      node,
+      { fill: fillAttr ?? 'none', 'fill-opacity': fillOpacity, ...strokeAttrs },
+      strokeAttrs,
+      ctx,
+      visibleFills
+    )
+  }
+
+  // A shape painted once per fill SVG can draw; with none, it draws below as one without fills.
+  const drawn = visibleFills.length > 1 ? drawnFills(visibleFills, node, ctx) : []
+  if (drawn.length > 0) {
+    return drawn.flatMap(({ fill, paint }, index) =>
+      nodeShapeElements(
+        node,
+        paint,
+        solidFillOpacity(fill, ctx.colors),
+        index === drawn.length - 1 ? strokeAttrs : {},
+        ctx
+      )
+    )
+  }
+
+  const hasFillOrStroke = fillAttr || visibleStrokeCount > 0
+  if (hasFillOrStroke && !isGroupLike(node)) {
+    return nodeShapeElements(node, fillAttr, fillOpacity, strokeAttrs, ctx)
+  }
+
+  return []
+}
+
+/** The paint CSS `color` sets, for a tinted icon path. */
+const CURRENT_COLOR = 'currentColor'
+
+/** A paint's SVG color and, for an sRGB solid, the `fill-opacity` beside it. */
+function exportedFill(
+  fill: Fill | undefined,
+  node: SceneNode,
+  ctx: SVGExportContext
+): { color: string | null; opacity: number | undefined } {
+  if (!fill) return { color: null, opacity: undefined }
+  return {
+    color: resolveFill(fill, node, ctx),
+    opacity: solidFillOpacity(fill, ctx.colors)
+  }
+}
+
+function renderNode(node: SceneNode, ctx: SVGExportContext): SVGNode | null {
+  if (!node.visible) return null
+  // A layer without a name has nothing to be found by.
+  if (!ctx.layerIds || !node.name) return drawNode(node, ctx)
+  // Parents take their names before their children, so a repeated name counts in layer order.
+  const id = layerId(node.name, ctx.layerIds)
+  const drawn = drawNode(node, ctx)
+  if (!drawn) return null
+  // A layer drawn as its only child's element keeps that child's id and gets its own group.
+  if ('id' in drawn.attrs) return svg('g', { id }, drawn)
+  return { ...drawn, attrs: { id, ...drawn.attrs } }
+}
+
+/**
+ * A layer's name as an element id, numbered from `_2` when an earlier layer has it, as Figma does,
+ * and past any id already given out.
+ */
+function layerId(name: string, ids: NonNullable<SVGExportContext['layerIds']>): string {
+  let count = ids.names.get(name) ?? 0
+  let id: string
+  do {
+    count += 1
+    id = count === 1 ? name : `${name}_${count}`
+  } while (ids.taken.has(id))
+  ids.names.set(name, count)
+  ids.taken.add(id)
+  return id
+}
+
+function drawNode(node: SceneNode, ctx: SVGExportContext): SVGNode | null {
+  const effects = layerEffects(node, ctx)
+  const { attrs: groupAttrs, clipId } = buildGroupAttrs(node, ctx)
+
+  if (node.type === 'TEXT') {
+    const fill = exportedFill(
+      node.fills.find((f) => f.visible),
+      node,
+      ctx
+    )
+    const text = renderTextNode(node, fill.color, ctx, fill.opacity)
+    return svgElement('g', groupAttrs, withLayerEffects([text], effects, groupAttrs))
+  }
+
+  const visibleFills = node.fills.filter((f) => f.visible)
+  const visibleStrokes = node.strokes.filter((s) => s.visible)
+  const tint = ctx.tint?.(node) ?? []
+  const ownFill = visibleFills.length > 0 && !hasPathLevelFills(node) ? visibleFills[0] : undefined
+  const fill = exportedFill(ownFill, node, ctx)
+  const tintedFill = fill.color !== null && tint.includes('fill')
+  const fillAttr = tintedFill ? CURRENT_COLOR : fill.color
+  // `currentColor` has no alpha. Display P3 normally bakes solid opacity into the color, which a
+  // tint throws away, so a tinted solid keeps `fill-opacity` in every color space.
+  const fillOpacity = ownFill ? solidFillOpacity(ownFill, ctx.colors, tintedFill) : fill.opacity
+  const ownStrokes = svgStrokeAttrs(visibleStrokes, ctx.colors, node.strokeCap)
+  const strokeAttrs =
+    ownStrokes.stroke && tint.includes('stroke')
+      ? { ...ownStrokes, stroke: CURRENT_COLOR }
+      : ownStrokes
+
+  const children: (SVGNode | null)[] = buildShapeChildren(
+    node,
+    visibleFills,
+    fillAttr,
+    fillOpacity,
+    strokeAttrs,
+    visibleStrokes,
+    ctx
+  )
+
+  // A boolean operation draws its combined shape, not its operands.
+  const childNodes = booleanOutlines(node, ctx) ? [] : ctx.graph.getChildren(node.id)
+  const childContent = renderMaskedChildren(childNodes, ctx, renderNode)
+
+  if (clipId && childContent.length > 0) {
+    children.push(svgElement('g', { 'clip-path': `url(#${clipId})` }, childContent))
+  } else {
+    appendAll(children, childContent)
+  }
+
+  const validChildren = withLayerEffects(compact(children), effects, groupAttrs)
+
+  if (validChildren.length === 0 && Object.keys(groupAttrs).length === 0) {
+    return null
+  }
+
+  if (validChildren.length === 1 && Object.keys(groupAttrs).length === 0) {
+    return validChildren[0]
+  }
+
+  return svgElement('g', groupAttrs, validChildren)
+}
+
+function isGroupLike(node: SceneNode): boolean {
+  return node.type === 'GROUP'
+}
+
+// --- Public API ---
+
+export interface SVGExportOptions {
+  /** Include XML declaration (default: true) */
+  xmlDeclaration?: boolean
+  /** The profile the SVG writes colors in; the document's own unless given. */
+  colorSpace?: ColorProfile
+  /** Receives each effect the export leaves out because SVG cannot draw it, such as glass. */
+  onWarning?: (warning: ExportEffectWarning) => void
+  /**
+   * Line breaks of text nodes as the editor laid them out, wraps included. Without them, only
+   * explicit newlines start a new baseline, which renderers that do not wrap SVG text keep.
+   */
+  textLayout?: SVGTextLayout
+  /** Combined shapes of boolean operations. Without them, saved fill geometry stands in. */
+  booleanOutlines?: SVGBooleanOutlines
+  /** Each layer's name as its element's `id`, as Figma's "Include id attribute" writes it. */
+  layerIds?: boolean
+  /** Size the drawing to the layers' boxes rather than to everything they draw. */
+  useAbsoluteBounds?: boolean
+}
+
+export function renderNodesToSVG(
+  graph: SceneGraph,
+  _pageId: string,
+  nodeIds: string[],
+  options: SVGExportOptions = {}
+): string | null {
+  const bounds = exportBounds(graph, nodeIds, options.useAbsoluteBounds)
+  if (!bounds) return null
+
+  const { minX, minY, maxX, maxY } = bounds
+  const width = round(maxX - minX)
+  const height = round(maxY - minY)
+
+  const ctx: SVGExportContext = {
+    defs: [],
+    defIdCounter: 0,
+    graph,
+    colors: {
+      from: graph.documentColorSpace,
+      to: options.colorSpace ?? graph.documentColorSpace
+    },
+    onWarning: options.onWarning,
+    textLayout: options.textLayout,
+    booleanOutlines: options.booleanOutlines,
+    layerIds: options.layerIds ? { names: new Map(), taken: new Set() } : undefined
+  }
+
+  const contentNodes: SVGNode[] = []
+  const drawingOrigin = Matrix.translated(minX, minY)
+
+  for (const id of nodeIds) {
+    const node = graph.getNode(id)
+    if (!node?.visible) continue
+
+    const placed = {
+      ...node,
+      ...localTransformFromWorld(node, getWorldMatrix(node, graph), drawingOrigin)
+    }
+    const rendered = renderNode(placed, ctx)
+    if (rendered) contentNodes.push(rendered)
+  }
+
+  if (contentNodes.length === 0) return null
+
+  const rootChildren: (SVGNode | string)[] = []
+  if (ctx.defs.length > 0) {
+    rootChildren.push(svgElement('defs', {}, ctx.defs))
+  }
+  appendAll(rootChildren, contentNodes)
+
+  const root = svgElement(
+    'svg',
+    {
+      xmlns: 'http://www.w3.org/2000/svg',
+      'xmlns:xlink': 'http://www.w3.org/1999/xlink',
+      width,
+      height,
+      viewBox: `0 0 ${width} ${height}`
+    },
+    rootChildren
+  )
+
+  const svgStr = renderSVGNode(root)
+  const xmlDecl = options.xmlDeclaration !== false ? '<?xml version="1.0" encoding="UTF-8"?>\n' : ''
+  return xmlDecl + svgStr
+}
+
+/**
+ * One layer as an `<svg>` element sized to its box, for inlining in HTML where the box already
+ * places, rotates, and fades it: the drawing starts at the layer's origin without its rotation
+ * or opacity, and keeps its flips.
+ */
+export function renderNodeSVGElement(
+  graph: SceneGraph,
+  node: SceneNode,
+  {
+    idPrefix,
+    colorSpace = graph.documentColorSpace,
+    tint
+  }: Pick<SVGExportOptions, 'colorSpace'> &
+    Partial<Pick<SVGExportContext, 'tint'>> & {
+      idPrefix: string
+    }
+): SVGNode | null {
+  const colors = { from: graph.documentColorSpace, to: colorSpace }
+  const ctx: SVGExportContext = { defs: [], defIdCounter: 0, graph, colors, idPrefix, tint }
+  const drawn = renderNode({ ...node, x: 0, y: 0, rotation: 0, opacity: 1 }, ctx)
+  if (!drawn) return null
+  // A straight line has no height or width, but its stroke still needs a viewport to draw in.
+  const width = Math.max(1, round(node.width))
+  const height = Math.max(1, round(node.height))
+  return svg(
+    'svg',
+    { width, height, viewBox: `0 0 ${width} ${height}` },
+    ctx.defs.length > 0 ? svgElement('defs', {}, ctx.defs) : null,
+    drawn
+  )
+}

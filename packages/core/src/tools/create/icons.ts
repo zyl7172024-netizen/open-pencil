@@ -1,0 +1,158 @@
+import * as v from 'valibot'
+
+import { parseColor } from '@open-pencil/scene-graph/color'
+import { iconOptionsSchema } from '@open-pencil/scene-graph/icons'
+
+import { graphOf } from '#core/figma-api/graph'
+import { prepareSlotInsertion } from '#core/figma-api/slots'
+import { placeIcon } from '#core/icons'
+import { layoutLength, toolNumber, defineTool } from '#core/tools/schema'
+
+export const fetchIconsTool = defineTool({
+  name: 'get_icons',
+  exposure: { webmcp: false },
+  description:
+    'Pre-fetch icons from Iconify into cache. Batches by prefix (one HTTP request per set). Call this once with all needed icons, then use insert_icon to place them instantly. Popular sets: lucide (outline), mdi (filled), heroicons, tabler, solar, mingcute, ri (remix).',
+  execution: { kind: 'async', mutation: 'none' },
+  capabilities: ['network:access'],
+  input: v.strictObject({
+    names: v.pipe(
+      v.array(v.string()),
+      v.minLength(1),
+      v.description('Icon names as prefix:name (e.g. ["lucide:heart", "lucide:home", "mdi:star"])')
+    ),
+    size: v.optional(layoutLength('Icon size in pixels (default: 24)', 1))
+  }),
+  execute: async (figma, args) => {
+    const size = args.size ?? 24
+    try {
+      const icons = await figma.icons.icons(args.names, size)
+      const fetched = [...icons.keys()]
+      const notFound = args.names.filter((name) => !icons.has(name))
+      const result: Record<string, unknown> = { fetched, count: fetched.length }
+      if (notFound.length > 0) result.not_found = notFound
+      return result
+    } catch (e) {
+      return { error: (e as Error).message }
+    }
+  }
+})
+
+export const insertIcon = defineTool({
+  name: 'insert_icon',
+
+  description:
+    'Insert one or more vector icons onto the canvas. Pass a single name or multiple names to batch-insert into the same parent. If already cached by get_icons — instant, no network request.',
+  execution: { kind: 'async', mutation: 'document' },
+  capabilities: ['document:write', 'network:access'],
+  input: v.strictObject({
+    names: v.optional(
+      v.pipe(
+        v.array(v.string()),
+        v.minLength(1),
+        v.description(
+          'Icon names as prefix:name (e.g. ["lucide:heart"] or ["lucide:heart","lucide:home","lucide:star"])'
+        )
+      )
+    ),
+    name: v.optional(
+      v.pipe(v.string(), v.description('Single icon name (shorthand for names with one icon)'))
+    ),
+    size: v.optional(layoutLength('Icon size in pixels (default: 24)', 1)),
+    color: v.optional(
+      v.pipe(v.string(), v.description('Icon color hex (replaces currentColor). Default: #000000'))
+    ),
+    parent_id: v.optional(v.pipe(v.string(), v.description('Parent node ID for all icons'))),
+    options: v.optional(
+      v.pipe(
+        iconOptionsSchema,
+        v.description(
+          'How sets drawn from their own sources draw the icons; other sets ignore it. Material Symbols (material-symbols-outlined, -rounded, -sharp): wght 100–700, FILL 0 or 1, GRAD -50–200, opsz 20–48 (follows size when left out). SF Symbols (sf-symbols, macOS desktop only): weight ultralight…black, scale small|medium|large, rendering monochrome|hierarchical|palette|multicolor, variable 0–1 for symbols with variable color, and secondary and tertiary as #rrggbb for palette. E.g. {"wght":600,"FILL":1}'
+        )
+      )
+    )
+  }),
+  execute: async (figma, args) => {
+    const names = args.names ?? (args.name ? [args.name] : [])
+    if (names.length === 0) return { error: 'Provide "names" (array) or "name" (string)' }
+
+    const size = args.size ?? 24
+    const color = args.color ?? '#000000'
+
+    let icons
+    try {
+      icons = await graphOf(figma).waitOutsideEdit(figma.icons.icons(names, size, args.options))
+    } catch (e) {
+      return { error: (e as Error).message }
+    }
+
+    const inserted: { id: string; name: string; icon: string }[] = []
+    const notFound: string[] = []
+
+    // Read after the lookup, beside the inserts, so a profile changed meanwhile is the one used.
+    const parsedColor = parseColor(color, graphOf(figma).documentColorSpace)
+    const parentId = args.parent_id ?? figma.currentPage.id
+    prepareSlotInsertion(graphOf(figma), parentId, 'insert_icon')
+    for (const name of names) {
+      const icon = icons.get(name)
+      if (!icon || icon.paths.length === 0) {
+        notFound.push(name)
+        continue
+      }
+      const frame = placeIcon(graphOf(figma), parentId, icon, { size, color: parsedColor })
+      inserted.push({ id: frame.id, name: frame.name, icon: name })
+    }
+
+    if (args.name && inserted.length === 1) {
+      return { id: inserted[0].id, name: inserted[0].name, type: 'FRAME' as const }
+    }
+
+    const result: Record<string, unknown> = { inserted }
+    if (notFound.length > 0) result.not_found = notFound
+    return result
+  }
+})
+
+export const searchIconsTool = defineTool({
+  name: 'search_icons',
+  exposure: { webmcp: false },
+  description:
+    'Search Iconify for icons by keyword. Accepts multiple queries — all searched in parallel. Returns results keyed by query.',
+  execution: { kind: 'async', mutation: 'none' },
+  capabilities: ['network:access'],
+  input: v.strictObject({
+    queries: v.pipe(
+      v.array(v.string()),
+      v.minLength(1),
+      v.description('Search keywords (e.g. ["heart", "arrow", "settings"])')
+    ),
+    limit: v.optional(
+      toolNumber(
+        v.pipe(
+          v.number(),
+          v.minValue(1),
+          v.maxValue(100),
+          v.description('Max results per query (default: 5)')
+        )
+      )
+    ),
+    prefix: v.optional(
+      v.pipe(v.string(), v.description('Filter by icon set prefix (e.g. "lucide", "mdi")'))
+    )
+  }),
+  execute: async (figma, args) => {
+    try {
+      const options = { limit: args.limit ?? 5, prefix: args.prefix }
+      const results = await Promise.all(
+        args.queries.map(
+          async (query) => [query, await figma.icons.search(query, options)] as const
+        )
+      )
+      return Object.fromEntries(
+        results.map(([query, result]) => [query, { icons: result.icons, total: result.total }])
+      )
+    } catch (e) {
+      return { error: (e as Error).message }
+    }
+  }
+})

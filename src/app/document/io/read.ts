@@ -1,0 +1,187 @@
+import { filename } from 'pathe/utils'
+
+import { resolveEditorProfile, type Editor } from '@open-pencil/core'
+import { stopFigReaderWorker } from '@open-pencil/core/io/formats/fig'
+import { errorMessage } from '@open-pencil/std/errors'
+import { nextFrame } from '@open-pencil/vue/shared/frame'
+
+import { describeDiagnosticError, recordDocumentFailure } from '@/app/diagnostics'
+import { viewDiagnosticsAction } from '@/app/diagnostics/view'
+import { readFigDocument } from '@/app/document/io/fig'
+import { applyImportedDocument } from '@/app/document/io/imported-document'
+import { readReloadSource } from '@/app/document/io/reload-source'
+import { captureReloadState, restoreReloadState } from '@/app/document/io/reload-state'
+import type { NamedDocumentState, OpenFileOptions } from '@/app/document/io/state'
+import type { EditorPreparationController } from '@/app/editor/preparation/controller'
+import { notificationMessages } from '@/app/i18n/notifications'
+import { toast } from '@/app/shell/ui'
+
+type ReloadActionsOptions = {
+  editor: Editor
+  state: NamedDocumentState
+  getFilePath: () => string | null
+  getFileHandle: () => FileSystemFileHandle | null
+  hasUnsavedChanges: () => boolean
+  markDocumentSaved: () => void
+  preparationController: EditorPreparationController
+}
+
+export function createOpenActions({
+  editor,
+  state,
+  setDocumentSource,
+  fitCurrentPageToViewport,
+  preparationController
+}: OpenFileOptions) {
+  async function openFigFile(file: File, handle?: FileSystemFileHandle, path?: string) {
+    const load = preparationController.begin({ kind: 'document-open', subject: file.name })
+    let succeeded = false
+    try {
+      load.update({ phase: 'reading', detail: file.name })
+      await nextFrame()
+      load.update({ phase: 'decoding', detail: file.name })
+      const imported = await readFigDocument(file, load.signal)
+      await nextFrame()
+      load.update({ phase: 'materializing', detail: file.name })
+      await applyImportedDocument(editor, imported, load)
+      // Into a reused tab too, the document opens with the panels its kind starts with.
+      state.showUI = resolveEditorProfile(editor.state).panelsOpen
+      state.documentName = filename(file.name) ?? file.name
+      setDocumentSource(file.name, 'fig', handle, path)
+      await fitCurrentPageToViewport()
+      load.update({ phase: 'preparing-render', detail: state.documentName })
+      editor.requestRender()
+      // The document is open by now: a canvas that cannot show it fails the render, not the read.
+      await preparationController
+        .waitForPresentation(load.id, editor.state)
+        .catch((error: unknown) => {
+          const message = errorMessage(error)
+          load.fail({ code: 'render-failed', message, retryable: true })
+          toast.error(notificationMessages.get().operationFailed({ error: message }))
+        })
+      succeeded = true
+    } catch (e) {
+      if (load.signal.aborted) return
+      const diagnostic = describeDiagnosticError(e)
+      load.fail({
+        code: 'decode-failed',
+        message: errorMessage(e),
+        retryable: diagnostic.retryable ?? true
+      })
+      recordDocumentFailure({
+        operation: 'open',
+        format: 'fig',
+        ...diagnostic,
+        retryable: diagnostic.retryable
+      })
+      console.error('Failed to open .fig file:', e)
+      toast.error(
+        notificationMessages.get().openFileFailed({
+          name: file.name,
+          error: errorMessage(e)
+        }),
+        viewDiagnosticsAction()
+      )
+    } finally {
+      if (succeeded) load.complete()
+    }
+  }
+
+  return { openFigFile }
+}
+
+export function createReloadActions({
+  editor,
+  state,
+  getFilePath,
+  getFileHandle,
+  hasUnsavedChanges,
+  markDocumentSaved,
+  preparationController
+}: ReloadActionsOptions) {
+  /**
+   * The file changed on disk while the document holds edits: they are kept, as VS Code keeps them,
+   * and the person may reload, which discards them.
+   */
+  function offerReload() {
+    const messages = notificationMessages.get()
+    const path = getFilePath()
+    const handle = getFileHandle()
+    const action = {
+      label: messages.reloadDiscardingChanges,
+      run: (toastId: number) => {
+        toast.remove(toastId)
+        // An offer for a file the document has since left, as after Save As, reloads nothing.
+        if (getFilePath() !== path || getFileHandle() !== handle) return
+        void reload()
+      }
+    }
+    toast.warning(messages.fileChangedOnDisk({ name: state.documentName }), action, {
+      sticky: true
+    })
+  }
+
+  async function reloadFromDisk() {
+    if (hasUnsavedChanges()) {
+      offerReload()
+      return
+    }
+    await reload()
+  }
+
+  async function reload() {
+    const load = preparationController.begin({
+      kind: 'document-reload',
+      subject: state.documentName
+    })
+    let succeeded = false
+    try {
+      const snapshot = captureReloadState(state)
+      // A large document does not fit in a page twice: the open one's reader worker stops first,
+      // and it keeps loading pages and writing its archive from the copy this thread holds.
+      stopFigReaderWorker(editor.graph)
+      load.update({ phase: 'reading', detail: state.documentName })
+      const imported = await readReloadSource({
+        filePath: getFilePath(),
+        fileHandle: getFileHandle(),
+        signal: load.signal
+      })
+      if (!imported) {
+        succeeded = true
+        return
+      }
+      await applyImportedDocument(editor, imported, load)
+      // Saved as read, before the page it showed loads: an edit made while it loads, such as a
+      // page rename, is not in the file.
+      markDocumentSaved()
+      await restoreReloadState(editor, state, snapshot)
+      editor.requestRender()
+      succeeded = true
+    } catch (error) {
+      if (load.signal.aborted) return
+      const diagnostic = describeDiagnosticError(error)
+      load.fail({
+        code: 'decode-failed',
+        message: errorMessage(error),
+        retryable: diagnostic.retryable ?? true
+      })
+      recordDocumentFailure({
+        operation: 'open',
+        format: 'fig',
+        ...diagnostic,
+        retryable: diagnostic.retryable
+      })
+      toast.error(
+        notificationMessages.get().openFileFailed({
+          name: state.documentName,
+          error: errorMessage(error)
+        }),
+        viewDiagnosticsAction()
+      )
+    } finally {
+      if (succeeded) load.complete()
+    }
+  }
+
+  return { reloadFromDisk }
+}

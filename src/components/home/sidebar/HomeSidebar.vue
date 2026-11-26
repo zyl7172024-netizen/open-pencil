@@ -1,0 +1,227 @@
+<script setup lang="ts">
+import {
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuLabel,
+  DropdownMenuPortal,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger
+} from 'reka-ui'
+import { computed } from 'vue'
+
+import { useMessages } from '@open-pencil/vue/i18n'
+
+import AccountAvatar from '@/components/presence/AccountAvatar.vue'
+import IconButton from '@/components/ui/button/IconButton.vue'
+import AppSkeleton from '@/components/ui/feedback/AppSkeleton.vue'
+import { sideList } from '@/components/ui/list/side-list'
+import AppDropdownMenuRoot from '@/components/ui/menu/AppDropdownMenuRoot.vue'
+import { menu } from '@/components/ui/menu/menu'
+import Tip from '@/components/ui/overlay/Tip.vue'
+
+import type { HomeCloudAccount, HomeLocation } from '../cloud/types'
+
+/**
+ * Where the home tab can show documents from: recent files, each Cloud workspace of the signed-in
+ * account, documents shared with that account, its Trash, and the configured storage bucket.
+ */
+const {
+  active,
+  account = null,
+  workspaces = [],
+  sharedCount = 0,
+  storage = null,
+  cloud = true,
+  checking = false
+} = defineProps<{
+  active: HomeLocation
+  /** The build has Cloud, so its sign-in and workspaces have a place. */
+  cloud?: boolean
+  /** Cloud has yet to say whether this app is signed in, so neither its places nor sign-in show. */
+  checking?: boolean
+  account?: HomeCloudAccount | null
+  workspaces?: {
+    id: string
+    name: string
+    documentCount?: number
+    attention?: boolean
+    /** Anyone may open what is in it, as in the server's community gallery. */
+    public?: boolean
+  }[]
+  sharedCount?: number
+  /** The configured storage bucket, or null when no storage is set up. */
+  storage?: { label: string; detail: string } | null
+}>()
+
+const emit = defineEmits<{
+  select: [location: HomeLocation]
+  connect: []
+  openAccount: []
+  storageSettings: []
+  switchServer: []
+  newWorkspace: []
+  signOut: []
+}>()
+
+const ui = sideList()
+const menuUI = menu()
+const t = useMessages('cloud/editor')
+const isActive = (location: HomeLocation) =>
+  active.kind === location.kind && active.id === location.id
+const workspaceLocations = computed(() =>
+  workspaces.map((workspace) => ({
+    ...workspace,
+    location: { kind: 'workspace', id: workspace.id } satisfies HomeLocation
+  }))
+)
+</script>
+
+<template>
+  <nav :class="ui.root()" :aria-label="t.homeLocations">
+    <div :class="ui.group()">
+      <button
+        type="button"
+        :class="ui.item()"
+        :data-active="isActive({ kind: 'recent', id: 'recent' })"
+        @click="emit('select', { kind: 'recent', id: 'recent' })"
+      >
+        <icon-lucide-clock :class="ui.icon()" />
+        <span :class="ui.label()">{{ t.homeRecent }}</span>
+      </button>
+    </div>
+
+    <div v-if="cloud" :class="ui.group()">
+      <div :class="ui.header()">
+        <span :class="ui.title()">{{ t.productName }}</span>
+        <div v-if="account" :class="ui.actions()">
+          <IconButton :label="t.homeNewWorkspace" @click="emit('newWorkspace')">
+            <icon-lucide-plus class="size-3.5" />
+          </IconButton>
+          <AppDropdownMenuRoot :modal="false">
+            <DropdownMenuTrigger as-child>
+              <IconButton :label="t.homeAccount({ email: account.email })">
+                <icon-lucide-ellipsis class="size-3.5" />
+              </IconButton>
+            </DropdownMenuTrigger>
+            <DropdownMenuPortal>
+              <DropdownMenuContent
+                side="bottom"
+                align="end"
+                :side-offset="4"
+                :class="[menuUI.content(), 'w-56']"
+              >
+                <DropdownMenuLabel :class="[menuUI.label(), 'flex items-center gap-2 pb-1.5']">
+                  <AccountAvatar :id="account.id" :name="account.name" :image="account.image" />
+                  <span class="min-w-0">
+                    <span class="block truncate text-xs text-surface">{{ account.name }}</span>
+                    <span class="block truncate">{{ account.email }}</span>
+                    <span class="block truncate">{{ account.host }}</span>
+                  </span>
+                </DropdownMenuLabel>
+                <DropdownMenuSeparator :class="menuUI.separator()" />
+                <DropdownMenuItem
+                  :class="menuUI.item({ justify: 'start' })"
+                  @select="emit('openAccount')"
+                >
+                  <icon-lucide-external-link :class="menuUI.icon()" />
+                  {{ t.homeAccountSettings }}
+                </DropdownMenuItem>
+                <DropdownMenuItem
+                  :class="menuUI.item({ justify: 'start' })"
+                  @select="emit('switchServer')"
+                >
+                  <icon-lucide-server :class="menuUI.icon()" />
+                  {{ t.homeConnectAnotherServer }}
+                </DropdownMenuItem>
+                <DropdownMenuSeparator :class="menuUI.separator()" />
+                <DropdownMenuItem
+                  :class="menuUI.item({ justify: 'start' })"
+                  @select="emit('signOut')"
+                >
+                  <icon-lucide-log-out :class="menuUI.icon()" />
+                  {{ t.signOut }}
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenuPortal>
+          </AppDropdownMenuRoot>
+        </div>
+      </div>
+      <div :class="ui.items()">
+        <template v-if="account">
+          <button
+            v-for="workspace in workspaceLocations"
+            :key="workspace.id"
+            type="button"
+            :class="ui.item()"
+            :data-active="isActive(workspace.location)"
+            @click="emit('select', workspace.location)"
+          >
+            <Tip v-if="workspace.public" :label="t.savePublicHeading">
+              <icon-lucide-globe :class="ui.icon()" role="img" :aria-label="t.savePublicLabel" />
+            </Tip>
+            <icon-lucide-layers v-else :class="ui.icon()" />
+            <span :class="ui.label()">{{ workspace.name }}</span>
+            <span :class="ui.trailing()">
+              <Tip v-if="workspace.attention" :label="t.homeAttentionTip">
+                <icon-lucide-git-compare-arrows
+                  :class="ui.attention()"
+                  role="img"
+                  :aria-label="t.homeNeedsAttention"
+                />
+              </Tip>
+              <template v-else>{{ workspace.documentCount }}</template>
+            </span>
+          </button>
+          <button
+            type="button"
+            :class="ui.item()"
+            :data-active="isActive({ kind: 'shared', id: 'shared' })"
+            @click="emit('select', { kind: 'shared', id: 'shared' })"
+          >
+            <icon-lucide-users :class="ui.icon()" />
+            <span :class="ui.label()">{{ t.homeSharedWithYou }}</span>
+            <span v-if="sharedCount" :class="ui.trailing()">{{ sharedCount }}</span>
+          </button>
+          <button
+            type="button"
+            :class="ui.item()"
+            :data-active="isActive({ kind: 'trash', id: 'trash' })"
+            @click="emit('select', { kind: 'trash', id: 'trash' })"
+          >
+            <icon-lucide-trash-2 :class="ui.icon()" />
+            <span :class="ui.label()">{{ t.homeTrash }}</span>
+          </button>
+        </template>
+        <div v-else-if="checking" :class="ui.item()" role="status" :aria-label="t.checkingServer">
+          <AppSkeleton class="size-3.5 shrink-0" />
+          <AppSkeleton class="w-28" />
+        </div>
+        <button v-else type="button" :class="ui.item()" @click="emit('connect')">
+          <icon-lucide-log-in :class="ui.icon()" />
+          <span :class="ui.label()">{{ t.homeSignIn }}</span>
+        </button>
+      </div>
+    </div>
+
+    <div v-if="storage" :class="ui.group()">
+      <div :class="ui.header()">
+        <span :class="ui.title()">{{ t.homeStorage }}</span>
+        <IconButton :label="t.homeStorageSettings" @click="emit('storageSettings')">
+          <icon-lucide-settings-2 class="size-3.5" />
+        </IconButton>
+      </div>
+      <div :class="ui.items()">
+        <button
+          type="button"
+          :class="ui.item()"
+          :data-active="isActive({ kind: 'storage', id: 'storage' })"
+          @click="emit('select', { kind: 'storage', id: 'storage' })"
+        >
+          <icon-lucide-database :class="ui.icon()" />
+          <span :class="ui.label()">{{ storage.label }}</span>
+          <span :class="ui.trailing()">{{ storage.detail }}</span>
+        </button>
+      </div>
+    </div>
+  </nav>
+</template>

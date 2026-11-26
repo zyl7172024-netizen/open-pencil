@@ -1,0 +1,234 @@
+<script setup lang="ts">
+import { useFocus } from '@vueuse/core'
+import {
+  PopoverTrigger,
+  PopoverPortal,
+  PopoverContent,
+  DropdownMenuTrigger,
+  DropdownMenuPortal,
+  DropdownMenuContent,
+  DropdownMenuItem
+} from 'reka-ui'
+import { tv } from 'tailwind-variants'
+import { computed, nextTick, ref, watch } from 'vue'
+
+import { useMessages } from '@open-pencil/vue/i18n'
+
+import AppButton from '@/components/ui/button/AppButton.vue'
+import IconButton from '@/components/ui/button/IconButton.vue'
+import { AppConfirmationDialog } from '@/components/ui/dialog'
+import AppDropdownMenuRoot from '@/components/ui/menu/AppDropdownMenuRoot.vue'
+import { menuItem, useMenuUI } from '@/components/ui/menu/menu'
+import MenuScrollArea from '@/components/ui/menu/MenuScrollArea.vue'
+import AppPopoverRoot from '@/components/ui/overlay/AppPopoverRoot.vue'
+import Tip from '@/components/ui/overlay/Tip.vue'
+import iconButtonTheme from '@/theme/button/icon-button'
+import historyTheme from '@/theme/chat/history'
+
+const chatHistoryTheme = tv(historyTheme)
+
+const {
+  conversations,
+  selectedId,
+  disabled = false,
+  saved = false
+} = defineProps<{
+  conversations: { id: string; title: string; documentName: string; available: boolean }[]
+  selectedId?: string
+  disabled?: boolean
+  saved?: boolean
+}>()
+const emit = defineEmits<{
+  select: [id: string]
+  create: []
+  rename: [id: string, title: string]
+  saveTrace: [id: string]
+  delete: [id: string]
+}>()
+const ai = useMessages('ai')
+const triggerClass = tv(iconButtonTheme)({ size: 'sm' })
+const styles = chatHistoryTheme()
+const menu = useMenuUI({ content: 'min-w-44' })
+const item = menuItem({ justify: 'start' })
+const open = ref(false)
+const all = ref(false)
+const query = ref('')
+const editing = ref(false)
+const confirming = ref(false)
+const title = ref('')
+const titleInput = ref<HTMLInputElement>()
+const { focused } = useFocus(titleInput)
+const selected = computed(() => conversations.find((chat) => chat.id === selectedId))
+const results = computed(() =>
+  conversations.filter(
+    (chat) =>
+      (all.value || chat.available) &&
+      `${chat.title} ${chat.documentName}`
+        .toLocaleLowerCase()
+        .includes(query.value.trim().toLocaleLowerCase())
+  )
+)
+watch(
+  () => selectedId,
+  () => {
+    editing.value = false
+    confirming.value = false
+  }
+)
+function choose(id: string) {
+  open.value = false
+  emit('select', id)
+}
+async function rename() {
+  confirming.value = false
+  title.value = selected.value?.title ?? ''
+  editing.value = true
+  await nextTick()
+  focused.value = true
+  titleInput.value?.select()
+}
+function confirmDelete() {
+  editing.value = false
+  confirming.value = true
+}
+function remove() {
+  if (selectedId) emit('delete', selectedId)
+  confirming.value = false
+}
+function save() {
+  if (selectedId && title.value.trim()) emit('rename', selectedId, title.value)
+  editing.value = false
+}
+function closeMenu(event: Event) {
+  if (editing.value) event.preventDefault()
+}
+</script>
+
+<template>
+  <div :class="styles.root()">
+    <div :class="styles.header()">
+      <AppPopoverRoot v-model:open="open">
+        <Tip :label="ai.chatHistory">
+          <PopoverTrigger :class="triggerClass" :disabled="disabled" :aria-label="ai.chatHistory">
+            <icon-lucide-panel-left data-direction="reading" :class="styles.icon()" />
+          </PopoverTrigger>
+        </Tip>
+        <PopoverPortal>
+          <PopoverContent
+            align="start"
+            :side-offset="6"
+            :class="styles.content()"
+            :aria-label="ai.chatHistory"
+          >
+            <input
+              v-model="query"
+              :aria-label="ai.searchChats"
+              :placeholder="ai.searchChats"
+              :class="styles.input()"
+            />
+            <div :class="styles.scope()" role="group" :aria-label="ai.chatScope">
+              <button
+                :class="styles.scopeButton()"
+                :data-active="!all"
+                :aria-pressed="!all"
+                @click="all = false"
+              >
+                {{ ai.thisDocument }}
+              </button>
+              <button
+                :class="styles.scopeButton()"
+                :data-active="all"
+                :aria-pressed="all"
+                @click="all = true"
+              >
+                {{ ai.allDocuments }}
+              </button>
+            </div>
+            <div :class="styles.list()">
+              <button
+                v-for="chat in results"
+                :key="chat.id"
+                :class="styles.row()"
+                :data-selected="chat.id === selectedId"
+                :aria-current="chat.id === selectedId ? 'true' : undefined"
+                :disabled="disabled"
+                @click="choose(chat.id)"
+              >
+                <span :class="styles.title()"
+                  ><span :class="styles.label()">{{ chat.title || ai.newChat }}</span
+                  ><span v-if="all" :class="styles.detail()">{{ chat.documentName }}</span></span
+                >
+                <icon-lucide-check v-if="chat.id === selectedId" :class="styles.icon()" />
+              </button>
+              <p v-if="!results.length" :class="styles.empty()">{{ ai.noChatsFound }}</p>
+            </div>
+          </PopoverContent>
+        </PopoverPortal>
+      </AppPopoverRoot>
+      <span :class="styles.heading()" data-test-id="chat-title">{{
+        selected?.title || ai.newChat
+      }}</span>
+      <slot name="actions" />
+      <IconButton :label="ai.newChat" :disabled="disabled" size="sm" @click="emit('create')"
+        ><icon-lucide-plus :class="styles.icon()"
+      /></IconButton>
+      <AppDropdownMenuRoot v-if="saved">
+        <Tip :label="ai.chatActions">
+          <DropdownMenuTrigger
+            :class="triggerClass"
+            :aria-label="ai.chatActions"
+            :disabled="disabled"
+          >
+            <icon-lucide-ellipsis :class="styles.icon()" />
+          </DropdownMenuTrigger>
+        </Tip>
+        <DropdownMenuPortal>
+          <DropdownMenuContent
+            align="end"
+            :side-offset="6"
+            :class="menu.content"
+            @close-auto-focus="closeMenu"
+          >
+            <MenuScrollArea>
+              <DropdownMenuItem :class="item" @select="rename">{{
+                ai.renameChat
+              }}</DropdownMenuItem>
+              <DropdownMenuItem
+                :class="item"
+                @select="selectedId && emit('saveTrace', selectedId)"
+                >{{ ai.saveChatTrace }}</DropdownMenuItem
+              >
+              <DropdownMenuItem :class="item" @select="confirmDelete">{{
+                ai.deleteChat
+              }}</DropdownMenuItem>
+            </MenuScrollArea>
+          </DropdownMenuContent>
+        </DropdownMenuPortal>
+      </AppDropdownMenuRoot>
+    </div>
+    <form
+      v-if="editing"
+      :class="styles.form()"
+      @submit.prevent="save"
+      @keydown.esc.stop="editing = false"
+    >
+      <input ref="titleInput" v-model="title" :aria-label="ai.chatTitle" :class="styles.input()" />
+      <div :class="styles.actions()">
+        <AppButton size="xs" @click="editing = false">{{ ai.cancelChatAction }}</AppButton
+        ><AppButton size="xs" type="submit" :disabled="disabled || !title.trim()">{{
+          ai.saveChatTitle
+        }}</AppButton>
+      </div>
+    </form>
+    <AppConfirmationDialog
+      v-model:open="confirming"
+      :heading="ai.deleteChatConfirmation"
+      :description="ai.deleteChatDescription({ title: selected?.title ?? '' })"
+      :cancel-label="ai.cancelChatAction"
+      :confirm-label="ai.deleteChat"
+      tone="danger"
+      :confirm-disabled="disabled"
+      @confirm="remove"
+    />
+  </div>
+</template>

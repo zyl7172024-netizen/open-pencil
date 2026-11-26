@@ -1,0 +1,597 @@
+import type { EnrollmentStatus } from '#cloud/admin/enrollment/service'
+import type {
+  CloudSignInMethod,
+  CommentEmailSetting,
+  DocumentPermission,
+  WorkspaceRole
+} from '#cloud/contract'
+import type {
+  EmailLocale,
+  TransactionalEmailKind,
+  TransactionalEmailPayloadByKind
+} from '#cloud/email'
+import type * as OAuth from '#cloud/server/oauth/tables'
+import type { Account, Session } from 'better-auth'
+import type { ColumnType, Generated, Insertable, Selectable, Updateable } from 'kysely'
+
+export type TimestampColumn = ColumnType<Date, Date | string | undefined, Date | string | null>
+
+export type UploadStatus = 'pending' | 'finalizing' | 'cleaning' | 'committed' | 'abandoned'
+
+export interface DocumentShareTable {
+  id: string
+  documentId: string
+  permission: DocumentPermission
+  secretHash: string
+  roomEpoch: Generated<number>
+  createdBy: string
+  createdAt: TimestampColumn
+  updatedAt: TimestampColumn
+  expiresAt: TimestampColumn | null
+  revokedAt: TimestampColumn | null
+  lastUsedAt: TimestampColumn | null
+}
+
+export interface DocumentGrantTable {
+  id: string
+  documentId: string
+  userId: string
+  permission: DocumentPermission
+  createdBy: string
+  createdAt: TimestampColumn
+  updatedAt: TimestampColumn
+  revokedAt: TimestampColumn | null
+}
+
+export interface DocumentInvitationTable {
+  id: string
+  documentId: string
+  emailNormalized: string
+  permission: DocumentPermission
+  tokenHash: string
+  invitedBy: string
+  invitedAt: TimestampColumn
+  expiresAt: TimestampColumn
+  acceptedAt: TimestampColumn | null
+  revokedAt: TimestampColumn | null
+}
+
+export interface WorkspaceTable {
+  id: string
+  name: string
+  slug: string
+  createdBy: string
+  /** Whose plan the workspace's limits come from; ownership passes to another admin when they go. */
+  ownerId: string
+  createdAt: TimestampColumn
+  updatedAt: TimestampColumn
+}
+
+export interface WorkspaceMemberTable {
+  workspaceId: string
+  userId: string
+  role: WorkspaceRole
+  createdAt: TimestampColumn
+}
+
+export interface WorkspaceInvitationTable {
+  id: string
+  workspaceId: string
+  emailNormalized: string
+  role: WorkspaceRole
+  tokenHash: string
+  invitedBy: string
+  invitedAt: TimestampColumn
+  expiresAt: TimestampColumn
+  acceptedAt: TimestampColumn | null
+  revokedAt: TimestampColumn | null
+}
+
+export interface DocumentTable {
+  id: string
+  workspaceId: string
+  name: string
+  /** What the file is, in a few sentences, for the community gallery; see migration 020. */
+  description: Generated<string | null>
+  /** A design or a board; see migration 027. */
+  kind: Generated<'design' | 'board' | 'slides'>
+  currentRevisionId: string | null
+  collaborationEpoch: Generated<number>
+  version: Generated<number>
+  createdBy: string
+  createdAt: TimestampColumn
+  updatedAt: TimestampColumn
+  deletedAt: TimestampColumn | null
+  /** Who moved the document to Trash; empty when its account's deletion did. */
+  deletedBy: string | null
+  /**
+   * When it was deleted forever, and by whom (empty for an account's deletion): out of everyone's
+   * sight, its files wait out the deployment's grace before cleanup destroys them.
+   */
+  purgedAt: TimestampColumn | null
+  purgedBy: string | null
+  /** Storage taken off its workspace's usage when it was deleted forever; see migration 007. */
+  purgedBytes: Generated<number>
+  cleanupClaimId: Generated<string | null>
+  cleanupClaimedAt: TimestampColumn | null
+  /** Set while a deployment administrator has taken the document down; see migration 032. */
+  disabledAt: TimestampColumn | null
+  disabledReason: Generated<string | null>
+}
+
+/** A report someone filed about a document shared with them by link; see migration 032. */
+/** A comment pin on a document: where it sits, and whether it is resolved. */
+export interface CommentThreadTable {
+  id: string
+  documentId: string
+  pageId: string
+  pageName: string | null
+  nodeId: string | null
+  nodeName: string | null
+  offsetX: number | null
+  offsetY: number | null
+  x: number
+  y: number
+  createdBy: string
+  createdAt: TimestampColumn
+  updatedAt: TimestampColumn
+  resolvedAt: TimestampColumn | null
+  resolvedBy: string | null
+}
+
+/** A thread's first message or a reply to it. */
+export interface CommentTable {
+  id: string
+  threadId: string
+  /** Null only for a comment brought in from a file, which has `importedAuthorName` instead. */
+  authorId: string | null
+  importedAuthorName: string | null
+  agent: string | null
+  body: string
+  createdAt: TimestampColumn
+  editedAt: TimestampColumn | null
+}
+
+/** Someone a comment names, by account. */
+export interface CommentMentionTable {
+  commentId: string
+  userId: string
+  createdAt: TimestampColumn
+}
+
+/** How far an account has read a thread. */
+export interface CommentReadTable {
+  userId: string
+  threadId: string
+  readAt: TimestampColumn
+}
+
+/** An email sent about a comment, counted against each day's budget. */
+export interface CommentEmailTable {
+  id: string
+  senderId: string
+  recipientId: string
+  sentAt: TimestampColumn
+}
+
+export interface NotificationSettingTable {
+  userId: string
+  commentEmails: CommentEmailSetting
+  updatedAt: TimestampColumn
+}
+
+export interface DocumentReportTable {
+  id: string
+  documentId: string
+  shareId: string | null
+  reporterUserId: string | null
+  reporterGuestId: string | null
+  replyEmail: string | null
+  /** The language to reply in when the reporter has no account that chose one. */
+  replyLocale: Generated<EmailLocale | null>
+  reason: 'spam-phishing' | 'illegal' | 'copyright' | 'harassment' | 'other'
+  description: string
+  status: Generated<'open' | 'dismissed' | 'actioned'>
+  createdAt: TimestampColumn
+  resolvedAt: TimestampColumn | null
+  resolvedBy: string | null
+}
+
+export interface StorageObjectTable {
+  id: string
+  objectKey: string
+  checksum: string
+  byteSize: number
+  contentType: string
+  createdAt: TimestampColumn
+}
+
+export interface DocumentRevisionTable {
+  id: string
+  documentId: string
+  parentRevisionId: string | null
+  storageObjectId: string
+  createdBy: string
+  createdAt: TimestampColumn
+}
+
+/** An image a workspace's documents use, stored once; see migration 023. */
+export interface WorkspaceImageTable {
+  workspaceId: string
+  /** The SHA-256 of the bytes, which the object store verified. */
+  checksum: string
+  storageObjectId: string
+  /** When a save last asked for it; an image no revision uses is released a while after. */
+  touchedAt: TimestampColumn
+}
+
+/** An image a stored revision uses, under the name its file gives it. */
+export interface RevisionImageTable {
+  revisionId: string
+  name: string
+  workspaceId: string
+  checksum: string
+}
+
+/** A revision kept in the document's history; see migration 021. */
+export interface DocumentVersionTable {
+  id: string
+  documentId: string
+  revisionId: string
+  kind: 'checkpoint' | 'named'
+  name: string | null
+  description: string | null
+  createdBy: string
+  restoredFromVersionId: string | null
+  createdAt: TimestampColumn
+}
+
+export type UploadKind = 'revision' | 'image'
+
+export interface UploadTable {
+  id: string
+  /** An image upload names the document it was asked for, which decides who may make it. */
+  documentId: string
+  kind: Generated<UploadKind>
+  baseRevisionId: string | null
+  objectKey: string
+  checksum: string
+  byteSize: number
+  contentType: string
+  multipartUploadId: string | null
+  status: UploadStatus
+  finalizationStartedAt: TimestampColumn | null
+  cleanupClaimId: Generated<string | null>
+  cleanupClaimedAt: TimestampColumn | null
+  createdBy: string
+  createdAt: TimestampColumn
+  expiresAt: TimestampColumn
+}
+
+export interface AuthUserTable {
+  id: string
+  name: string
+  email: string
+  emailVerified: boolean
+  image: string | null
+  role: Generated<string | null>
+  banned: Generated<boolean | null>
+  banReason: Generated<string | null>
+  banExpires: TimestampColumn | null
+  /** Unset on accounts that never turned two-step sign-in on. */
+  twoFactorEnabled: Generated<boolean | null>
+  /** The language Cloud writes to the account in; unset is English. */
+  locale: Generated<EmailLocale | null>
+  createdAt: TimestampColumn
+  updatedAt: TimestampColumn
+}
+
+/** Better Auth's API keys, which are Cloud's personal access tokens; the plugin owns the rest. */
+export interface AccessTokenTable {
+  id: string
+  referenceId: string
+  name: string | null
+  start: string | null
+  expiresAt: TimestampColumn | null
+  lastRequest: TimestampColumn | null
+  createdAt: TimestampColumn
+}
+
+export interface TwoFactorTable {
+  id: string
+  secret: string
+  backupCodes: string
+  userId: string
+  verified: Generated<boolean>
+  failedVerificationCount: Generated<number>
+  lockedUntil: TimestampColumn | null
+}
+
+export interface PasskeyTable {
+  id: string
+  name: string | null
+  publicKey: string
+  userId: string
+  credentialID: string
+  counter: number
+  deviceType: string
+  backedUp: boolean
+  transports: string | null
+  createdAt: TimestampColumn
+  aaguid: string | null
+}
+
+/**
+ * How a session proved its second step: a code, a recovery code, a passkey, or for a desktop app,
+ * a device sign-in that only a session which proved it could approve.
+ */
+export type MFAAssuranceMethod = 'totp' | 'recovery-code' | 'passkey' | 'device'
+
+export interface MFAAssuranceTable {
+  sessionId: string
+  userId: string
+  method: MFAAssuranceMethod
+  verifiedAt: TimestampColumn
+}
+
+/** Better Auth's keyed values, which also hold an administrator's sign-in blocks. */
+export interface VerificationTable {
+  id: string
+  identifier: string
+  value: string
+  expiresAt: TimestampColumn
+  createdAt: TimestampColumn
+  updatedAt: TimestampColumn
+}
+
+export interface SignInTable {
+  id: string
+  userId: string
+  sessionId: string | null
+  method: CloudSignInMethod
+  ipAddress: string | null
+  userAgent: string | null
+  createdAt: TimestampColumn
+}
+
+export type UserPictureFormat = 'png' | 'jpeg'
+
+/** The picture an account shows: uploaded by its owner, or copied from a linked account. */
+export interface UserPictureTable {
+  userId: string
+  bytes: Uint8Array
+  format: UserPictureFormat
+  /** The SHA-256 of the bytes, hex, which names this picture in its address. */
+  checksum: string
+  source: 'upload' | 'provider'
+  createdAt: TimestampColumn
+}
+
+/** A collaboration room's latest snapshot, a stored file, by document and epoch. */
+export interface DocumentRoomSnapshotTable {
+  documentId: string
+  roomEpoch: number
+  /** The stored file holding the room's snapshot. */
+  snapshotObjectId: string
+  /** The last logged update the snapshot holds; later ones are in `documentRoomUpdate`. */
+  throughSequence: number
+  createdAt: TimestampColumn
+  updatedAt: TimestampColumn
+}
+
+/** An update a room logged after its snapshot, one per save. */
+export interface DocumentRoomUpdateTable {
+  documentId: string
+  roomEpoch: number
+  sequence: number
+  /** One Yjs update, as the relay merged the changes of one save. */
+  data: Uint8Array
+  createdAt: TimestampColumn
+}
+
+export interface InvitationContinuationTable {
+  id: string
+  invitationId: string
+  tokenEncrypted: string
+  expiresAt: TimestampColumn
+  consumedAt: TimestampColumn | null
+  createdAt: TimestampColumn
+}
+
+/** Which version of the server's terms an account accepted, and when; one row per version. */
+export interface TermsAcceptanceTable {
+  userId: string
+  version: string
+  acceptedAt: TimestampColumn
+}
+
+export interface AccountEntitlementTable {
+  userId: string
+  values: unknown
+  source: string
+  revision: Generated<number>
+  /** Set only by versioned writes; see `setVersioned`. */
+  externalVersion: number | null
+  updatedAt: TimestampColumn
+}
+
+/** An account told its storage is full; see `createStorageLimitNoticeService`. */
+export interface StorageLimitNoticeTable {
+  userId: string
+  notifiedAt: TimestampColumn
+}
+
+export interface WorkspaceStorageUsageTable {
+  workspaceId: string
+  committedBytes: number
+  updatedAt: TimestampColumn
+}
+
+export interface UploadStorageReservationTable {
+  id: string
+  workspaceId: string
+  uploadId: string
+  bytes: number
+  expiresAt: TimestampColumn
+  committedAt: TimestampColumn | null
+  releasedAt: TimestampColumn | null
+  createdAt: TimestampColumn
+}
+
+export type TransactionalEmailStatus = 'pending' | 'sending' | 'accepted' | 'failed' | 'suppressed'
+
+/**
+ * Kinds that rows may still hold although nothing sends them now: the beta's invitation letter,
+ * which approved the official deployment's waitlist. Delivered ones stay in the outbox as history.
+ */
+export const RETIRED_TRANSACTIONAL_EMAIL_KINDS = ['enrollment-invited'] as const
+export type RetiredTransactionalEmailKind = (typeof RETIRED_TRANSACTIONAL_EMAIL_KINDS)[number]
+
+/** Whether a stored email is one Cloud still sends, rather than a retired kind kept as history. */
+export function isSendableEmailKind(
+  kind: TransactionalEmailKind | RetiredTransactionalEmailKind
+): kind is TransactionalEmailKind {
+  return !(RETIRED_TRANSACTIONAL_EMAIL_KINDS as readonly string[]).includes(kind)
+}
+
+export interface TransactionalEmailTable {
+  id: string
+  idempotencyKey: string
+  kind: TransactionalEmailKind | RetiredTransactionalEmailKind
+  recipientEmailNormalized: string
+  payloadEncrypted: string | null
+  /** The language the email is written in. */
+  locale: Generated<EmailLocale>
+  status: TransactionalEmailStatus
+  attemptCount: Generated<number>
+  nextAttemptAt: TimestampColumn
+  claimId: string | null
+  claimedAt: TimestampColumn | null
+  transport: string | null
+  transportMessageId: string | null
+  lastErrorCode: string | null
+  createdAt: TimestampColumn
+  updatedAt: TimestampColumn
+  acceptedAt: TimestampColumn | null
+}
+
+export type TransactionalEmailPayload = TransactionalEmailPayloadByKind[TransactionalEmailKind]
+
+export interface EnrollmentTable {
+  id: string
+  emailNormalized: string
+  name: string | null
+  reason: string | null
+  status: EnrollmentStatus
+  requestedAt: TimestampColumn
+  reviewedAt: TimestampColumn | null
+  reviewedBy: string | null
+  reviewNote: string | null
+  requestRevision: Generated<number>
+  approvedUserId: string | null
+  /** `waitlist` on the requests recorded from openpencil.dev's waitlist for the beta; nothing sets it now. */
+  source: ColumnType<'waitlist' | null, 'waitlist' | null | undefined, 'waitlist' | null>
+}
+
+export interface APIRateLimitTable {
+  keyHash: string
+  windowStartedAt: TimestampColumn
+  requestCount: Generated<number>
+  updatedAt: TimestampColumn
+}
+
+export interface AdminAuditEventTable {
+  id: string
+  actorUserId: string
+  action: string
+  subjectType: string
+  subjectId: string
+  metadata: unknown
+  createdAt: TimestampColumn
+}
+
+export interface AuthSchemaVersionTable {
+  id: string
+  version: string
+  updatedAt: TimestampColumn
+}
+
+/** One invitation sent, for the daily invitation budget; see `src/server/invitations/budget.ts`. */
+export interface InvitationSendTable {
+  id: string
+  senderId: string
+  emailNormalized: string
+  sentAt: TimestampColumn
+}
+
+export interface CloudDatabase {
+  account: Account
+  session: Session
+  twoFactor: TwoFactorTable
+  passkey: PasskeyTable
+  mfaAssurance: MFAAssuranceTable
+  signIn: SignInTable
+  verification: VerificationTable
+  userPicture: UserPictureTable
+  user: AuthUserTable
+  apikey: AccessTokenTable
+  authSchemaVersion: AuthSchemaVersionTable
+  enrollment: EnrollmentTable
+  apiRateLimit: APIRateLimitTable
+  adminAuditEvent: AdminAuditEventTable
+  workspace: WorkspaceTable
+  workspaceMember: WorkspaceMemberTable
+  workspaceInvitation: WorkspaceInvitationTable
+  document: DocumentTable
+  storageObject: StorageObjectTable
+  documentRevision: DocumentRevisionTable
+  revisionImage: RevisionImageTable
+  workspaceImage: WorkspaceImageTable
+  documentVersion: DocumentVersionTable
+  documentShare: DocumentShareTable
+  documentGrant: DocumentGrantTable
+  documentInvitation: DocumentInvitationTable
+  documentRoomSnapshot: DocumentRoomSnapshotTable
+  documentRoomUpdate: DocumentRoomUpdateTable
+  invitationContinuation: InvitationContinuationTable
+  accountEntitlement: AccountEntitlementTable
+  termsAcceptance: TermsAcceptanceTable
+  workspaceStorageUsage: WorkspaceStorageUsageTable
+  storageLimitNotice: StorageLimitNoticeTable
+  transactionalEmail: TransactionalEmailTable
+  uploadStorageReservation: UploadStorageReservationTable
+  upload: UploadTable
+  invitationSend: InvitationSendTable
+  documentReport: DocumentReportTable
+  commentThread: CommentThreadTable
+  comment: CommentTable
+  commentMention: CommentMentionTable
+  commentRead: CommentReadTable
+  commentEmail: CommentEmailTable
+  notificationSetting: NotificationSettingTable
+  oauthClient: OAuth.OAuthClientTable
+  oauthAccessToken: OAuth.OAuthAccessTokenTable
+  oauthRefreshToken: OAuth.OAuthRefreshTokenTable
+  oauthConsent: OAuth.OAuthConsentTable
+}
+
+export type NewTransactionalEmail = Insertable<TransactionalEmailTable>
+export type TransactionalEmail = Selectable<TransactionalEmailTable>
+export type Workspace = Selectable<WorkspaceTable>
+export type NewWorkspace = Insertable<WorkspaceTable>
+export type WorkspaceUpdate = Updateable<WorkspaceTable>
+export type Document = Selectable<DocumentTable>
+export type NewDocument = Insertable<DocumentTable>
+export type DocumentRevision = Selectable<DocumentRevisionTable>
+export type DocumentVersion = Selectable<DocumentVersionTable>
+export type NewDocumentRevision = Insertable<DocumentRevisionTable>
+export type DocumentShare = Selectable<DocumentShareTable>
+export type NewDocumentShare = Insertable<DocumentShareTable>
+export type DocumentGrant = Selectable<DocumentGrantTable>
+export type NewDocumentGrant = Insertable<DocumentGrantTable>
+export type DocumentInvitation = Selectable<DocumentInvitationTable>
+export type NewDocumentInvitation = Insertable<DocumentInvitationTable>
+export type StorageObject = Selectable<StorageObjectTable>
+export type NewStorageObject = Insertable<StorageObjectTable>
+export type Upload = Selectable<UploadTable>
+export type NewUpload = Insertable<UploadTable>

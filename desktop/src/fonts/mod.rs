@@ -1,0 +1,96 @@
+//! Tauri commands that list system fonts and return their data to the canvas renderer.
+
+mod catalog;
+#[cfg(target_os = "macos")]
+mod macos;
+mod names;
+mod sfnt;
+mod style;
+pub mod watch;
+
+use serde::Serialize;
+
+/// A family and its faces, each by the name its font gives it, with its weight and slant.
+#[derive(Serialize, Clone)]
+pub struct FontFamily {
+    family: String,
+    faces: Vec<catalog::ListedFace>,
+}
+
+fn enumerate_system_fonts() -> Vec<FontFamily> {
+    let mut families: Vec<FontFamily> = catalog::families()
+        .into_iter()
+        .filter(|(_, faces)| !faces.is_empty())
+        .map(|(family, faces)| FontFamily { family, faces })
+        .collect();
+    families.sort_by(|a, b| a.family.cmp(&b.family));
+    families
+}
+
+/// The installed families, read once until the fonts change (`watch`).
+#[tauri::command]
+pub async fn list_system_fonts() -> Vec<FontFamily> {
+    tauri::async_runtime::spawn_blocking(enumerate_system_fonts)
+        .await
+        .unwrap_or_default()
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FontLoadError {
+    code: FontLoadErrorCode,
+    message: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum FontLoadErrorCode {
+    NotFound,
+    UnsupportedFormat,
+    Failed,
+}
+
+impl FontLoadError {
+    fn new(code: FontLoadErrorCode, message: String) -> Self {
+        Self { code, message }
+    }
+}
+
+fn load_system_font_blocking(family: String, style: String) -> Result<Vec<u8>, FontLoadError> {
+    let Some(face) = catalog::load_face(&family, &style) else {
+        #[cfg(target_os = "macos")]
+        if macos::family_has_only_unsupported_outlines(&family) {
+            return Err(FontLoadError::new(
+                FontLoadErrorCode::UnsupportedFormat,
+                format!("Font outlines are in an unsupported format: {family}"),
+            ));
+        }
+        return Err(FontLoadError::new(
+            FontLoadErrorCode::NotFound,
+            format!("Font face not found: {family} {style}"),
+        ));
+    };
+    sfnt::standalone_face(face.data.as_ref(), face.index).ok_or_else(|| {
+        FontLoadError::new(
+            FontLoadErrorCode::Failed,
+            format!("Font data is malformed: {family} {style}"),
+        )
+    })
+}
+
+#[tauri::command]
+pub async fn load_system_font(
+    family: String,
+    style: String,
+) -> Result<tauri::ipc::Response, FontLoadError> {
+    let data =
+        tauri::async_runtime::spawn_blocking(move || load_system_font_blocking(family, style))
+            .await
+            .map_err(|e| {
+                FontLoadError::new(
+                    FontLoadErrorCode::Failed,
+                    format!("Font load task failed: {e}"),
+                )
+            })??;
+    Ok(tauri::ipc::Response::new(data))
+}

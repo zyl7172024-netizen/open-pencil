@@ -1,0 +1,57 @@
+<script setup lang="ts">
+import { PopoverTrigger, PopoverPortal, PopoverContent, PopoverClose } from 'reka-ui'
+
+import type { Stroke } from '@open-pencil/scene-graph'
+import { useMessages } from '@open-pencil/vue/i18n'
+import { useRetainedPopup } from '@open-pencil/vue/lifecycle/retention'
+
+import AppButton from '@/components/ui/button/AppButton.vue'
+import { useInlineSide } from '@/components/ui/direction/inline-side'
+import AppPopoverRoot from '@/components/ui/overlay/AppPopoverRoot.vue'
+import { usePopoverUI } from '@/components/ui/overlay/popover'
+
+import StrokeDashControls from './StrokeDashControls.vue'
+import StrokeGeometryControls from './StrokeGeometryControls.vue'
+
+const startSide = useInlineSide('start')
+const { stroke } = defineProps<{ stroke?: Stroke }>()
+const emit = defineEmits<{ patch: [changes: Partial<Stroke>] }>()
+const panels = useMessages('panels')
+const common = useMessages('common')
+const { open: popupOpen, portalActive } = useRetainedPopup()
+const styles = usePopoverUI({
+  content: 'w-64 max-w-[calc(100vw-1rem)]',
+  header: 'flex items-center justify-between border-b border-border px-3 py-2',
+  body: 'flex flex-col gap-3 p-3'
+})
+</script>
+
+<template>
+  <AppPopoverRoot v-model:open="popupOpen">
+    <PopoverTrigger as-child>
+      <AppButton :aria-label="panels.strokeSettings" data-property="stroke-settings">
+        <icon-lucide-sliders-horizontal class="size-3.5" />
+      </AppButton>
+    </PopoverTrigger>
+    <PopoverPortal v-if="portalActive">
+      <PopoverContent
+        :side="startSide"
+        align="start"
+        :side-offset="8"
+        :aria-label="panels.strokeSettings"
+        :class="styles.content"
+      >
+        <div :class="styles.header">
+          <h3 class="text-xs font-semibold text-surface">{{ panels.strokeSettings }}</h3>
+          <PopoverClose as-child
+            ><AppButton :aria-label="common.close"><icon-lucide-x class="size-3.5" /></AppButton
+          ></PopoverClose>
+        </div>
+        <div :class="styles.body">
+          <StrokeDashControls v-if="stroke" :stroke="stroke" @patch="emit('patch', $event)" />
+          <StrokeGeometryControls />
+        </div>
+      </PopoverContent>
+    </PopoverPortal>
+  </AppPopoverRoot>
+</template>

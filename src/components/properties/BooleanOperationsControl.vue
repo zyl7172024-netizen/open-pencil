@@ -1,0 +1,79 @@
+<script setup lang="ts">
+import {
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuPortal,
+  DropdownMenuTrigger
+} from 'reka-ui'
+import IconCombine from '~icons/lucide/combine'
+import IconCopyMinus from '~icons/lucide/copy-minus'
+import IconCopyX from '~icons/lucide/copy-x'
+import IconListCollapse from '~icons/lucide/list-collapse'
+import IconSquaresIntersect from '~icons/lucide/squares-intersect'
+
+import {
+  editorCommandMetadata,
+  formatShortcut,
+  useEditorCommands,
+  type EditorCommandId
+} from '@open-pencil/vue/editor/commands'
+import { useMessages } from '@open-pencil/vue/i18n'
+import { useRetainedPopup } from '@open-pencil/vue/lifecycle/retention'
+
+import IconButton from '@/components/ui/button/IconButton.vue'
+import AppDropdownMenuRoot from '@/components/ui/menu/AppDropdownMenuRoot.vue'
+import { menuItem, useMenuUI } from '@/components/ui/menu/menu'
+import MenuScrollArea from '@/components/ui/menu/MenuScrollArea.vue'
+
+const { getCommand, runCommand } = useEditorCommands()
+const commands = useMessages('commands')
+const { open: popupOpen, portalActive } = useRetainedPopup()
+
+const operations = [
+  { id: 'selection.booleanUnion', icon: IconCombine },
+  { id: 'selection.booleanSubtract', icon: IconCopyMinus },
+  { id: 'selection.booleanIntersect', icon: IconSquaresIntersect },
+  { id: 'selection.booleanExclude', icon: IconCopyX },
+  { id: 'selection.flatten', icon: IconListCollapse }
+] satisfies Array<{ id: EditorCommandId; icon: unknown }>
+
+const menuCls = useMenuUI({ content: 'min-w-44' })
+const itemCls = menuItem({ justify: 'between' })
+</script>
+
+<template>
+  <AppDropdownMenuRoot v-model:open="popupOpen">
+    <DropdownMenuTrigger as-child>
+      <IconButton
+        :label="commands.booleanOperations"
+        menu
+        size="xs"
+        data-test-id="boolean-operations-trigger"
+      >
+        <IconCombine class="size-3.5" />
+      </IconButton>
+    </DropdownMenuTrigger>
+    <DropdownMenuPortal v-if="portalActive">
+      <DropdownMenuContent align="end" side="bottom" :side-offset="4" :class="menuCls.content">
+        <MenuScrollArea>
+          <DropdownMenuItem
+            v-for="operation in operations"
+            :key="operation.id"
+            :data-test-id="`boolean-operation-${operation.id.replace('selection.', '')}`"
+            :class="itemCls"
+            :disabled="!getCommand(operation.id).enabled.value"
+            @select="runCommand(operation.id)"
+          >
+            <div class="flex min-w-0 items-center gap-2">
+              <component :is="operation.icon" class="size-3.5 shrink-0 text-muted" />
+              <span>{{ getCommand(operation.id).label }}</span>
+            </div>
+            <span class="ms-6 text-2xs text-muted">{{
+              formatShortcut(editorCommandMetadata(operation.id).shortcut)
+            }}</span>
+          </DropdownMenuItem>
+        </MenuScrollArea>
+      </DropdownMenuContent>
+    </DropdownMenuPortal>
+  </AppDropdownMenuRoot>
+</template>

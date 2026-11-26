@@ -1,0 +1,108 @@
+import type { AIProviderID } from '@open-pencil/core/constants'
+
+import type { AgentChoices } from '@/app/ai/agents/acp/options'
+
+export const AI_MODEL_ROLES = ['design', 'review', 'fast', 'vision'] as const
+/**
+ * The roles something reads: Design runs the chat, Review writes the design reviews the person
+ * asks for, Fast tasks names conversations and writes their compaction summaries, and Vision
+ * reads images. A role not listed here shows as not used in Settings and guided setup and keeps
+ * its saved assignment.
+ */
+export const AI_MODEL_ROLES_IN_USE = [
+  'design',
+  'review',
+  'fast',
+  'vision'
+] as const satisfies readonly AIModelRole[]
+
+/** Whether assigning a model to the role changes anything. */
+export function isModelRoleInUse(role: AIModelRole): boolean {
+  return (AI_MODEL_ROLES_IN_USE as readonly AIModelRole[]).includes(role)
+}
+export const AI_MODEL_CAPABILITIES = ['tools', 'vision'] as const
+/** `default` leaves the effort to the provider; the rest follow the AI SDK reasoning levels. */
+export const THINKING_LEVELS = [
+  'default',
+  'off',
+  'minimal',
+  'low',
+  'medium',
+  'high',
+  'xhigh'
+] as const
+export const HARNESS_PERMISSION_MODES = ['allow-reads', 'allow-edits', 'allow-all'] as const
+
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number]
+export type HarnessPermissionMode = (typeof HARNESS_PERMISSION_MODES)[number]
+
+export type AIModelRole = (typeof AI_MODEL_ROLES)[number]
+export type AIModelProfileId = `model-${string}`
+export type AIModelRoleAssignment = AIModelProfileId | 'design' | null
+export type AIModelCapability = (typeof AI_MODEL_CAPABILITIES)[number]
+export type OptionalAIModelRole = Exclude<AIModelRole, 'design'>
+
+export type AIModelConnection = {
+  id: string
+  providerID: AIProviderID
+  customBaseURL: string
+  customAPIType: 'completions' | 'responses'
+  credentialProfileId: string
+  /** The Home Cloud workspace whose plan pays for an `openpencil` connection. */
+  cloudWorkspaceId?: string
+}
+
+export type AIModelProfile = {
+  id: AIModelProfileId
+  name: string
+  connectionId: string
+  modelID: string
+  customModelID: string
+  maxOutputTokens: number
+  thinkingLevel: ThinkingLevel
+  /**
+   * The effort and modes an ACP agent runs the model on, by the agent's own values, since each
+   * agent and model names its own; absent ones keep the agent's.
+   */
+  agentChoices?: AgentChoices
+  harnessPermissionMode?: HarnessPermissionMode
+  capabilities: AIModelCapability[]
+}
+
+export type AIModelAssignments = {
+  design: AIModelProfileId
+  review: AIModelRoleAssignment
+  fast: AIModelRoleAssignment
+  vision: AIModelRoleAssignment
+}
+
+export type AIModelSettings = {
+  version: 1
+  connections: AIModelConnection[]
+  models: AIModelProfile[]
+  assignments: AIModelAssignments
+}
+
+export type AIModelProfileDraft = {
+  profileId: AIModelProfileId | null
+  sourceConnectionId: string | null
+  name: string
+  providerID: AIProviderID
+  modelID: string
+  customModelID: string
+  customBaseURL: string
+  customAPIType: 'completions' | 'responses'
+  cloudWorkspaceId?: string
+  maxOutputTokens: number
+  thinkingLevel: ThinkingLevel
+  /** Absent ones keep the agent's own. */
+  agentChoices: AgentChoices
+  harnessPermissionMode: HarnessPermissionMode
+  capabilities: AIModelCapability[]
+}
+
+export type ResolvedAIModelRole = {
+  requestedRole: AIModelRole
+  profile: AIModelProfile
+  connection: AIModelConnection
+}

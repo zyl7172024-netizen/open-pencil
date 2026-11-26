@@ -1,0 +1,224 @@
+schema_version = 2
+
+[deployment]
+mode = "self-hosted"
+public_url = "http://localhost:8787"
+indexing = "deny"
+# The server serves the editor itself, and its links point there. Trust any other editor origin
+# that connects to it, such as a development build.
+# trusted_origins = ["https://editor.example.com"]
+# The editor works with files on the device without signing in; false asks everyone to sign in.
+local_editor = true
+# Editors read this only from the official OpenPencil Cloud: it shows Cloud in editors from this
+# version on. Self-hosted servers leave it out.
+# listing = { minimum_editor_version = "0.14.0" }
+# The oldest editor that may use the server. Older editors ask to be updated instead of connecting,
+# and requests from older desktop editors are refused with 426 Upgrade Required. Versions compare
+# in SemVer order, where a pre-release comes before its release: name "0.18.0-beta.1" to admit betas.
+# minimum_editor_version = "0.14.0"
+
+# How the server names itself on its public pages, such as its community gallery: your name and
+# logo in the bar, and where your people get help. Without it, the server's address names it.
+# [deployment.branding]
+# name = "Acme Design"
+# logo_url = "https://acme.example/logo.svg"
+# help_url = "https://intranet.acme.example/design-help"
+
+# Other sites may show documents shared by link, and community gallery documents, in a frame at
+# /embed/…, read-only and without the visitor's account. Off unless enabled; with no origins
+# listed, any site may embed them.
+# [deployment.embedding]
+# enabled = true
+# allowed_origins = ["https://intranet.acme.example"]
+
+# Defaults to DATABASE_URL.
+[database]
+
+# The signing secret defaults to BETTER_AUTH_SECRET.
+[authentication]
+
+# "open", "approval" (an administrator reviews each new account), or "closed".
+[authentication.enrollment]
+mode = "open"
+notification_emails = []
+
+[authentication.mfa]
+required_for_admins = false
+totp = false
+recovery_codes = false
+trusted_device_lifetime_days = 14
+
+# Passkeys belong to public_url's host.
+[authentication.passkeys]
+enabled = false
+rp_name = "OpenPencil Cloud"
+
+[authentication.email_password]
+enabled = false
+sign_up = true
+minimum_password_length = 8
+maximum_password_length = 128
+verification_link_lifetime_minutes = 60
+password_reset_link_lifetime_minutes = 60
+compromised_password_check = false
+
+# Recommended when enabling public sign-up. TURNSTILE_SECRET_KEY remains external.
+# [authentication.captcha]
+# provider = "cloudflare-turnstile"
+# site_key = "replace-with-public-site-key"
+# allowed_hostnames = ["cloud.example.com"]
+
+[authentication.trusted_proxies]
+headers = []
+addresses = []
+
+# Add this table to enable Google. The client secret defaults to
+# GOOGLE_CLIENT_SECRET. The client ID may instead use
+# client_id = { from_env = "GOOGLE_CLIENT_ID" }.
+# [authentication.providers.google]
+# client_id = "your-public-google-client-id"
+
+# Add this table to enable Apple. The private key defaults to APPLE_PRIVATE_KEY.
+# [authentication.providers.apple]
+# client_id = "dev.openpencil.cloud"
+# team_id = "TEAM_ID"
+# key_id = "KEY_ID"
+# app_bundle_identifier = "dev.openpencil"
+
+# Add this table to enable GitHub, from a GitHub App with Account permissions > Email addresses set
+# to read-only and the callback URL <public_url>/api/auth/callback/github. The client secret
+# defaults to GITHUB_CLIENT_SECRET; the client ID may instead use { from_env = "..." }. Set
+# deployment.minimum_editor_version to an editor release with GitHub sign-in at the same time:
+# older editors cannot read a server that offers it.
+# [authentication.providers.github]
+# client_id = "your-github-app-client-id"
+
+[object_storage]
+endpoint = "http://localhost:8333"
+region = "us-east-1"
+bucket = "openpencil"
+force_path_style = true
+checksum_verification = "metadata"
+# Credentials default to S3_ACCESS_KEY_ID and S3_SECRET_ACCESS_KEY.
+maximum_upload_bytes = 1073741824
+# Keep each file cleanup deletes under this prefix, and expire the prefix with a lifecycle rule
+# longer than the database's restore window. After restoring the database to an earlier time, copy
+# deleted/<key> back to <key> for each missing file a revision, image, or room snapshot refers to,
+# before serving it. Useful where the bucket keeps no versions, as on R2.
+# deleted_prefix = "deleted/"
+
+[collaboration]
+# One WebSocket message on the relay, at least 262160. Larger edits arrive as 256 KiB fragments.
+maximum_message_bytes = 1048576
+maximum_connections_per_room = 1000
+# The relay is served on the API origin. Set this only when clients reach it through a different
+# URL, such as a separate proxy.
+# relay_url = "wss://relay.example.com/api/collaboration/relay"
+
+# How long deleted documents stay in Trash, where people can restore them, and how long one deleted
+# forever there keeps its files, out of sight, so a server administrator can still restore it
+# (0 destroys it at once).
+[documents]
+retention_days = 30
+purge_grace_days = 7
+
+[email]
+transport = "none"
+
+# Add this table to offer OpenPencil services (AI models and other paid capabilities) to editors.
+# Cloud never proxies them: it advertises the
+# endpoint and signs short-lived ES256 tokens the service verifies against /.well-known/jwks.json.
+# The PKCS #8 signing key defaults to OPENPENCIL_CLOUD_SERVICES_SIGNING_KEY. Workspaces also need the
+# [entitlements.services] enabled entitlement.
+# [services]
+# endpoint = "https://ai.example.com"
+# token_lifetime_minutes = 10
+
+# The billing service that sells plans and credits; editors link to the plan page whenever it is
+# set. Needs the [services] signing key, which signs its tokens, and the [internal_api], through
+# which it sets the plans it sells. Leave it out when the deployment does not bill.
+# [billing]
+# endpoint = "https://billing.example.com"
+
+# Add this table to let services such as billing set an account's entitlements, which every
+# workspace it owns takes, over HTTP at PUT /api/internal/accounts/<user id>/entitlements. The
+# bearer token defaults to OPENPENCIL_CLOUD_SERVICE_TOKEN; requires entitlements from the database.
+# [internal_api]
+
+# Optional: your own terms and privacy policy, linked at sign-up and in the portal's footer. With
+# require_acceptance, each account accepts terms_version once before using the server, and again
+# whenever you change it. abuse_email is linked as Report abuse, and is where the owner of a
+# document an administrator blocks writes to contest it. Leave the table out to show none.
+# [legal]
+# terms_url = "https://example.com/terms"
+# privacy_url = "https://example.com/privacy"
+# terms_version = "2026-01-01"
+# require_acceptance = true
+# abuse_email = "abuse@example.com"
+# minimum_age = 16
+
+# Optional: a workspace whose documents anyone may open read-only, without signing in or a share
+# link, as a public gallery. Everything saved there is public. Leave the table out to have none.
+# Set [authentication.trusted_proxies] headers first and let only the proxy reach the server: the
+# gallery is rate-limited by client IP, and a request without the header has none.
+# [community]
+# workspace = "0f6b1c1e-6a8e-4b8e-9a4f-3c2d1e0f9a8b"
+# The gallery document this server names as its tour, for clients that ask it. The OpenPencil app
+# and openpencil.dev take theirs from the official server, whatever this one names.
+# tour = "7c6939c0-dedc-4fbe-80b2-80919621de10"
+
+# Optional: lets people connect apps such as ChatGPT, Claude, or Grok to their account. Apps
+# register themselves, so anyone may register one, but each connection takes the person's approval
+# and reaches one workspace they choose. The apps then read and change that workspace's documents,
+# so say so in your privacy notice. Leave the table out to accept no apps.
+# [oauth]
+# enabled = true
+
+# Optional: reports server errors to PostHog error tracking. Leave it out to send nothing. The host
+# defaults to https://eu.i.posthog.com and the project API key to POSTHOG_PROJECT_API_KEY. Reports
+# name no account unless include_ids is set; then they carry the user's account ID and the IDs of
+# the documents and workspaces involved, so say so in your privacy notice.
+# [error_tracking]
+# provider = "posthog"
+# host = "https://us.i.posthog.com"
+# include_ids = false
+
+[workers.email]
+batch_size = 50
+interval_ms = 30000
+lease_ms = 300000
+maximum_attempts = 5
+
+[workers.cleanup]
+enabled = true
+batch_size = 100
+interval_ms = 60000
+lease_ms = 300000
+
+[entitlements]
+source = "static"
+
+[entitlements.documents]
+maximum_file_bytes = 1_073_741_824
+# Keep every version; false keeps the last 30 days of version history.
+revision_history = true
+
+[entitlements.storage]
+maximum_bytes = 1_099_511_627_776
+
+# Links work for people signed in to the server; guests are people who follow them without.
+[entitlements.sharing]
+links = true
+guest_view = true
+guest_edit = false
+guest_presence = true
+
+[entitlements.collaboration]
+enabled = true
+maximum_participants = 100
+
+# The services [services] advertises. The allowance is credits per month, passed to the service in
+# every token; leave it out for no allowance.
+[entitlements.services]
+enabled = false
+# monthly_credit_allowance = 10000

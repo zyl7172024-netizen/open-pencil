@@ -1,0 +1,81 @@
+import { computed } from 'vue'
+
+import { readIcon } from '@open-pencil/scene-graph/icons'
+import {
+  canCreateSlot as canBecomeSlot,
+  slotOwner,
+  slotPropertyId
+} from '@open-pencil/scene-graph/slots'
+
+import { useEditor } from '#vue/editor/context'
+import { useSelectedNodeState } from '#vue/editor/selection-state/nodes'
+import { useSceneComputed } from '#vue/internal/scene-computed/use'
+
+/**
+ * Returns reactive selection-derived state for the current editor.
+ *
+ * Use this composable to drive UI from the current selection without manually
+ * reading graph state in every component.
+ */
+export function useSelectionState() {
+  const editor = useEditor()
+
+  const selectedIds = useSceneComputed(() => editor.state.selectedIds)
+
+  const hasSelection = computed(() => selectedIds.value.size > 0)
+
+  const { node: selectedNode } = useSelectedNodeState(editor)
+
+  const selectedCount = computed(() => selectedIds.value.size)
+
+  const selectedNodeType = computed(() => selectedNode.value?.type ?? null)
+
+  const isInstance = computed(() => selectedNodeType.value === 'INSTANCE')
+  /** Whether the selection holds an icon, which can be detached into plain artwork. */
+  const isIcon = useSceneComputed(() => editor.getSelectedNodes().some((node) => readIcon(node)))
+  const isComponent = computed(() => selectedNodeType.value === 'COMPONENT')
+  const isGroup = computed(() => selectedNodeType.value === 'GROUP')
+
+  const canCreateComponentSet = useSceneComputed(() => {
+    if (selectedIds.value.size < 2) return false
+    for (const id of selectedIds.value) {
+      if (editor.graph.getNode(id)?.type !== 'COMPONENT') return false
+    }
+    return true
+  })
+
+  // A frame of a main component becomes a slot; other sibling layers there are wrapped in one.
+  const canCreateSlot = useSceneComputed(() => {
+    const nodes = editor.getSelectedNodes()
+    const first = nodes.at(0)
+    if (!first || nodes.some((node) => node.parentId !== first.parentId || slotPropertyId(node)))
+      return false
+    if (nodes.length === 1 && canBecomeSlot(editor.graph, first)) return true
+    return !!slotOwner(editor.graph, first)
+  })
+
+  /** Whether Ungroup takes any selected layer apart: a group, frame, boolean, or section. */
+  const canUngroup = useSceneComputed(
+    () => selectedIds.value.size > 0 && editor.canUngroupSelection()
+  )
+
+  /** Whether the selection holds layers the Auto Arrange layouts take. */
+  const canAutoArrange = useSceneComputed(() => editor.canAutoArrangeNodes([...selectedIds.value]))
+
+  return {
+    editor,
+    selectedIds,
+    hasSelection,
+    selectedNode,
+    selectedCount,
+    selectedNodeType,
+    isInstance,
+    isIcon,
+    isComponent,
+    isGroup,
+    canCreateComponentSet,
+    canCreateSlot,
+    canUngroup,
+    canAutoArrange
+  }
+}

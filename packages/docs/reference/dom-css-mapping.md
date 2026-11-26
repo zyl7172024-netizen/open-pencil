@@ -1,0 +1,80 @@
+# DOM/CSS mapping reference
+
+OpenPencil maps browser-computed DOM/CSS styles into SceneGraph fields through `@open-pencil/dom-css`. Browser adapters should use native DOM/CSSOM and `getComputedStyle()` as the source of truth. Headless conversion is an approximation for tests and CLI usage.
+
+## Layout
+
+| CSS | SceneGraph | Notes |
+|---|---|---|
+| `display: flex` / `inline-flex` | `layoutMode` | `flex-direction: row` maps to horizontal; `column` maps to vertical. |
+| `justify-content` | `primaryAxisAlign` | Supports start, center, end/flex-end, and space-between. |
+| `align-items` | `counterAxisAlign` | Supports start, center, end/flex-end, stretch, and baseline. |
+| `align-self` | `layoutAlignSelf` | Supports start, center, end/flex-end, stretch, and baseline. |
+| `flex-wrap: wrap` | `layoutWrap: WRAP` | Counter-axis spacing is preserved when gaps are available. |
+| `gap`, `row-gap`, `column-gap` | `itemSpacing`, `counterAxisSpacing` | Axis-aware: row and column gaps swap meaning for column flex direction. |
+| `padding-*` | `paddingTop/Right/Bottom/Left` | Browser-computed physical values are preferred. |
+| `position: absolute/fixed`, `left`, `top` | `layoutPositioning`, `x`, `y` | Right/bottom constraints are not mapped yet. |
+| `overflow: hidden/clip` | `clipsContent` | Other overflow values are ignored. |
+| `width`, `height`, min/max sizes | node size constraints | Browser-computed pixel values are preferred. |
+| `aspect-ratio` | fallback width/height sizing | Used when one axis is available and the other is `auto`/missing. |
+| `margin-left`/`margin-right: auto`, `<center>` | `layoutAlignSelf` | In block flow, both auto margins or a `-webkit-center` container center a block, `margin-left: auto` alone puts it at the end. A block that fills its container stays filling; one narrowed by `max-width` hugs up to it. |
+| `display: table`, rows, cells | vertical and horizontal auto layout | Rows stack, a row's cells sit side by side and stretch to its height, `border-spacing` is the gap, and `vertical-align` places a cell's content. Spanning cells and collapsed borders keep the positions layout gave them. |
+
+## Paint, stroke, and effects
+
+| CSS | SceneGraph | Notes |
+|---|---|---|
+| `background-color` | solid fill | Transparent values are ignored. |
+| `border-color`, `border-*-color` | stroke color | First available border color is used. |
+| `border-width`, `border-*-width` | stroke weight / independent stroke weights | Side-specific widths set independent stroke weights. |
+| `border-style: dashed/dotted` | `dashPattern` | Unsupported border styles fall back to solid. |
+| `border-radius`, `border-*-radius` | corner radii | Independent corners are preserved when sides differ. |
+| `opacity` | node opacity | Numeric computed value. |
+| `box-shadow` | drop shadow | First simple outer shadow only; complex shadow lists require maintained parser or browser-computed support before mapping. |
+| `<img src="data:...">` | image fill | Data URL images are stored in the graph image map. |
+| `<img src="https://...">` | preserved source URL metadata | External URL fetching is not performed; the URL is retained for HTML round-trip. |
+| `object-fit: contain/cover` | image `FIT` / `FILL` scale mode | `scale-down` maps to `FIT`; other object-fit values are not mapped yet. |
+
+## Text
+
+| CSS | SceneGraph | Notes |
+|---|---|---|
+| `color` | text fill | Uses core color parsing. |
+| `font-family` | `fontFamily` | Uses first family token. |
+| `font-size` | `fontSize` | Pixel/rem-ish numeric values. |
+| `font-weight` | `fontWeight` | Numeric values. |
+| `font-style: italic` | `italic` | Other styles ignored. |
+| `line-height` | `lineHeight` | Pixels stay pixels; a unitless multiple or a percent becomes a percent of the font size, which export writes back as a unitless multiple. |
+| `letter-spacing` | `letterSpacing` | Pixels stay pixels; `em` becomes a percent of the font size, which export writes back in `em`. |
+| `text-align` | horizontal text alignment | Supports center, right, justified, and the `-webkit-center` family `<center>` computes to; defaults left. A block holding only lines aligns them across it. |
+| `text-decoration-line` | underline / strikethrough | Decoration style/thickness are not mapped yet. |
+| `text-transform` | `textCase` | Uppercase, lowercase, and capitalize map to SceneGraph text case. |
+| `white-space: nowrap` | `maxLines = 1` | Other white-space values are not mapped yet. |
+| `text-shadow` | drop shadow effect | Simple shadows only. |
+
+## Export
+
+HTML export, Tailwind HTML, and Tailwind JSX (`sceneNodesToTailwindJSX`) share one SceneGraph → CSS projection; Tailwind classes are derived from that CSS.
+
+| SceneGraph | CSS | Notes |
+|---|---|---|
+| auto layout | `display: flex`, `flex-direction`, gaps, padding | Row direction is the default and is not written. |
+| grid layout | `display: grid`, `grid-template-*`, gaps | Equal `1fr` tracks use `repeat(N, minmax(0, 1fr))`. |
+| grid child position | `grid-column`, `grid-row`, `*-start` | Spans are written before starts. |
+| `layoutGrow` in auto layout | `flex-grow: 1` | |
+| rotation | `transform: rotate()` | Rotates around the element center. |
+| drop and inner shadows | `box-shadow` | Every visible shadow, in order; inner shadows use `inset`. A field bound to a variable is written as its `var()` where it draws the variable's value. |
+| layer / background blur | `filter` / `backdrop-filter: blur()` | A radius bound to a variable is written as its `var()` where it draws the variable's value; a negative radius keeps the literal, since CSS has no negative blur. |
+| right-to-left layout or text | `direction: rtl` | |
+| section | `<section>` | |
+| colors | hex, or `rgba()` when translucent | Hex lets Tailwind match its palette. |
+
+## Browser-oracle but not mapped yet
+
+These values are collected or covered by browser oracle tests but do not yet have a stable SceneGraph mapping:
+
+- complex gradients
+- CSS filters
+- multi-shadow lists
+- media-query-specific provenance
+- pseudo-elements

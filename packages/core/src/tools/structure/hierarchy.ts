@@ -1,0 +1,94 @@
+import * as v from 'valibot'
+
+import { defineTool, nodeSummary, requireNodes, toolFailure } from '#core/tools/schema'
+
+export const reparentNode = defineTool({
+  name: 'reparent_node',
+
+  description: 'Move a node into a different parent.',
+  execution: { kind: 'sync', mutation: 'document' },
+  input: v.strictObject({
+    id: v.pipe(v.string(), v.description('Node ID to move')),
+    parent_id: v.pipe(v.string(), v.description('New parent node ID'))
+  }),
+  execute: (figma, { id, parent_id }) => {
+    const node = figma.getNodeById(id)
+    const parent = figma.getNodeById(parent_id)
+    if (!node) return { error: `Node "${id}" not found` }
+    if (!parent) return { error: `Parent "${parent_id}" not found` }
+    parent.appendChild(node)
+    return { id, parent_id }
+  }
+})
+
+export const groupNodes = defineTool({
+  name: 'group_nodes',
+
+  description: 'Group selected nodes.',
+  execution: { kind: 'sync', mutation: 'document' },
+  input: v.strictObject({
+    ids: v.pipe(v.array(v.string()), v.minLength(2), v.description('Node IDs to group'))
+  }),
+  execute: (figma, { ids }) => {
+    const nodes = requireNodes(figma, ids)
+    if (!nodes || nodes.length < 2) return { error: 'Need at least 2 nodes to group' }
+    const parent = nodes[0].parent ?? figma.currentPage
+    const group = figma.group(nodes, parent)
+    return nodeSummary(group)
+  }
+})
+
+export const ungroupNodes = defineTool({
+  name: 'ungroup_nodes',
+
+  description: 'Ungroup groups, keeping their children in place.',
+  execution: { kind: 'sync', mutation: 'document' },
+  input: v.strictObject({
+    ids: v.pipe(v.array(v.string()), v.minLength(1), v.description('Group node IDs'))
+  }),
+  execute: (figma, { ids }) => {
+    const nodes = requireNodes(figma, ids)
+    if (!nodes) return { error: 'One or more node IDs were not found' }
+    try {
+      for (const node of nodes) figma.ungroup(node)
+    } catch (error) {
+      return toolFailure(error)
+    }
+    return { ungrouped: ids }
+  }
+})
+
+export const flattenNodes = defineTool({
+  name: 'flatten_nodes',
+
+  description: 'Flatten nodes into a single vector.',
+  execution: { kind: 'sync', mutation: 'document' },
+  input: v.strictObject({
+    ids: v.pipe(v.array(v.string()), v.minLength(1), v.description('Node IDs to flatten'))
+  }),
+  execute: (figma, { ids }) => {
+    const nodes = requireNodes(figma, ids)
+    if (!nodes) return { error: 'One or more node IDs were not found' }
+    return nodeSummary(figma.flatten(nodes, nodes[0].parent ?? figma.currentPage))
+  }
+})
+
+export const nodeToComponent = defineTool({
+  name: 'convert_to_components',
+
+  description: 'Convert one or more frames/groups into components.',
+  execution: { kind: 'sync', mutation: 'document' },
+  input: v.strictObject({
+    ids: v.pipe(v.array(v.string()), v.minLength(1), v.description('Node IDs to convert'))
+  }),
+  execute: (figma, { ids }) => {
+    const results: { id: string; name: string; originalId: string }[] = []
+    for (const id of ids) {
+      const node = figma.getNodeById(id)
+      if (!node) continue
+      const comp = figma.createComponentFromNode(node)
+      results.push({ id: comp.id, name: comp.name, originalId: id })
+    }
+    return { converted: results }
+  }
+})

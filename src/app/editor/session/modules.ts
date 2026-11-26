@@ -1,0 +1,122 @@
+import { computed, watch } from 'vue'
+
+import { resolveEditorProfile, type Editor } from '@open-pencil/core'
+import type { IORegistry } from '@open-pencil/core/io'
+import { createSelectedNodeState } from '@open-pencil/vue/editor/selection-state'
+
+import { createDocumentExportActions } from '@/app/document/export'
+import { createDocumentIOActions } from '@/app/document/io'
+import { createDesignCheck } from '@/app/editor/design-check/session'
+import { createFlashActions } from '@/app/editor/flash'
+import { createMobileClipboardActions } from '@/app/editor/mobile-clipboard'
+import type { EditorPreparationController } from '@/app/editor/preparation/controller'
+import { createProfilerActions } from '@/app/editor/profiler'
+import type { AppEditorState } from '@/app/editor/session/types'
+
+export function defineEditorStoreAccessors(store: object, editor: Editor) {
+  Object.defineProperties(store, {
+    graph: {
+      enumerable: true,
+      get: () => editor.graph
+    },
+    renderer: {
+      enumerable: true,
+      get: () => editor.renderer
+    },
+    canvasRenderers: {
+      enumerable: true,
+      get: () => editor.canvasRenderers
+    },
+    textEditor: {
+      enumerable: true,
+      get: () => editor.textEditor
+    }
+  })
+}
+
+export function createEditorComputedRefs(editor: Editor, state: AppEditorState) {
+  const { nodes: selectedNodes, dispose: disposeSelection } = createSelectedNodeState(editor)
+
+  const selectedNode = computed(() =>
+    selectedNodes.value.length === 1 ? selectedNodes.value[0] : undefined
+  )
+
+  const layerTree = computed(() => {
+    void state.sceneVersion
+    return editor.getLayerTree()
+  })
+
+  return { selectedNodes, selectedNode, layerTree, disposeSelection }
+}
+
+export function createEditorStoreModules(
+  editor: Editor,
+  state: AppEditorState,
+  io: IORegistry,
+  preparationController: EditorPreparationController
+) {
+  const flash = createFlashActions(editor, state)
+  const documentIO = createDocumentIOActions(editor, state, preparationController)
+  const documentExport = createDocumentExportActions(editor, state, io, documentIO.downloadBlob)
+  const mobileClipboard = createMobileClipboardActions(editor)
+  const profiler = createProfilerActions(editor)
+  const designCheck = createDesignCheck(editor, state)
+  // A document opens with the panels its kind starts with: a board on the canvas alone.
+  watch(
+    () => state.documentKind,
+    () => {
+      state.showUI = resolveEditorProfile(state).panelsOpen
+    },
+    { immediate: true }
+  )
+
+  return {
+    ...flash,
+    openFigFile: documentIO.openFigFile,
+    openDOMFile: documentIO.openDOMFile,
+    importDOMText: documentIO.importDOMText,
+    fitCurrentPageToViewport: documentIO.fitCurrentPageToViewport,
+    hasUnsavedChanges: documentIO.hasUnsavedChanges,
+    renameDocument: documentIO.renameDocument,
+    /** Calls back with each name the person gives the document. */
+    onDocumentRenamed: documentIO.onDocumentRenamed,
+    /** Calls back with the error of each automatic save that failed. */
+    onAutosaveFailed: documentIO.onAutosaveFailed,
+    /** Takes the document as it is now as its saved state, so closing it asks nothing. */
+    markDocumentSaved: documentIO.markDocumentSaved,
+    /** Counts the document changed by something outside its history, so it gets saved. */
+    markDocumentChanged: documentIO.markDocumentChanged,
+    /** Applies changes the document already has elsewhere, such as its room's, as no edit. */
+    adoptChanges: documentIO.adoptChanges,
+    saveFigFile: documentIO.saveFigFile,
+    saveFigFileAs: documentIO.saveFigFileAs,
+    getDocumentFilePath: documentIO.getDocumentFilePath,
+    getDocumentFileHandle: documentIO.getDocumentFileHandle,
+    hasWritableSource: documentIO.hasWritableSource,
+    getSourceIdentity: documentIO.getSourceIdentity,
+    getStorageBinding: documentIO.getStorageBinding,
+    getRecoveryId: documentIO.getRecoveryId,
+    adoptRecoverySnapshot: documentIO.adoptRecoverySnapshot,
+    persistRecoveryNow: documentIO.persistRecoveryNow,
+    discardRecovery: documentIO.discardRecovery,
+    setDocumentSource: documentIO.setDocumentSource,
+    setStorageDocumentSource: documentIO.setStorageDocumentSource,
+    setPlannedFilePath: documentIO.setPlannedFilePath,
+    saveFigFileToPath: documentIO.saveFigFileToPath,
+    saveFigFileCopy: documentIO.saveFigFileCopy,
+    saveFigFileToStorage: documentIO.saveFigFileToStorage,
+    startWatchingCurrentFile: documentIO.startWatchingCurrentFile,
+    designCheck,
+    dispose: () => {
+      designCheck.dispose()
+      editor.releaseGraphResources()
+      editor.dispose()
+      editor.clearPageViewports()
+      documentIO.disposeDocumentIO()
+      preparationController.dispose()
+    },
+    ...documentExport,
+    ...mobileClipboard,
+    ...profiler
+  }
+}

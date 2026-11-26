@@ -1,0 +1,591 @@
+import { Buffer } from 'node:buffer'
+import { resolve } from 'node:path'
+
+import type {
+  CallToolResult,
+  InputRequiredResult,
+  McpServer,
+  ToolCallback,
+  ToolAnnotations,
+  ServerContext
+} from '@modelcontextprotocol/server'
+import * as v from 'valibot'
+
+import { CODEGEN_PROMPT, toolInputFor } from '@open-pencil/core/tools'
+
+import type { RPCJSONObject } from '#mcp/json'
+import { MAX_RESULT_BYTES, fail, ok, resultTooLargeMessage } from '#mcp/result'
+import { readFileInput, withFileInput } from '#mcp/tool/input'
+import { createToolDescriptors, getMCPToolDefinitions } from '#mcp/tool/manifest'
+import type { ToolDescriptor, ToolEffect, ToolPolicy } from '#mcp/tool/metadata'
+import {
+  resolveSafePath,
+  withFileOutputHint,
+  withoutOutputPath,
+  writeToolOutput,
+  writesFileOutput
+} from '#mcp/tool/output'
+import { isToolEnabled } from '#mcp/tool/policy'
+import { toolInputSchema } from '#mcp/tool/schema'
+import { SELECTION_SCOPE_FILE_OUTPUT_ERROR } from '#mcp/tool/scope'
+
+export type RPCSender = (body: Record<string, unknown>) => Promise<unknown>
+export type MCPToolSettled = (context: ServerContext) => Promise<void>
+
+/**
+ * The document and page a call targets when not the active ones. Every document tool takes them,
+ * so they carry no description: their names say it, and list_documents gives the IDs.
+ */
+const automationTargetSchema = {
+  document_id: v.optional(v.string()),
+  page_id: v.optional(v.string())
+}
+
+function splitAutomationTarget(args: Record<string, unknown>): {
+  target: { document_id?: string; page_id?: string }
+  args: Record<string, unknown>
+} {
+  const { document_id, page_id, ...rest } = args
+  const target: { document_id?: string; page_id?: string } = {}
+  if (typeof document_id === 'string') target.document_id = document_id
+  if (typeof page_id === 'string') target.page_id = page_id
+  return { target, args: rest }
+}
+
+type RPCResponse = { ok?: boolean; result?: unknown; target?: unknown; error?: string }
+
+/** The app's recent files; the server keeps only those `open_document` could reach. */
+const recentFilesResultSchema = v.object({
+  files: v.array(v.object({ path: v.string(), name: v.string(), updated_at: v.string() }))
+})
+
+async function sendCommand(
+  sendRPC: RPCSender,
+  command: string,
+  args: Record<string, unknown>
+): Promise<RPCResponse> {
+  const res = (await sendRPC({ command, args })) as RPCResponse
+  if (res.ok === false) throw new Error(res.error)
+  return res
+}
+
+function withTarget<T extends object>(body: T, res: RPCResponse): T & { target?: unknown } {
+  return res.target ? { ...body, target: res.target } : body
+}
+
+/** Who sends a session's tool calls: any MCP client, or an ACP or Pi harness chat in the app. */
+export const MCP_AGENT_KINDS = ['mcp', 'acp', 'harness'] as const
+export type MCPAgentKind = (typeof MCP_AGENT_KINDS)[number]
+
+/** The session tool calls come from, so the app can show the client as an agent at work. */
+export interface MCPAgentSession {
+  id: string
+  kind: MCPAgentKind
+  /** The app chat the session belongs to, from its `x-openpencil-chat` header. */
+  chat?: string
+  /**
+   * Whether the client loads tools only up to a total schema size, from its
+   * `x-openpencil-defers-tools` header: the session gets `call_mcp_tool`, and tool schemas
+   * leave out `document_id` and `page_id`, since its calls go to its chat's document.
+   */
+  defersTools?: boolean
+}
+
+export interface RegisterToolsOptions {
+  policy: ToolPolicy
+  mcpRoot?: string | null
+  sendRPC: RPCSender
+  agentSession?: MCPAgentSession
+  /** Transport lifecycle cleanup after tool execution, including cancellation. */
+  onToolSettled?: MCPToolSettled
+}
+
+function toolAnnotations(effect: ToolEffect): ToolAnnotations {
+  return {
+    readOnlyHint: effect === 'read',
+    destructiveHint: effect === 'write'
+  }
+}
+
+function descriptorByName(descriptors: readonly ToolDescriptor[]): Map<string, ToolDescriptor> {
+  return new Map(descriptors.map((descriptor) => [descriptor.name, descriptor]))
+}
+
+/**
+ * The id the agent gave a call in its own conversation, which an app chat shows it under: Codex
+ * sends it as `callId`, Claude Code as `claudecode/toolUseId`.
+ */
+function agentCallId(meta: Record<string, unknown> | undefined): string | undefined {
+  const id = meta?.callId ?? meta?.['claudecode/toolUseId']
+  return typeof id === 'string' && id.length > 0 && id.length <= 128 ? id : undefined
+}
+
+export function registerTools(mcpServer: McpServer, options: RegisterToolsOptions): void {
+  const { policy, sendRPC, agentSession } = options
+  // Sent with each tool call: the session, the client's name once it has introduced itself,
+  // and for an app chat's agent, the chat and the call's id in it.
+  const agent = (meta: Record<string, unknown> | undefined) => {
+    if (!agentSession) return undefined
+    const session = {
+      session: agentSession.id,
+      kind: agentSession.kind,
+      client: mcpServer.server.getClientVersion()?.name
+    }
+    if (!agentSession.chat) return session
+    return { ...session, chat: agentSession.chat, call: agentCallId(meta) }
+  }
+  const resolvedRoot = options.mcpRoot ? resolve(options.mcpRoot) : null
+  const descriptors = descriptorByName(createToolDescriptors(resolvedRoot !== null))
+  const callable = new Map<string, CallableTool>()
+  const register = <InputArgs extends v.GenericSchema>(
+    name: string,
+    toolOptions: { description?: string; inputSchema: InputArgs; advertised?: v.GenericSchema },
+    handler: ToolCallback<ReturnType<typeof toolInputSchema<InputArgs>>>
+  ) => {
+    const descriptor = descriptors.get(name)
+    if (!descriptor) throw new Error(`Missing MCP tool descriptor for "${name}"`)
+    if (!isToolEnabled(descriptor, policy)) return
+    callable.set(name, {
+      input: toolOptions.inputSchema,
+      run: async (args, context) => handler(args, context)
+    })
+    mcpServer.registerTool(
+      name,
+      {
+        description: toolOptions.description ?? descriptor.description,
+        inputSchema: toolInputSchema(toolOptions.inputSchema, toolOptions.advertised),
+        annotations: toolAnnotations(descriptor.effect),
+        _meta: { 'openpencil/capabilities': descriptor.capabilities }
+      },
+      async (args, context) => {
+        try {
+          return await handler(args, context)
+        } finally {
+          await options.onToolSettled?.(context)
+        }
+      }
+    )
+  }
+
+  const canWriteFiles = resolvedRoot !== null
+  for (const def of getMCPToolDefinitions()) {
+    const input = toolInputFor(def, 'mcp')
+    const entries = resolvedRoot ? withFileInput(def.name, input.entries) : input.entries
+    register(
+      def.name,
+      {
+        description: def.description,
+        inputSchema: v.strictObject({ ...entries, ...automationTargetSchema }),
+        // Still accepted, but every byte counts for a client that loads tools up to a size.
+        advertised: agentSession?.defersTools ? v.strictObject(entries) : undefined
+      },
+      async (args: Record<string, unknown>, context) => {
+        try {
+          const { target, args: toolArgs } = splitAutomationTarget(args)
+          const filePath =
+            writesFileOutput(def.name) && typeof toolArgs.path === 'string' ? toolArgs.path : null
+          if (policy.scope === 'selection' && filePath !== null) {
+            return fail(new Error(SELECTION_SCOPE_FILE_OUTPUT_ERROR))
+          }
+          const appArgs = resolvedRoot
+            ? await readFileInput(def.name, toolArgs, resolvedRoot)
+            : withoutOutputPath(def.name, toolArgs)
+          const result = await sendRPC({
+            command: 'tool',
+            args: {
+              ...target,
+              name: def.name,
+              args: appArgs,
+              agent: agent(context.mcpReq._meta),
+              // A client limited to the selection says so, whatever the server's own scope.
+              ...(policy.scope === 'selection' ? { scope: policy.scope } : {})
+            }
+          })
+          const res = result as { ok?: boolean; result?: unknown; error?: string }
+          if (res.ok === false) return fail(new Error(res.error))
+          const r = res.result as RPCJSONObject | undefined
+          if (r && filePath && resolvedRoot) {
+            const written = await writeToolOutput(def.name, r, filePath, resolvedRoot)
+            if (written) return written
+          }
+          // Only an image goes back as one; a PDF stays base64 in the JSON result, as described.
+          if (
+            r &&
+            'base64' in r &&
+            typeof r.mimeType === 'string' &&
+            r.mimeType.startsWith('image/')
+          ) {
+            const base64 = String(r.base64)
+            const bytes = Buffer.byteLength(base64, 'utf8')
+            if (bytes > MAX_RESULT_BYTES) {
+              return fail(
+                new Error(
+                  resultTooLargeMessage(
+                    `Image from "${def.name}"`,
+                    bytes,
+                    'Export a smaller region or lower the scale/resolution.'
+                  )
+                )
+              )
+            }
+            return {
+              content: [
+                {
+                  type: 'image' as const,
+                  data: base64,
+                  mimeType: r.mimeType
+                }
+              ]
+            }
+          }
+          return ok(withFileOutputHint(def.name, r, canWriteFiles), def.name)
+        } catch (e) {
+          return fail(e)
+        }
+      }
+    )
+  }
+
+  register(
+    'list_documents',
+    {
+      description:
+        'List open OpenPencil documents/tabs with their IDs, file paths, current pages, and pages.',
+      inputSchema: v.strictObject({})
+    },
+    async () => {
+      try {
+        const result = await sendRPC({ command: 'list_documents', args: {} })
+        const res = result as { ok?: boolean; result?: unknown; error?: string }
+        if (res.ok === false) return fail(new Error(res.error))
+        return ok(res.result ?? {})
+      } catch (e) {
+        return fail(e)
+      }
+    }
+  )
+
+  register(
+    'save_document',
+    {
+      description: resolvedRoot
+        ? 'Save the current document to a .fig file, a .jam file for a board, or a .deck file for slides. If path is provided, it must be inside the configured MCP root.'
+        : 'Save the current document to a .fig file, a .jam file for a board, or a .deck file for slides. Saves to the file the document is open from, and fails when it has none.',
+      inputSchema: resolvedRoot
+        ? v.strictObject({
+            path: v.optional(
+              v.pipe(
+                v.string(),
+                v.minLength(1),
+                v.description(
+                  'Path for the .fig file, .jam for a board, or .deck for slides, absolute or relative to the MCP root'
+                )
+              )
+            ),
+            ...automationTargetSchema
+          })
+        : v.strictObject({ ...automationTargetSchema })
+    },
+    async (args: { path?: string; document_id?: string; page_id?: string }, context) => {
+      try {
+        const safePath =
+          args.path !== undefined && resolvedRoot
+            ? await resolveSafePath(args.path, resolvedRoot)
+            : undefined
+        const { target } = splitAutomationTarget(args)
+        const result = await sendRPC({
+          command: 'save_document',
+          args: { ...target, path: safePath?.realPath, agent: agent(context.mcpReq._meta) }
+        })
+        const res = result as { ok?: boolean; result?: unknown; target?: unknown; error?: string }
+        if (res.ok === false) return fail(new Error(res.error))
+        const response: { saved: true; path?: string; target?: unknown } = { saved: true }
+        if (safePath) response.path = safePath.resolved
+        if (res.target) response.target = res.target
+        return ok(response)
+      } catch (e) {
+        return fail(e)
+      }
+    }
+  )
+
+  if (resolvedRoot) {
+    register(
+      'open_document',
+      {
+        description: 'Open a .fig or .pen file from inside the configured MCP root.',
+        inputSchema: v.strictObject({
+          path: v.pipe(
+            v.string(),
+            v.minLength(1),
+            v.description('Path to the design file, absolute or relative to the MCP root')
+          ),
+          ...automationTargetSchema
+        })
+      },
+      async (args: { path: string; document_id?: string; page_id?: string }, context) => {
+        try {
+          const safe = await resolveSafePath(args.path, resolvedRoot)
+          const { target } = splitAutomationTarget(args)
+          const result = await sendRPC({
+            command: 'open_document',
+            args: { ...target, path: safe.realPath, agent: agent(context.mcpReq._meta) }
+          })
+          const res = result as { ok?: boolean; result?: unknown; target?: unknown; error?: string }
+          if (res.ok === false) return fail(new Error(res.error))
+          const response: { opened: true; target?: unknown } = { opened: true }
+          if (res.target) response.target = res.target
+          return ok(response)
+        } catch (e) {
+          return fail(e)
+        }
+      }
+    )
+
+    register('list_recent_documents', { inputSchema: v.strictObject({}) }, async () => {
+      try {
+        const res = await sendCommand(sendRPC, 'list_recent_documents', {})
+        const { files } = v.parse(recentFilesResultSchema, res.result)
+        const insideRoot = await Promise.all(
+          files.map((file) =>
+            resolveSafePath(file.path, resolvedRoot).then(
+              () => true,
+              () => false
+            )
+          )
+        )
+        return ok({ files: files.filter((_, index) => insideRoot[index]) })
+      } catch (e) {
+        return fail(e)
+      }
+    })
+
+    register(
+      'create_document',
+      {
+        description:
+          'Create a new empty document with an optional save path inside the configured MCP root.',
+        inputSchema: v.strictObject({
+          path: v.optional(
+            v.pipe(
+              v.string(),
+              v.minLength(1),
+              v.description('Path for the new file, absolute or relative to the MCP root')
+            )
+          ),
+          ...automationTargetSchema
+        })
+      },
+      async (args: { path?: string; document_id?: string; page_id?: string }, context) => {
+        try {
+          const safePath =
+            args.path !== undefined ? await resolveSafePath(args.path, resolvedRoot) : undefined
+          const { target } = splitAutomationTarget(args)
+          const result = await sendRPC({
+            command: 'create_document',
+            args: { ...target, path: safePath?.realPath, agent: agent(context.mcpReq._meta) }
+          })
+          const res = result as { ok?: boolean; result?: unknown; target?: unknown; error?: string }
+          if (res.ok === false) return fail(new Error(res.error))
+          const response: { created: true; target?: unknown } = { created: true }
+          if (res.target) response.target = res.target
+          return ok(response)
+        } catch (e) {
+          return fail(e)
+        }
+      }
+    )
+  }
+
+  const closeEntries = {
+    unsaved: v.optional(
+      v.pipe(
+        v.picklist(['error', 'save', 'discard']),
+        v.description(
+          'What to do with unsaved changes: "error" (default) fails, "save" saves first, "discard" drops them'
+        )
+      )
+    ),
+    ...automationTargetSchema
+  }
+
+  register(
+    'close_document',
+    {
+      inputSchema: resolvedRoot
+        ? v.strictObject({
+            ...closeEntries,
+            path: v.optional(
+              v.pipe(
+                v.string(),
+                v.minLength(1),
+                v.description(
+                  'With unsaved "save": .fig path for a document never saved, inside the MCP root'
+                )
+              )
+            )
+          })
+        : v.strictObject(closeEntries)
+    },
+    async (
+      args: {
+        unsaved?: 'error' | 'save' | 'discard'
+        path?: string
+        document_id?: string
+        page_id?: string
+      },
+      context
+    ) => {
+      try {
+        const safePath =
+          args.path !== undefined && resolvedRoot
+            ? await resolveSafePath(args.path, resolvedRoot)
+            : undefined
+        const { target } = splitAutomationTarget(args)
+        // An app chat's agent closes the chat's document unless it names another.
+        const rpcArgs: Record<string, unknown> = { ...target, agent: agent(context.mcpReq._meta) }
+        if (args.unsaved) rpcArgs.unsaved = args.unsaved
+        if (safePath) rpcArgs.path = safePath.realPath
+        const res = await sendCommand(sendRPC, 'close_document', rpcArgs)
+        const closed = (res.result as { closed?: boolean } | undefined)?.closed === true
+        return ok(withTarget({ closed }, res))
+      } catch (e) {
+        return fail(e)
+      }
+    }
+  )
+
+  register(
+    'activate_document',
+    {
+      inputSchema: v.strictObject({
+        document_id: v.pipe(v.string(), v.description('Document/tab ID from list_documents')),
+        page_id: automationTargetSchema.page_id
+      })
+    },
+    async (args: { document_id: string; page_id?: string }, context) => {
+      try {
+        const { target } = splitAutomationTarget(args)
+        const res = await sendCommand(sendRPC, 'activate_document', {
+          ...target,
+          agent: agent(context.mcpReq._meta)
+        })
+        return ok(withTarget({ activated: true }, res))
+      } catch (e) {
+        return fail(e)
+      }
+    }
+  )
+
+  for (const command of ['undo', 'redo'] as const) {
+    register(
+      command,
+      { inputSchema: v.strictObject({ ...automationTargetSchema }) },
+      async (args, context) => {
+        try {
+          const { target } = splitAutomationTarget(args)
+          const res = await sendCommand(sendRPC, command, {
+            ...target,
+            agent: agent(context.mcpReq._meta)
+          })
+          return ok(withTarget({ ...(res.result as RPCJSONObject | undefined) }, res))
+        } catch (e) {
+          return fail(e)
+        }
+      }
+    )
+  }
+
+  register('get_settings', { inputSchema: v.strictObject({}) }, async () => {
+    try {
+      const res = await sendCommand(sendRPC, 'get_settings', {})
+      return ok(res.result ?? {})
+    } catch (e) {
+      return fail(e)
+    }
+  })
+
+  register(
+    'update_settings',
+    {
+      inputSchema: v.strictObject({
+        settings: v.pipe(
+          v.record(v.string(), v.unknown()),
+          v.description(
+            'Partial settings, e.g. {"appearance":{"theme":"light"},"editing":{"snapping":{"pixelGrid":false}}}. Unknown keys and invalid values are rejected.'
+          )
+        )
+      })
+    },
+    async (args: { settings: Record<string, unknown> }) => {
+      try {
+        // Echo only the applied patch: with get_settings disabled, writing must not read.
+        await sendCommand(sendRPC, 'update_settings', { settings: args.settings })
+        return ok({ updated: args.settings })
+      } catch (e) {
+        return fail(e)
+      }
+    }
+  )
+
+  register(
+    'get_codegen_prompt',
+    {
+      description:
+        'Get design-to-code generation guidelines. Call before generating frontend code.',
+      inputSchema: v.strictObject({})
+    },
+    async () => ok({ prompt: CODEGEN_PROMPT })
+  )
+
+  if (agentSession?.defersTools) registerCallTool(mcpServer, callable, options.onToolSettled)
+}
+
+/** A registered tool as `call_mcp_tool` runs it: its input, and its handler. */
+interface CallableTool {
+  input: v.GenericSchema
+  run: (args: unknown, context: ServerContext) => Promise<CallToolResult | InputRequiredResult>
+}
+
+const callToolInputSchema = v.strictObject({
+  toolName: v.pipe(v.string(), v.description('The OpenPencil tool, such as create_shape')),
+  arguments: v.optional(
+    v.pipe(v.record(v.string(), v.unknown()), v.description('The arguments its schema describes'))
+  )
+})
+
+/**
+ * Antigravity CLI holds back the tools past its schema budget and tells its model to call them
+ * through `call_mcp_tool`, which it does not provide over ACP; this is that tool. It runs only the
+ * tools this session registered, after checking the arguments as a direct call would.
+ */
+function registerCallTool(
+  mcpServer: McpServer,
+  callable: ReadonlyMap<string, CallableTool>,
+  onToolSettled: MCPToolSettled | undefined
+): void {
+  mcpServer.registerTool(
+    'call_mcp_tool',
+    {
+      description:
+        'Call an OpenPencil tool by name, with the arguments its schema describes. Use it for the OpenPencil tools that are not loaded as functions.',
+      inputSchema: toolInputSchema(callToolInputSchema),
+      annotations: toolAnnotations('write')
+    },
+    async ({ toolName, arguments: args = {} }, context) => {
+      try {
+        const tool = callable.get(toolName)
+        if (!tool) return fail(new Error(`No OpenPencil tool named "${toolName}"`))
+        const parsed = v.safeParse(tool.input, args)
+        if (!parsed.success) {
+          return fail(
+            new Error(`Invalid arguments for ${toolName}:\n${v.summarize(parsed.issues)}`)
+          )
+        }
+        return await tool.run(parsed.output, context)
+      } finally {
+        await onToolSettled?.(context)
+      }
+    }
+  )
+}

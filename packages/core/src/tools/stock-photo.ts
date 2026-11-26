@@ -1,0 +1,45 @@
+import * as v from 'valibot'
+
+import { defineTool } from './schema'
+import { applyPhotos } from './stock-photo/apply'
+import { getActiveProvider } from './stock-photo/providers'
+import { parsePhotoRequests } from './stock-photo/requests'
+
+export { applyPhotos, type PhotoRequest, type PhotoResult } from './stock-photo/apply'
+export { parsePhotoRequests } from './stock-photo/requests'
+export { setPexelsAPIKey, setUnsplashAccessKey } from './stock-photo/providers'
+
+export const stockPhoto = defineTool({
+  name: 'search_stock_photos',
+
+  description:
+    'Search stock photos and apply to leaf image placeholders or closed area geometry. ' +
+    'Pass a JSON array; each item is {id, query, index?, orientation?}. ' +
+    'Containers with content, text, lines, and structural nodes are rejected.',
+  execution: { kind: 'async', mutation: 'document' },
+  capabilities: ['document:write', 'network:access'],
+  input: v.strictObject({
+    requests: v.pipe(
+      v.string(),
+      v.description(
+        'JSON array: [{"id":"0:5","query":"mountain sunset"},{"id":"0:8","query":"business team","orientation":"square"}]'
+      )
+    )
+  }),
+  execute: async (figma, { requests }) => {
+    const provider = getActiveProvider()
+    if (!provider) {
+      return {
+        error: `No stock photo service has a key. Ask the user to add a Pexels or Unsplash key: Insert photo in the toolbar asks for one.`
+      }
+    }
+
+    const reqs = parsePhotoRequests(requests)
+    if ('error' in reqs) return reqs
+
+    const results = await applyPhotos(figma, provider, reqs)
+    const ok = results.filter((result) => result.photo).length
+
+    return { applied: ok, failed: results.length - ok, provider: provider.name, results }
+  }
+})

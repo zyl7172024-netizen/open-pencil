@@ -1,0 +1,2 @@
+export const CHECKERBOARD_BACKGROUND =
+  'bg-checkerboard bg-[image:linear-gradient(45deg,var(--color-checkerboard-muted)_25%,transparent_25%),linear-gradient(-45deg,var(--color-checkerboard-muted)_25%,transparent_25%),linear-gradient(45deg,transparent_75%,var(--color-checkerboard-muted)_75%),linear-gradient(-45deg,transparent_75%,var(--color-checkerboard-muted)_75%)] bg-[size:0.5rem_0.5rem] bg-[position:0_0,0_0.25rem,0.25rem_-0.25rem,-0.25rem_0]'

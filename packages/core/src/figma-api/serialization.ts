@@ -1,0 +1,104 @@
+import type { SceneGraph, SceneNode } from '@open-pencil/scene-graph'
+import { figmaTextAutoResize } from '@open-pencil/scene-graph/text'
+
+import { figmaNodeType } from './accessors/basic'
+import { pluginChildren } from './accessors/sticky'
+import { figmaFills, figmaStrokes } from './accessors/visual'
+import type { NodeProxyHost } from './proxy'
+
+function resolveBindings(graph: SceneGraph, node: SceneNode): Record<string, unknown> | undefined {
+  const keys = Object.keys(node.boundVariables)
+  if (keys.length === 0) return undefined
+  const result: Record<string, unknown> = {}
+  for (const [field, varId] of Object.entries(node.boundVariables)) {
+    const variable = graph.variables.get(varId)
+    result[field] = {
+      variableId: varId,
+      variableName: variable?.name ?? varId,
+      resolvedValue: variable ? graph.resolveVariable(varId) : undefined
+    }
+  }
+  return result
+}
+
+function appendTextProps(obj: Record<string, unknown>, n: SceneNode): void {
+  obj.fontFamily = n.fontFamily
+  obj.fontSize = n.fontSize
+  obj.fontWeight = n.fontWeight
+  obj.italic = n.italic
+  obj.textAlignHorizontal = n.textAlignHorizontal
+  obj.textAlignVertical = n.textAlignVertical
+  obj.textAutoResize = figmaTextAutoResize(n)
+  obj.textDirection = n.textDirection
+  if (n.lineHeight != null) obj.lineHeight = n.lineHeight
+  if (n.letterSpacing.value !== 0) obj.letterSpacing = n.letterSpacing
+  if (n.textCase !== 'ORIGINAL') obj.textCase = n.textCase
+  if (n.textDecoration !== 'NONE') obj.textDecoration = n.textDecoration
+  if (n.maxLines != null) obj.maxLines = n.maxLines
+}
+
+function appendComponentProperties(obj: Record<string, unknown>, n: SceneNode): void {
+  if (
+    (n.type === 'COMPONENT' || n.type === 'COMPONENT_SET') &&
+    n.componentPropertyDefinitions.length > 0
+  ) {
+    obj.componentPropertyDefinitions = n.componentPropertyDefinitions
+  }
+  if (n.componentPropertyReferences.length > 0)
+    obj.componentPropertyReferences = n.componentPropertyReferences
+  if (n.type === 'INSTANCE' && Object.keys(n.componentPropertyAssignments).length > 0)
+    obj.componentPropertyAssignments = n.componentPropertyAssignments
+}
+
+export function nodeProxyToJSON(
+  graph: SceneGraph,
+  api: NodeProxyHost,
+  nodeId: string,
+  maxDepth?: number,
+  currentDepth = 0
+): Record<string, unknown> {
+  const n = graph.getNode(nodeId)
+  if (!n) return { id: nodeId, removed: true }
+
+  const obj: Record<string, unknown> = {
+    id: n.id,
+    type: figmaNodeType(graph, n),
+    name: n.name,
+    x: n.x,
+    y: n.y,
+    width: n.width,
+    height: n.height
+  }
+  if (n.fills.length > 0) obj.fills = figmaFills(n)
+  if (n.strokes.length > 0) obj.strokes = figmaStrokes(n)
+  if (n.effects.length > 0) obj.effects = n.effects
+  if (n.opacity !== 1) obj.opacity = n.opacity
+  if (n.cornerRadius > 0) obj.cornerRadius = n.cornerRadius
+  if (!n.visible) obj.visible = false
+  if (n.text) obj.characters = n.text
+  appendComponentProperties(obj, n)
+  if (n.type === 'TEXT') {
+    appendTextProps(obj, n)
+  }
+  if (n.layoutMode !== 'NONE') {
+    obj.layoutMode = n.layoutMode
+    obj.layoutDirection = n.layoutDirection
+    obj.itemSpacing = n.itemSpacing
+  }
+  // Include variable bindings with resolved values
+  const bindings = resolveBindings(graph, n)
+  if (bindings) obj.boundVariables = bindings
+  // The modes the layer sets itself, by collection ID, as Figma names them; children inherit them.
+  if (Object.keys(n.variableModes).length > 0) obj.explicitVariableModes = { ...n.variableModes }
+  const children = pluginChildren(graph, nodeId)
+  if (children.length > 0) {
+    if (maxDepth !== undefined && currentDepth >= maxDepth) {
+      obj.childCount = children.length
+    } else {
+      obj.children = children.map((child) =>
+        api.wrapNode(child.id).toJSON(maxDepth, currentDepth + 1)
+      )
+    }
+  }
+  return obj
+}

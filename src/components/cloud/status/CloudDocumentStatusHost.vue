@@ -1,0 +1,194 @@
+<script setup lang="ts">
+import { useObjectUrl } from '@vueuse/core'
+import { isEqual } from 'es-toolkit'
+import { joinURL } from 'ufo'
+import { computed, ref, shallowRef, watch } from 'vue'
+import { useRouter } from 'vue-router'
+
+import { CLOUD_ACCOUNT_PLAN_PATH } from '@open-pencil/cloud/contract'
+import { useMessages } from '@open-pencil/vue/i18n'
+
+import { openCloudConnect } from '@/app/cloud/connect/flow'
+import {
+  conflictChoiceRequested,
+  resolveCloudConflict,
+  type CloudConflictChoice
+} from '@/app/cloud/documents/conflict'
+import { useCloudDocumentStatus } from '@/app/cloud/documents/status'
+import { signInToEditCloudShare } from '@/app/cloud/links'
+import {
+  cloudRoomPermissions,
+  cloudRoomsAtStorageLimit,
+  cloudRoomsRefused,
+  rejoinRefusedRoom
+} from '@/app/cloud/rooms/live'
+import { showCloudServerOnHome } from '@/app/cloud/servers/store'
+import { cloudConnection } from '@/app/cloud/sessions/connection'
+import { cloudShareOpen } from '@/app/cloud/sharing/dialog'
+import { cloudShareTarget } from '@/app/cloud/sharing/document'
+import { cloudGuestLinkTabs } from '@/app/cloud/sharing/link'
+import { useEditorStore } from '@/app/editor/active-store'
+import { useDateFormat } from '@/app/i18n/date'
+import { createStorageAdapter } from '@/app/integrations/storage'
+import { openHomeLocation } from '@/app/shell/menu/navigation'
+import { openExternalLink, toast } from '@/app/shell/ui'
+import { getLocalCanvasStore } from '@/app/storage/local-store'
+import { resumeStorageSync } from '@/app/storage/sync'
+import CloudConflictDialog from '@/components/cloud/conflict/CloudConflictDialog.vue'
+
+import CloudDocumentStatus from './CloudDocumentStatus.vue'
+import CloudGuestStatus from './CloudGuestStatus.vue'
+
+/** The open document's Cloud status beside its name, and the choice when it conflicts. */
+const store = useEditorStore()
+const router = useRouter()
+const t = useMessages('cloud/editor')
+const dates = useDateFormat()
+const { state, location, meta } = useCloudDocumentStatus(() => store.getStorageBinding())
+
+const ago = (iso: string | null | undefined) => (iso ? dates.relative(iso) : '')
+const savedAgo = computed(() => ago(meta.value?.lastSyncedAt) || null)
+const viewOnly = computed(() => cloudRoomPermissions.value.get(store) === 'view')
+const atStorageLimit = computed(() => cloudRoomsAtStorageLimit.value.has(store))
+/** The plan page of the server the document lives on, where a bigger plan is chosen. */
+const billingURL = computed(() => {
+  const binding = store.getStorageBinding()
+  const target = binding && cloudShareTarget(binding)
+  return target?.discovery.billing ? joinURL(target.server.url, CLOUD_ACCOUNT_PLAN_PATH) : null
+})
+const notLive = computed(() => cloudRoomsRefused.value.has(store))
+/** A tab opened from a link without an account has no Cloud file of its own to report on. */
+const guestLink = computed(() => cloudGuestLinkTabs.value.get(store) ?? null)
+/** Rejoining shows the document as the server holds it, so it waits for this tab's edits. */
+const canRejoin = computed(() => state.value === 'synced' && !store.hasUnsavedChanges())
+/**
+ * Saving and saved need nothing from the person, and the tab's dot already shows unsaved edits,
+ * so the status shows only for what does: being offline, a failed save, a conflict, view only.
+ */
+const needsAttention = computed(
+  () =>
+    viewOnly.value ||
+    notLive.value ||
+    state.value === 'offline' ||
+    state.value === 'error' ||
+    state.value === 'conflict'
+)
+
+const resolving = ref(false)
+const choice = ref<CloudConflictChoice>('keep-both')
+const localPreview = shallowRef<Blob | null>(null)
+const localPreviewURL = useObjectUrl(localPreview)
+const cloudSavedAt = ref<string | null>(null)
+let conflictRequest = 0
+
+async function openConflict() {
+  const binding = store.getStorageBinding()
+  if (!binding) return
+  const request = ++conflictRequest
+  choice.value = 'keep-both'
+  const thumb = await getLocalCanvasStore()
+    .readThumb(binding.documentId)
+    .catch(() => null)
+  const stored = await createStorageAdapter(binding)
+    .getDocumentMetadata?.(binding.documentId)
+    .catch(() => null)
+  // A later request supersedes this one, and its own reads fill and open the dialog; Save to
+  // can also move the document elsewhere meanwhile, and these reads describe the old place.
+  if (request !== conflictRequest || !isEqual(store.getStorageBinding(), binding)) return
+  localPreview.value = thumb ? new Blob([Uint8Array.from(thumb)], { type: 'image/png' }) : null
+  cloudSavedAt.value = stored?.updatedAt ?? null
+  // Opened once both copies are read, so it never shows the last conflict's preview or time.
+  resolving.value = true
+}
+
+// A notification about this tab's conflict opens the choice once the status knows of it.
+watch(
+  [conflictChoiceRequested, state],
+  ([requested, current]) => {
+    const documentId = store.getStorageBinding()?.documentId
+    if (!requested || current !== 'conflict') return
+    if (requested.getStorageBinding()?.documentId !== documentId) return
+    conflictChoiceRequested.value = null
+    void openConflict()
+  },
+  { immediate: true }
+)
+
+async function confirm(picked: CloudConflictChoice) {
+  resolving.value = false
+  try {
+    await resolveCloudConflict(
+      store,
+      picked,
+      t.value.conflictYourCopyName({ name: store.state.documentName })
+    )
+  } catch {
+    toast.error(t.value.conflictResolveFailed)
+  }
+}
+
+/** Home lists one server's workspaces at a time, so it switches to this document's server. */
+function openWorkspace() {
+  const binding = store.getStorageBinding()
+  if (!binding?.profileId || !binding.containerId) return
+  showCloudServerOnHome(binding.profileId)
+  openHomeLocation(router, { kind: 'workspace', id: binding.containerId })
+}
+
+/** The server's billing portal, where the owner can choose a plan with more storage. */
+function managePlan() {
+  if (billingURL.value) void openExternalLink(billingURL.value)
+}
+
+function retry() {
+  const serverId = location.value?.serverId
+  if (serverId && cloudConnection(serverId).state !== 'signed-in') {
+    openCloudConnect({ serverId })
+    return
+  }
+  void resumeStorageSync()
+}
+</script>
+
+<template>
+  <template v-if="state && location">
+    <CloudDocumentStatus
+      v-if="needsAttention"
+      :state="state"
+      :workspace="location.workspace ?? location.host"
+      :host="location.host"
+      :saved-ago="savedAgo"
+      :view-only="viewOnly"
+      :at-storage-limit="atStorageLimit"
+      :can-manage-plan="billingURL !== null"
+      :not-live="notLive"
+      :can-rejoin="canRejoin"
+      @resolve="openConflict"
+      @rejoin="rejoinRefusedRoom(store)"
+      @share="cloudShareOpen = true"
+      @retry="retry"
+      @open-workspace="openWorkspace"
+      @manage-plan="managePlan"
+    />
+    <CloudConflictDialog
+      v-model:open="resolving"
+      v-model:choice="choice"
+      :document-name="store.state.documentName"
+      :mine="{
+        previewURL: localPreviewURL,
+        by: t.conflictYouOnThisDevice,
+        savedAgo: ago(meta?.updatedAt)
+      }"
+      :cloud="{ previewURL: null, savedAgo: ago(cloudSavedAt) }"
+      @confirm="confirm"
+      @later="resolving = false"
+    />
+  </template>
+  <!-- A link's copy has no Cloud file of its own; it reports a guest's view or a full owner. -->
+  <CloudGuestStatus
+    v-else-if="guestLink || atStorageLimit"
+    :can-edit-signed-in="guestLink?.canEditSignedIn ?? false"
+    :at-storage-limit="atStorageLimit"
+    @sign-in="signInToEditCloudShare(store)"
+  />
+</template>

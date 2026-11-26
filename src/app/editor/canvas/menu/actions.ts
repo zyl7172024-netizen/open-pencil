@@ -1,0 +1,115 @@
+import type { Ref } from 'vue'
+
+import { nodeToXPath } from '@open-pencil/core/xpath'
+
+import { useComments } from '@/app/comments/use'
+import type { EditorStore } from '@/app/editor/active-store'
+import { pasteClipboardToReplace } from '@/app/editor/clipboard/paste/replace'
+import { pasteClipboardAsLayers } from '@/app/editor/clipboard/paste/web'
+import {
+  copySelectionProperties,
+  pasteClipboardProperties
+} from '@/app/editor/clipboard/properties'
+import { executeClipboardCommand } from '@/app/editor/clipboard/system'
+import { createTextClipboard } from '@/app/editor/clipboard/text'
+import { canVectorizeImageNode, vectorizeImageNode } from '@/app/editor/vectorize'
+import { notificationMessages } from '@/app/i18n/notifications'
+import { toast } from '@/app/shell/ui'
+
+function toArrayBuffer(data: Uint8Array): ArrayBuffer {
+  const bytes = new Uint8Array(data.length)
+  bytes.set(data)
+  return bytes.buffer
+}
+
+export function createCanvasMenuActions(store: EditorStore, selectedIds: Ref<Set<string>>) {
+  const copyText = createTextClipboard()
+  const comments = useComments()
+
+  function ids() {
+    return [...selectedIds.value]
+  }
+
+  function execCommand(cmd: 'copy' | 'cut' | 'paste') {
+    const { cursorCanvasX: ccx, cursorCanvasY: ccy } = store.state
+    const cursorPos = ccx != null && ccy != null ? { x: ccx, y: ccy } : undefined
+    void executeClipboardCommand(store, cmd, cursorPos).then((ok) => {
+      if (!ok) toast.error(notificationMessages.get().clipboardAccessBlocked)
+      return undefined
+    })
+  }
+
+  async function clipboardWrite(text: string | null, label: string) {
+    if (text) await copyText(text, label)
+  }
+
+  async function copyNodeId() {
+    const nodeIds = ids()
+    if (nodeIds.length === 0) return
+    const messages = notificationMessages.get()
+    await clipboardWrite(
+      nodeIds.join(', '),
+      nodeIds.length > 1 ? messages.nodeIDs : messages.nodeID
+    )
+  }
+
+  async function copyXPath() {
+    const nodeIds = ids()
+    if (nodeIds.length === 0) return
+    const xpaths = nodeIds
+      .map((id) => nodeToXPath(store.graph, id))
+      .filter((xpath): xpath is string => xpath !== null)
+    if (xpaths.length === 0) return
+    const messages = notificationMessages.get()
+    await clipboardWrite(xpaths.join('\n'), xpaths.length > 1 ? messages.xPaths : messages.xPath)
+  }
+
+  async function copyAsPNG() {
+    if (typeof ClipboardItem === 'undefined') {
+      toast.error(notificationMessages.get().pngClipboardUnavailable)
+      return
+    }
+    const data = await store.renderExportImage(ids(), 2, 'PNG')
+    if (!data) return
+    const blob = new Blob([toArrayBuffer(data)], { type: 'image/png' })
+    await navigator.clipboard.write([new ClipboardItem({ 'image/png': blob })])
+    toast.info(notificationMessages.get().copiedAs({ format: 'PNG' }))
+  }
+
+  function removeSelectedGuide() {
+    const guide = store.state.guides.selected
+    if (!guide) return
+    store.removeGuide(guide.ownerId, guide.guideId)
+    store.setSelectedGuide(null)
+  }
+
+  return {
+    ids,
+    execCommand,
+    removeSelectedGuide,
+    toggleUI: () => {
+      store.state.showUI = !store.state.showUI
+    },
+    toggleCommentsOnCanvas: comments.toggleOnCanvas,
+    pasteToReplace: () => pasteClipboardToReplace(store),
+    // Pastes where the menu was opened, as Paste here does.
+    pasteAsLayers: () => {
+      const { cursorCanvasX: x, cursorCanvasY: y } = store.state
+      void pasteClipboardAsLayers(store, x != null && y != null ? { x, y } : undefined)
+    },
+    copyProperties: () => copySelectionProperties(store),
+    pasteProperties: () => pasteClipboardProperties(store),
+    clipboardWrite,
+    copyNodeId,
+    copyXPath,
+    copyAsPNG,
+    canVectorizeImage: () => {
+      void selectedIds.value
+      return canVectorizeImageNode(store)
+    },
+    vectorizeImage: async () => {
+      const nodeId = ids()[0]
+      if (nodeId) await vectorizeImageNode(store, nodeId)
+    }
+  }
+}

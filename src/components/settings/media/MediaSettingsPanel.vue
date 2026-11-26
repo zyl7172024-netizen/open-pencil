@@ -1,0 +1,92 @@
+<script setup lang="ts">
+import { computed, ref } from 'vue'
+
+import { IS_TAURI } from '@open-pencil/core/constants'
+import { useMessages } from '@open-pencil/vue/i18n'
+
+import { vectorizeProviderID, VECTORIZE_PROVIDER_DEFINITIONS } from '@/app/editor/vectorize'
+import { exaKeyStatus, pexelsKeyStatus, unsplashKeyStatus } from '@/app/settings/credentials/media'
+import type { MediaSettingsService } from '@/app/settings/media/use'
+import SettingsPage from '@/components/settings/layout/SettingsPage.vue'
+import SettingsSection from '@/components/settings/layout/SettingsSection.vue'
+import AppActionRow from '@/components/ui/list/AppActionRow.vue'
+import { useHeldContent } from '@/components/ui/overlay/held'
+import PanelDrillIn from '@/components/ui/panel/PanelDrillIn.vue'
+
+import MediaCredentialEditor from './MediaCredentialEditor.vue'
+
+const editing = ref<MediaSettingsService | null>(null)
+// The editor keeps its service while it slides away.
+const editedService = useHeldContent(editing)
+const settings = useMessages('settings')
+const media = useMessages('media')
+const stockServices = computed(() => [
+  { id: 'pexels' as const, name: 'Pexels', status: pexelsKeyStatus.value },
+  { id: 'unsplash' as const, name: 'Unsplash', status: unsplashKeyStatus.value }
+])
+const vectorProvider = computed(() =>
+  VECTORIZE_PROVIDER_DEFINITIONS.find((item) => item.id === vectorizeProviderID.value)
+)
+</script>
+
+<template>
+  <PanelDrillIn :open="editing !== null" data-test-id="settings-media-panel">
+    <template #detail>
+      <MediaCredentialEditor
+        v-if="editedService"
+        :key="editedService"
+        :service="editedService"
+        @done="editing = null"
+      />
+    </template>
+    <SettingsPage>
+      <div class="flex flex-col gap-6">
+        <!-- A campaign's note, such as web search coming with Cloud. -->
+        <slot name="campaign" />
+        <SettingsSection>
+          <template #title>{{ media.stockPhotos }}</template>
+          <AppActionRow
+            v-for="service in stockServices"
+            :key="service.id"
+            @click="editing = service.id"
+          >
+            {{ service.name }}
+            <template #description>{{
+              service.status === 'configured' ? settings.configured : settings.notConfigured
+            }}</template>
+            <template #trailing
+              >{{ settings.edit
+              }}<icon-lucide-chevron-right data-direction="reading" class="size-3.5"
+            /></template>
+          </AppActionRow>
+        </SettingsSection>
+        <!-- Exa refuses browsers, so only the desktop app can search with a key of its own. -->
+        <SettingsSection v-if="IS_TAURI">
+          <template #title>{{ media.webSearch }}</template>
+          <template #description>{{ media.webSearchDescription }}</template>
+          <AppActionRow data-web-search-settings @click="editing = 'exa'">
+            Exa
+            <template #description>{{
+              exaKeyStatus === 'configured' ? settings.configured : settings.notConfigured
+            }}</template>
+            <template #trailing
+              >{{ settings.edit
+              }}<icon-lucide-chevron-right data-direction="reading" class="size-3.5"
+            /></template>
+          </AppActionRow>
+        </SettingsSection>
+        <SettingsSection>
+          <template #title>{{ media.vectorization }}</template>
+          <template #description>{{ media.vectorizationDescription }}</template>
+          <AppActionRow data-vectorize-settings @click="editing = 'vectorize'">
+            {{ vectorProvider?.name }}
+            <template #trailing
+              >{{ settings.edit
+              }}<icon-lucide-chevron-right data-direction="reading" class="size-3.5"
+            /></template>
+          </AppActionRow>
+        </SettingsSection>
+      </div>
+    </SettingsPage>
+  </PanelDrillIn>
+</template>

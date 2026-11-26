@@ -1,0 +1,324 @@
+import { bytesToHex } from '@noble/hashes/utils.js'
+import { groupBy } from 'es-toolkit/array'
+
+import type { NodeChange } from '@open-pencil/kiwi/fig/codec'
+import type { CharacterStyleOverride, DerivedTextGlyph, SceneNode } from '@open-pencil/scene-graph'
+import { faceStyleKey, normalizeFontFamily } from '@open-pencil/scene-graph/font-style'
+import { rangeFontStyle } from '@open-pencil/scene-graph/shared-styles'
+import {
+  hasTextList,
+  lineHeightPixels,
+  paragraphIndexAt,
+  textParagraphRanges
+} from '@open-pencil/scene-graph/text'
+import { maxOf, minOf } from '@open-pencil/std/arrays'
+
+import type { PlacedTextGlyph, TextDecorationRecord } from '../export/runtime'
+import { figmaStyleName, standardStyleNamer, type StyleNamer } from '../font/style'
+import { bakeGlyphScale, encodePathCommandsBlob, type OutlineCommand } from '../path/commands'
+import { characterStyleIDs } from '../text/data-export'
+import { buildDerivedTextData } from './data'
+import { emojiGlyphFields } from './glyphs'
+
+type DerivedTextData = NonNullable<NodeChange['derivedTextData']>
+type DerivedTextBaseline = NonNullable<DerivedTextData['baselines']>[number]
+type DerivedTextGlyphRecord = NonNullable<DerivedTextData['glyphs']>[number]
+type DerivedTextDecoration = NonNullable<DerivedTextData['decorations']>[number]
+
+/**
+ * One shaped glyph in node space: `x`/`y` sit on its baseline, and `commands` are its outline in
+ * pixels at `fontSize`, or `null` when the shaper could not tell which font drew it.
+ */
+export interface ShapedTextGlyph {
+  commands: OutlineCommand[] | null
+  x: number
+  y: number
+  fontSize: number
+  /** The character the glyph draws, left out for a list marker. */
+  firstCharacter?: number
+  /** Horizontal advance in pixels. */
+  advance: number
+  /** The emoji the glyph stands for, when it is one: its outline is then the placeholder square. */
+  emojiCodePoints?: number[]
+}
+
+/** Text laid out at the node's width, as the renderer draws it. */
+export interface ShapedText {
+  glyphs: ShapedTextGlyph[]
+  baselines: DerivedTextBaseline[]
+  /** One entry per UTF-16 character: its x offset from the start of its line. */
+  logicalIndexToCharacterOffsetMap: number[]
+}
+
+export interface DerivedTextBuildContext {
+  digestMap: Map<string, Uint8Array>
+  blobs: Uint8Array[]
+  glyphBlobMap: Map<string, number>
+  shapeText(node: SceneNode): ShapedText | null
+  textDecorations(node: SceneNode, glyphs: readonly PlacedTextGlyph[]): TextDecorationRecord[]
+  /** The name a family's font gives a face; Google Fonts' names when left out. */
+  fontStyleName?: StyleNamer
+}
+
+// Figma stores a whitespace glyph as a lone close command.
+const EMPTY_GLYPH_COMMANDS: OutlineCommand[] = [{ type: 'Z' }]
+
+function appendGlyphBlob(context: DerivedTextBuildContext, blob: Uint8Array): number {
+  const key = bytesToHex(blob)
+  const existing = context.glyphBlobMap.get(key)
+  if (existing !== undefined) return existing
+  const index = context.blobs.push(blob) - 1
+  context.glyphBlobMap.set(key, index)
+  return index
+}
+
+function fontMetaData(
+  node: SceneNode,
+  digestMap: Map<string, Uint8Array>,
+  nameFace: StyleNamer
+): DerivedTextData['fontMetaData'] {
+  const fonts: NonNullable<DerivedTextData['fontMetaData']> = []
+  const seen = new Set<string>()
+  const addFont = (style: CharacterStyleOverride) => {
+    const normalized = normalizeFontFamily(style.fontFamily ?? node.fontFamily)
+    const weight = style.fontWeight ?? node.fontWeight
+    const italic = style.italic ?? node.italic
+    const name = figmaStyleName(node, style, nameFace)
+    // Two faces at one weight and slant ("Roman", "Book") are fonts of their own.
+    if (seen.has(`${normalized}|${name}`)) return
+    seen.add(`${normalized}|${name}`)
+    fonts.push({
+      key: { family: normalized, style: name, postscript: '' },
+      fontLineHeight: 1.2,
+      fontDigest: digestMap.get(
+        `${normalized}|${faceStyleKey({ fontWeight: weight, italic, fontStyle: rangeFontStyle(node, style) })}`
+      ),
+      fontStyle: italic ? 'ITALIC' : 'NORMAL',
+      fontWeight: weight
+    })
+  }
+  addFont({})
+  for (const run of node.styleRuns) addFont(run.style)
+  return fonts
+}
+
+type OutlinedGlyph = ShapedTextGlyph & { commands: OutlineCommand[] }
+
+function isOutlined(glyph: ShapedTextGlyph): glyph is OutlinedGlyph {
+  return glyph.commands !== null
+}
+
+function shapedGlyphRecords(
+  glyphs: OutlinedGlyph[],
+  context: DerivedTextBuildContext
+): DerivedTextGlyphRecord[] {
+  return glyphs.map((glyph) => ({
+    commandsBlob: appendGlyphBlob(
+      context,
+      encodePathCommandsBlob(
+        glyph.commands.length > 0 ? glyph.commands : EMPTY_GLYPH_COMMANDS,
+        glyph.fontSize
+      )
+    ),
+    position: { x: glyph.x, y: glyph.y },
+    fontSize: glyph.fontSize,
+    firstCharacter: glyph.firstCharacter,
+    advance: glyph.fontSize > 0 ? glyph.advance / glyph.fontSize : 0,
+    rotation: 0,
+    ...emojiGlyphFields(glyph)
+  }))
+}
+
+interface SavedGlyph {
+  glyph: DerivedTextGlyph
+  /** The character the glyph draws; a list marker draws none. */
+  character: number | undefined
+}
+
+/**
+ * Lines of glyphs the node already has, recovered from their baselines, top to bottom. Path
+ * text has no lines, so its glyphs share the one baseline the format requires.
+ */
+function savedGlyphLines(glyphs: SavedGlyph[]): SavedGlyph[][] {
+  if (glyphs.some(({ glyph }) => (glyph.rotation ?? 0) !== 0)) return [glyphs]
+  return Object.values(groupBy(glyphs, ({ glyph }) => String(glyph.y))).sort(
+    (a, b) => a[0].glyph.y - b[0].glyph.y
+  )
+}
+
+/**
+ * The character each saved glyph draws. Glyphs from shapers that record no characters stand
+ * one for one for the text; in a list, or among glyphs that record them, a glyph without a
+ * character is a list marker.
+ */
+function savedGlyphCharacters(
+  node: SceneNode,
+  glyphs: DerivedTextGlyph[]
+): Array<number | undefined> {
+  const indexed = hasTextList(node) || glyphs.some((glyph) => glyph.firstCharacter !== undefined)
+  return glyphs.map((glyph, index) => glyph.firstCharacter ?? (indexed ? undefined : index))
+}
+
+/**
+ * Where a line starts: at its first character, or, for an empty list item that shows only its
+ * marker, at the paragraph after the last character of the lines before.
+ */
+function lineStart(node: SceneNode, line: SavedGlyph[], previousEnd: number | undefined): number {
+  const characters = line.flatMap(({ character }) => (character === undefined ? [] : [character]))
+  if (characters.length > 0) return minOf(characters)
+  if (previousEnd === undefined) return 0
+  const ranges = textParagraphRanges(node.text)
+  return ranges[paragraphIndexAt(node.text, previousEnd) + 1]?.start ?? node.text.length
+}
+
+function savedGlyphLayout(
+  node: SceneNode,
+  glyphs: DerivedTextGlyph[]
+): Pick<ShapedText, 'baselines' | 'logicalIndexToCharacterOffsetMap'> {
+  const lineHeight =
+    lineHeightPixels(node.lineHeight, node.fontSize) ?? Math.ceil(node.fontSize * 1.2)
+  const offsets = Array.from({ length: node.text.length }, () => 0)
+  const characters = savedGlyphCharacters(node, glyphs)
+  const lines = savedGlyphLines(
+    glyphs.map((glyph, index) => ({ glyph, character: characters[index] }))
+  )
+  const starts: number[] = []
+  let previousEnd: number | undefined
+  for (const line of lines) {
+    starts.push(lineStart(node, line, previousEnd))
+    for (const { character } of line) {
+      if (character !== undefined) previousEnd = Math.max(previousEnd ?? 0, character)
+    }
+    // An empty item ends at its own newline.
+    if (line.every(({ character }) => character === undefined)) previousEnd = starts.at(-1)
+  }
+  const baselines = lines.map((line, lineIndex) => {
+    // Markers stand before their item's text; a line starts where its characters do.
+    const text = line.filter(({ character }) => character !== undefined)
+    const startX = text.length
+      ? minOf(text.map(({ glyph }) => glyph.x))
+      : maxOf(line.map(({ glyph }) => glyph.x + (glyph.advance ?? 0)))
+    for (const { glyph, character } of text) {
+      if (character !== undefined && character < offsets.length) {
+        offsets[character] = glyph.x - startX
+      }
+    }
+    return {
+      firstCharacter: starts[lineIndex],
+      endCharacter: starts[lineIndex + 1] ?? node.text.length,
+      position: { x: startX, y: line[0].glyph.y },
+      width: node.width,
+      lineY: lineIndex * lineHeight,
+      lineHeight,
+      lineAscent: Math.max(lineHeight - node.fontSize * 0.2, 0)
+    }
+  })
+  return { baselines, logicalIndexToCharacterOffsetMap: offsets }
+}
+
+/**
+ * A kept glyph's advance in ems: its own when it has one, else the distance to the next glyph
+ * on its line, else nothing.
+ */
+function savedAdvance(glyph: DerivedTextGlyph, next: DerivedTextGlyph | undefined): number {
+  if (glyph.fontSize <= 0) return 0
+  if (glyph.advance !== undefined) return (glyph.advance * (glyph.scaleX ?? 1)) / glyph.fontSize
+  return next ? Math.max(next.x - glyph.x, 0) / glyph.fontSize : 0
+}
+
+function savedGlyphRecords(
+  node: SceneNode,
+  glyphs: DerivedTextGlyph[],
+  context: DerivedTextBuildContext
+): DerivedTextGlyphRecord[] {
+  const characters = savedGlyphCharacters(node, glyphs)
+  return glyphs.map((glyph, index) => {
+    const next = glyphs[index + 1]
+    const sameLine =
+      index + 1 < glyphs.length &&
+      next.y === glyph.y &&
+      (next.rotation ?? 0) === (glyph.rotation ?? 0)
+    return {
+      commandsBlob: appendGlyphBlob(
+        context,
+        bakeGlyphScale(
+          glyph.commandsBlob,
+          glyph.scaleX ?? 1,
+          glyph.scaleY ?? 1,
+          glyph.rotation ?? 0
+        )
+      ),
+      position: { x: glyph.x, y: glyph.y },
+      fontSize: glyph.fontSize,
+      firstCharacter: characters[index],
+      advance: savedAdvance(glyph, sameLine ? next : undefined),
+      // Preserve path-text radians; hardcoding 0 used to flatten circular text on re-export.
+      rotation: glyph.rotation ?? 0,
+      ...emojiGlyphFields(glyph)
+    }
+  })
+}
+
+/**
+ * Decorations as Figma saves them, which it draws saved text's underlines and strikethroughs
+ * from: their rects by the style of the characters they decorate.
+ */
+function derivedDecorations(
+  node: SceneNode,
+  glyphs: readonly PlacedTextGlyph[],
+  context: DerivedTextBuildContext
+): DerivedTextDecoration[] | undefined {
+  const records = context.textDecorations(node, glyphs)
+  if (records.length === 0) return undefined
+  const styleIDs = characterStyleIDs(node)
+  const byStyle = groupBy(records, (record) => String(styleIDs[record.firstCharacter] ?? 0))
+  return Object.entries(byStyle).map(([styleID, rects]) => ({
+    rects: rects.map(({ x, y, width, height }) => ({ x, y, w: width, h: height })),
+    styleID: Number(styleID)
+  }))
+}
+
+/** Glyphs are derived data: a shaper failure must not fail the save or copy that writes them. */
+function shapeOrNull(node: SceneNode, context: DerivedTextBuildContext): ShapedText | null {
+  try {
+    return context.shapeText(node)
+  } catch (error) {
+    console.warn(`Writing "${node.name}" without glyphs; text shaping failed:`, error)
+    return null
+  }
+}
+
+/**
+ * The `derivedTextData` a text node is written with. Glyphs the node already has (from Figma,
+ * or placed along a path) are kept; other text is shaped at the node's width. Text that cannot
+ * be shaped gets no glyphs and no baselines, so readers lay it out themselves instead of drawing
+ * a guess. Text shaped without every outline gets no `derivedTextData`: Figma draws lines without
+ * outlines as blank text. A partial set would draw gaps, so it is all or none.
+ */
+export function buildNodeDerivedTextData(
+  node: SceneNode,
+  context: DerivedTextBuildContext
+): NodeChange['derivedTextData'] {
+  const fonts = fontMetaData(node, context.digestMap, context.fontStyleName ?? standardStyleNamer)
+  const saved = node.derivedTextGlyphs ?? []
+  if (saved.length > 0) {
+    return buildDerivedTextData({
+      node,
+      glyphs: savedGlyphRecords(node, saved, context),
+      decorations: node.textPathData ? undefined : derivedDecorations(node, saved, context),
+      fontMetaData: fonts,
+      ...savedGlyphLayout(node, saved)
+    })
+  }
+  const shaped = node.textPathData ? null : shapeOrNull(node, context)
+  const outlined = shaped?.glyphs.filter(isOutlined) ?? []
+  if (shaped && outlined.length < shaped.glyphs.length) return undefined
+  return buildDerivedTextData({
+    node,
+    glyphs: shapedGlyphRecords(outlined, context),
+    decorations: shaped ? derivedDecorations(node, shaped.glyphs, context) : undefined,
+    fontMetaData: fonts,
+    baselines: shaped?.baselines ?? [],
+    logicalIndexToCharacterOffsetMap: shaped?.logicalIndexToCharacterOffsetMap ?? []
+  })
+}

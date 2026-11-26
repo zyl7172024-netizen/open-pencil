@@ -1,0 +1,248 @@
+<script setup lang="ts">
+import {
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuPortal,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger
+} from 'reka-ui'
+import { computed, nextTick, ref, watch } from 'vue'
+
+import { useEditorCommands } from '@open-pencil/vue/editor/commands'
+import { useMessages } from '@open-pencil/vue/i18n'
+
+import { useEditorStore } from '@/app/editor/active-store'
+import {
+  setCommentsOnCanvas,
+  setDesignIssuesOnCanvas,
+  setSnappingPreference
+} from '@/app/settings/preferences/apply'
+import { appPreferences } from '@/app/settings/preferences/store'
+import { appMenuShortcutLabel } from '@/app/shell/menu/shortcut'
+import AppDropdownMenuRoot from '@/components/ui/menu/AppDropdownMenuRoot.vue'
+import AppShortcutText from '@/components/ui/menu/AppShortcutText.vue'
+import { menuItem, useMenuUI } from '@/components/ui/menu/menu'
+import MenuScrollArea from '@/components/ui/menu/MenuScrollArea.vue'
+
+/** A split view's header passes its pane, which opening the menu makes active, by pointer or key. */
+const { paneId } = defineProps<{ paneId?: string }>()
+
+const store = useEditorStore()
+const { getCommand } = useEditorCommands()
+const menuText = useMessages('menu')
+const commands = useMessages('commands')
+const panels = useMessages('panels')
+
+const open = ref(false)
+const editing = ref(false)
+const inputRef = ref<HTMLInputElement | null>()
+const inputValue = ref('')
+
+const menuCls = useMenuUI({ content: 'min-w-52' })
+const itemCls = menuItem({ justify: 'start', class: 'relative pl-7' })
+
+const zoom = computed(
+  () => (paneId ? store.getPaneView(paneId)?.zoom : undefined) ?? store.state.zoom
+)
+
+function zoomPercent() {
+  return Math.round(zoom.value * 100)
+}
+
+function startEditing() {
+  editing.value = true
+  inputValue.value = String(zoomPercent())
+  void nextTick(() => inputRef.value?.select())
+}
+
+function commitInput() {
+  const parsed = Number.parseInt(inputValue.value, 10)
+  if (!Number.isNaN(parsed) && parsed > 0) {
+    store.zoomToLevel(parsed / 100)
+  }
+  editing.value = false
+}
+
+function cancelInput() {
+  editing.value = false
+}
+
+function toggleRulers() {
+  store.state.showRulers = !store.state.showRulers
+  store.requestRepaint()
+}
+
+function togglePixelGrid() {
+  store.state.showPixelGrid = store.state.showPixelGrid === false
+  store.requestRepaint()
+}
+
+function toggleRemoteCursors() {
+  store.state.showRemoteCursors = !store.state.showRemoteCursors
+  store.requestRepaint()
+}
+
+function zoomIn() {
+  const center = store.viewportScreenCenter()
+  store.applyZoom(-100, center.x, center.y)
+}
+
+function zoomOut() {
+  const center = store.viewportScreenCenter()
+  store.applyZoom(100, center.x, center.y)
+}
+
+const ZOOM_PRESETS = [
+  { level: 0.5, label: () => commands.value.zoomTo50 },
+  {
+    level: 1,
+    label: () => commands.value.zoomTo100,
+    shortcut: appMenuShortcutLabel('view.zoom100')
+  },
+  { level: 2, label: () => commands.value.zoomTo200 }
+]
+
+function isActivePreset(level: number) {
+  return Math.abs(store.state.zoom - level) < 0.005
+}
+
+watch(open, (v) => {
+  if (v && paneId) store.setActivePane(paneId)
+  if (!v) editing.value = false
+})
+</script>
+
+<template>
+  <AppDropdownMenuRoot v-model:open="open">
+    <DropdownMenuTrigger as-child>
+      <button
+        data-test-id="zoom-dropdown-trigger"
+        class="cursor-pointer rounded px-1.5 py-0.5 text-2xs text-muted tabular-nums hover:bg-hover"
+        :class="paneId ? 'shrink-0' : 'ms-auto'"
+      >
+        {{ zoomPercent() }}%
+      </button>
+    </DropdownMenuTrigger>
+
+    <DropdownMenuPortal>
+      <DropdownMenuContent
+        side="bottom"
+        :side-offset="4"
+        align="end"
+        :class="menuCls.content"
+        @escape-key-down="cancelInput"
+      >
+        <MenuScrollArea>
+          <div class="px-1 py-1">
+            <input
+              v-if="editing"
+              ref="inputRef"
+              v-model="inputValue"
+              data-test-id="zoom-input"
+              class="w-full rounded border border-accent bg-input px-2 py-1 text-xs text-surface outline-none"
+              @blur="commitInput"
+              @keydown.enter="commitInput"
+              @keydown.escape.stop="cancelInput"
+            />
+            <button
+              v-else
+              data-test-id="zoom-input-trigger"
+              class="w-full cursor-pointer rounded border border-border bg-input px-2 py-1 text-start text-xs text-surface hover:border-muted"
+              @click="startEditing"
+            >
+              {{ zoomPercent() }}%
+            </button>
+          </div>
+
+          <DropdownMenuSeparator :class="menuCls.separator" />
+
+          <DropdownMenuItem :class="itemCls" @select="zoomIn">
+            <span class="flex-1">{{ menuText.zoomIn }}</span>
+            <AppShortcutText>{{ appMenuShortcutLabel('zoom-in') }}</AppShortcutText>
+          </DropdownMenuItem>
+          <DropdownMenuItem :class="itemCls" @select="zoomOut">
+            <span class="flex-1">{{ menuText.zoomOut }}</span>
+            <AppShortcutText>{{ appMenuShortcutLabel('zoom-out') }}</AppShortcutText>
+          </DropdownMenuItem>
+          <DropdownMenuItem :class="itemCls" @select="getCommand('view.zoomFit').run()">
+            <span class="flex-1">{{ commands.zoomToFit }}</span>
+            <AppShortcutText>{{ appMenuShortcutLabel('view.zoomFit') }}</AppShortcutText>
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            v-for="preset in ZOOM_PRESETS"
+            :key="preset.level"
+            :class="itemCls"
+            @select="store.zoomToLevel(preset.level)"
+          >
+            <icon-lucide-check
+              v-if="isActivePreset(preset.level)"
+              class="absolute inset-s-2 size-3.5"
+            />
+            <span class="flex-1">{{ preset.label() }}</span>
+            <AppShortcutText v-if="preset.shortcut">{{ preset.shortcut }}</AppShortcutText>
+          </DropdownMenuItem>
+
+          <DropdownMenuSeparator :class="menuCls.separator" />
+
+          <DropdownMenuItem :class="itemCls" @select.prevent="togglePixelGrid">
+            <icon-lucide-check
+              v-if="store.state.showPixelGrid !== false"
+              class="absolute inset-s-2 size-3.5"
+            />
+            <span class="flex-1">{{ menuText.pixelGrid }}</span>
+            <AppShortcutText>{{ appMenuShortcutLabel('view-pixel-grid') }}</AppShortcutText>
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            :class="itemCls"
+            @select.prevent="
+              setSnappingPreference('pixelGrid', !store.state.snappingPreferences.pixelGrid)
+            "
+          >
+            <icon-lucide-check
+              v-if="store.state.snappingPreferences.pixelGrid"
+              class="absolute inset-s-2 size-3.5"
+            />
+            <span class="flex-1">{{ menuText.snapToPixelGrid }}</span>
+            <AppShortcutText>{{ appMenuShortcutLabel('snap-pixel-grid') }}</AppShortcutText>
+          </DropdownMenuItem>
+          <DropdownMenuItem :class="itemCls" @select.prevent="toggleRulers">
+            <icon-lucide-check v-if="store.state.showRulers" class="absolute inset-s-2 size-3.5" />
+            <span class="flex-1">{{ panels.rulers }}</span>
+            <AppShortcutText>{{ appMenuShortcutLabel('view-rulers') }}</AppShortcutText>
+          </DropdownMenuItem>
+          <DropdownMenuItem :class="itemCls" @select.prevent="toggleRemoteCursors">
+            <icon-lucide-check
+              v-if="store.state.showRemoteCursors"
+              class="absolute inset-s-2 size-3.5"
+            />
+            <span class="flex-1">{{ panels.multiplayerCursors }}</span>
+            <AppShortcutText>{{
+              appMenuShortcutLabel('view-multiplayer-cursors')
+            }}</AppShortcutText>
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            :class="itemCls"
+            @select.prevent="setDesignIssuesOnCanvas(!appPreferences.designCheck.showOnCanvas)"
+          >
+            <icon-lucide-check
+              v-if="appPreferences.designCheck.showOnCanvas"
+              class="absolute inset-s-2 size-3.5"
+            />
+            <span class="flex-1">{{ menuText.designIssues }}</span>
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            :class="itemCls"
+            @select.prevent="setCommentsOnCanvas(!appPreferences.comments.showOnCanvas)"
+          >
+            <icon-lucide-check
+              v-if="appPreferences.comments.showOnCanvas"
+              class="absolute inset-s-2 size-3.5"
+            />
+            <span class="flex-1">{{ menuText.comments }}</span>
+            <AppShortcutText>{{ appMenuShortcutLabel('view-comments') }}</AppShortcutText>
+          </DropdownMenuItem>
+        </MenuScrollArea>
+      </DropdownMenuContent>
+    </DropdownMenuPortal>
+  </AppDropdownMenuRoot>
+</template>

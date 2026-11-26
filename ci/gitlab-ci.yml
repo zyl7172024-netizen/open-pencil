@@ -1,0 +1,58 @@
+# Offline GitLab pipeline for the web editor.
+# Copy this to .gitlab-ci.yml at the repository root, or merge these jobs into the pipeline the
+# project already has (the build command can be customised).
+#
+# Before the first run:
+#   * Build an image with Bun 1.4.4 and Node 22.12-22.x, pointing Bun at the internal registry
+#     (registry.intranet/openpencil/web-ci:node22-bun144).
+#   * Publish packages/canvaskit/dist and packages/taffy/dist as a generic package or CI artifact,
+#     and extract it to FORK_DIST_DIR. They cannot come from GitHub on this network.
+#
+# What this pipeline deliberately does not run: browser E2E (needs a Playwright download and
+# darwin-only visual baselines), native tests and desktop bundles (need Rust, WebView2 and signing
+# keys), cloud images (need Docker base images), and release uploads (need internet credentials).
+stages:
+  - build
+  - quality
+
+variables:
+  NODE_OPTIONS: --experimental-strip-types
+  FORK_DIST_DIR: $CI_PROJECT_DIR/ci/artifacts/fork-dist
+
+default:
+  image: registry.intranet/openpencil/web-ci:node22-bun144
+
+before_script:
+  # Fails loudly on a runner without Bun instead of letting the build fall through.
+  - command -v bun >/dev/null || { echo "FATAL: bun missing on $(hostname)"; exit 1; }
+  - bun --version
+
+web-build:
+  stage: build
+  script:
+    # The prebuilt packages ship with the repository; unpack them where the restore scripts look.
+    - if [ -f ci/artifacts.tar.gz ]; then mkdir -p ci/artifacts && tar -xzf ci/artifacts.tar.gz -C ci/artifacts --strip-components=1; fi
+    # Before bun install: its postinstall then matches the local hashes and skips the download.
+    - sh ci/restore-fork-dist.sh
+    # tsdown cannot load its TypeScript config under Bun 1.4.x, so the packages arrive built
+    # from a machine with network access instead of running `bun run build:packages` here.
+    - sh ci/restore-package-dist.sh
+    # Without this the HTML engine's build wants Cargo; the web editor itself does not load it.
+    - sh ci/html-engine-stub.sh
+    - bun install --frozen-lockfile
+    - bun run lint
+    - node node_modules/vite/bin/vite.js build
+  artifacts:
+    paths:
+      - dist/
+    expire_in: 1 week
+
+quality:
+  stage: quality
+  needs:
+    - web-build
+  script:
+    # `bun run build` already runs lint; these are the checks it does not cover.
+    - bun run test:dupes
+    - bun run check:arch
+    - bun run check:i18n

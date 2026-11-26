@@ -1,0 +1,156 @@
+import type { Element, Node } from '@xmldom/xmldom'
+
+/** SVG presentation attributes as an element inherits them, still as source strings. */
+export interface PresentationAttributes {
+  /** The CSS `color` that `currentColor` paints take; empty when no element sets one. */
+  color: string
+  fill: string
+  stroke: string
+  strokeWidth: string
+  strokeCap: string
+  strokeJoin: string
+  fillRule: string
+  fillOpacity: string
+  strokeOpacity: string
+  fontFamily: string
+  fontSize: string
+  fontWeight: string
+  fontStyle: string
+  textAnchor: string
+  letterSpacing: string
+  textDecoration: string
+  visibility: string
+  display: string
+}
+
+export const DEFAULT_PRESENTATION: PresentationAttributes = {
+  color: '',
+  // No fill set: the host's color, as an icon's, never the `color` an ancestor sets.
+  fill: '',
+  stroke: 'none',
+  strokeWidth: '1',
+  strokeCap: 'butt',
+  strokeJoin: 'miter',
+  fillRule: 'nonzero',
+  fillOpacity: '1',
+  strokeOpacity: '1',
+  fontFamily: '',
+  fontSize: '',
+  fontWeight: 'normal',
+  fontStyle: 'normal',
+  textAnchor: 'start',
+  letterSpacing: 'normal',
+  textDecoration: 'none',
+  visibility: 'visible',
+  display: 'inline'
+}
+
+export function isElement(node: Node): node is Element {
+  return node.nodeType === node.ELEMENT_NODE
+}
+
+export function inlineStyles(element: Element): ReadonlyMap<string, string> {
+  const styles = new Map<string, string>()
+  for (const declaration of (element.getAttribute('style') ?? '').split(';')) {
+    const separator = declaration.indexOf(':')
+    if (separator <= 0) continue
+    const name = declaration.slice(0, separator).trim()
+    const value = declaration.slice(separator + 1).trim()
+    if (name && value) styles.set(name, value)
+  }
+  return styles
+}
+
+function inheritedAttribute(
+  element: Element,
+  styles: ReadonlyMap<string, string>,
+  name: string,
+  inherited: string
+): string {
+  return (
+    styles.get(name) ??
+    (element.hasAttribute(name) ? (element.getAttribute(name) ?? inherited) : inherited)
+  )
+}
+
+export function presentationFor(
+  element: Element,
+  inherited: PresentationAttributes
+): PresentationAttributes {
+  const styles = inlineStyles(element)
+  const attribute = (name: string, value: string) =>
+    inheritedAttribute(element, styles, name, value)
+  const color = attribute('color', inherited.color).trim()
+  return {
+    // `inherit` and `currentColor` as a color both mean the parent's.
+    color: isCurrentColor(color) || color.toLowerCase() === 'inherit' ? inherited.color : color,
+    fill: attribute('fill', inherited.fill),
+    stroke: attribute('stroke', inherited.stroke),
+    strokeWidth: attribute('stroke-width', inherited.strokeWidth),
+    strokeCap: attribute('stroke-linecap', inherited.strokeCap),
+    strokeJoin: attribute('stroke-linejoin', inherited.strokeJoin),
+    fillRule: attribute('fill-rule', inherited.fillRule),
+    fillOpacity: attribute('fill-opacity', inherited.fillOpacity),
+    strokeOpacity: attribute('stroke-opacity', inherited.strokeOpacity),
+    fontFamily: attribute('font-family', inherited.fontFamily),
+    fontSize: attribute('font-size', inherited.fontSize),
+    fontWeight: attribute('font-weight', inherited.fontWeight),
+    fontStyle: attribute('font-style', inherited.fontStyle),
+    textAnchor: attribute('text-anchor', inherited.textAnchor),
+    letterSpacing: attribute('letter-spacing', inherited.letterSpacing),
+    textDecoration: attribute('text-decoration', inherited.textDecoration),
+    // As Figma reads them: both inherit, unlike CSS `display`; any visibility but `visible`
+    // hides, `inherit` included, and any display but `none` shows.
+    visibility:
+      attribute('visibility', inherited.visibility).trim() === 'visible' ? 'visible' : 'hidden',
+    display: attribute('display', inherited.display).trim() === 'none' ? 'none' : 'inline'
+  }
+}
+
+/** Whether an element with these attributes shows: `visibility: visible`, not `display: none`. */
+export function presentationVisible(presentation: PresentationAttributes): boolean {
+  return presentation.visibility === 'visible' && presentation.display !== 'none'
+}
+
+/** An SVG opacity, a number or a percentage, clamped to 0–1. */
+export function opacityValue(value: string | null | undefined): number {
+  if (!value) return 1
+  const parsed = Number.parseFloat(value)
+  if (!Number.isFinite(parsed)) return 1
+  const opacity = value.trim().endsWith('%') ? parsed / 100 : parsed
+  return Math.min(1, Math.max(0, opacity))
+}
+
+export function num(element: Element, attr: string, fallback = 0): number {
+  const value = element.getAttribute(attr)
+  if (value === null) return fallback
+  const parsed = Number.parseFloat(value)
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
+const CURRENT_COLOR = 'currentColor'
+
+/** CSS keywords match in any case, so `currentcolor` is `currentColor`. */
+function isCurrentColor(value: string): boolean {
+  return value.trim().toLowerCase() === CURRENT_COLOR.toLowerCase()
+}
+
+/**
+ * A paint as drawn: null for `none`, and `currentColor`, in any case, as the element's `color`
+ * when one is set. Without one, and for a fill no element sets, it is `currentColor`, which the
+ * host's color fills, as an icon's color does.
+ */
+export function normalizeSVGPaint(value: string | null, color = ''): string | null {
+  if (value === null) return null
+  const paint = value.trim()
+  if (paint === '') return CURRENT_COLOR
+  if (paint.toLowerCase() === 'none') return null
+  if (!isCurrentColor(paint)) return value
+  return color || CURRENT_COLOR
+}
+
+export function combinedTransform(parent: string | null, element: Element): string | null {
+  const current = element.getAttribute('transform')
+  if (parent && current) return `${parent} ${current}`
+  return current ?? parent
+}

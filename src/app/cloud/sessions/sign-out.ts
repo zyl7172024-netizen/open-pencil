@@ -1,0 +1,43 @@
+import { signOutFromCloud } from '@open-pencil/cloud/client'
+import type { CloudDiscovery } from '@open-pencil/cloud/contract'
+
+import { leaveAfterSignOut } from '@/app/cloud-portal/site'
+import { IS_CLOUD_SITE } from '@/constants'
+
+import { isCloudSiteServer, rememberCloudAccount } from '../servers/store'
+import { cloudServerFetch, forgetCloudConnection } from './connection'
+import { forgetCloudAccountCopies } from './forget'
+import { clearCloudSessionToken } from './token'
+
+export type CloudSignOutDependencies = {
+  revoke: typeof signOutFromCloud
+  clear(serverId: string): Promise<void>
+}
+
+const defaults: CloudSignOutDependencies = {
+  revoke: signOutFromCloud,
+  clear: clearCloudSessionToken
+}
+
+/**
+ * Ends the session on the server first, so a failed sign-out keeps the token to try again
+ * rather than leaving a live session behind, then forgets it here, along with the account's recent
+ * documents and uploaded copies (`forgetCloudAccountCopies`). Signing out of the server
+ * that serves this editor leaves it as a visit without an account would (`leaveAfterSignOut`).
+ */
+export async function signOutOfCloud(
+  serverId: string,
+  discovery: CloudDiscovery,
+  dependencies: CloudSignOutDependencies = defaults
+): Promise<void> {
+  await dependencies.revoke(discovery, { fetch: cloudServerFetch(serverId) })
+  await dependencies.clear(serverId)
+  rememberCloudAccount(serverId, null)
+  forgetCloudConnection(serverId)
+  // The session is over either way. Recent is cleared first, and a copy this could not remove is
+  // listed only in its own account's workspaces.
+  await forgetCloudAccountCopies(serverId).catch((error: unknown) => {
+    console.warn('[Cloud] Could not forget the account on this device', error)
+  })
+  if (IS_CLOUD_SITE && isCloudSiteServer(serverId)) leaveAfterSignOut(discovery.localEditor)
+}

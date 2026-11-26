@@ -1,0 +1,74 @@
+<script setup lang="ts">
+import { isGeneratedFrame } from '@open-pencil/scene-graph/generated'
+import { LAYOUT_CONTAINER_TYPES } from '@open-pencil/vue/controls/selection-layout'
+import { useMessages } from '@open-pencil/vue/i18n'
+import { LayoutControlsRoot } from '@open-pencil/vue/primitives/LayoutControls'
+
+import ClipContentControl from '@/components/properties/layout/ClipContentControl.vue'
+import FlexControls from '@/components/properties/layout/flex/FlexControls.vue'
+import GridControls from '@/components/properties/layout/grid/GridControls.vue'
+import LayoutFlowControl from '@/components/properties/layout/LayoutFlowControl.vue'
+import LayoutWrapToggle from '@/components/properties/layout/LayoutWrapToggle.vue'
+import PaddingControls from '@/components/properties/layout/padding/PaddingControls.vue'
+import SizeControls from '@/components/properties/layout/size/SizeControls.vue'
+import TextResizingControl from '@/components/properties/layout/TextResizingControl.vue'
+import IconButton from '@/components/ui/button/IconButton.vue'
+import PanelSection from '@/components/ui/panel/PanelSection.vue'
+
+const panels = useMessages('panels')
+</script>
+
+<template>
+  <LayoutControlsRoot v-slot="ctx">
+    <template v-if="ctx.node">
+      <!-- A generated frame, such as a shape with text, lays out its own sublayers; its auto layout is not offered. -->
+      <PanelSection
+        :label="
+          ctx.node.layoutMode === 'NONE' || isGeneratedFrame(ctx.node)
+            ? panels.layout
+            : panels.autoLayout
+        "
+      >
+        <template v-if="LAYOUT_CONTAINER_TYPES.has(ctx.node.type)" #actions>
+          <IconButton
+            :label="ctx.node.layoutMode === 'NONE' ? panels.addAutoLayout : panels.removeAutoLayout"
+            size="xs"
+            :active="ctx.node.layoutMode !== 'NONE'"
+            class="data-[state=on]:bg-accent/15"
+            @click="
+              ctx.editor.setLayoutMode(
+                ctx.node.id,
+                ctx.node.layoutMode === 'NONE' ? 'VERTICAL' : 'NONE'
+              )
+            "
+          >
+            <icon-lucide-layout-panel-top class="size-3.5" />
+          </IconButton>
+        </template>
+
+        <LayoutFlowControl v-if="LAYOUT_CONTAINER_TYPES.has(ctx.node.type)">
+          <LayoutWrapToggle v-if="ctx.isFlex" />
+        </LayoutFlowControl>
+        <div v-if="ctx.node.type !== 'TEXT'" class="mt-2 mb-1 text-2xs text-muted">
+          {{ panels.dimensions }}
+        </div>
+        <TextResizingControl v-if="ctx.node.type === 'TEXT'" />
+        <SizeControls />
+        <ClipContentControl
+          v-if="LAYOUT_CONTAINER_TYPES.has(ctx.node.type) && ctx.node.layoutMode === 'NONE'"
+        />
+
+        <template
+          v-if="LAYOUT_CONTAINER_TYPES.has(ctx.node.type) && ctx.node.layoutMode !== 'NONE'"
+        >
+          <FlexControls v-if="ctx.isFlex" />
+          <template v-if="ctx.isGrid">
+            <GridControls />
+            <PaddingControls />
+            <ClipContentControl />
+          </template>
+        </template>
+      </PanelSection>
+    </template>
+  </LayoutControlsRoot>
+</template>

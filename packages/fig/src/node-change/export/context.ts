@@ -1,0 +1,443 @@
+import { effectiveFigmaRawNodeFields } from '#fig/source-metadata'
+
+import type {
+  Effect as KiwiEffect,
+  NodeChange,
+  Paint,
+  StyleReference
+} from '@open-pencil/kiwi/fig/codec'
+import { isUnsetGuid, stringToGuid, UNSET_GUID } from '@open-pencil/kiwi/fig/guid'
+import type {
+  ComponentPropertyDefinition,
+  Effect,
+  GlassEffectParams,
+  NoiseEffectParams,
+  PluginDataEntry,
+  SceneGraph,
+  SceneNode,
+  TextureEffectParams
+} from '@open-pencil/scene-graph'
+import { UNSET_GLASS, UNSET_NOISE, UNSET_TEXTURE } from '@open-pencil/scene-graph/constants'
+import type { Color, GUID, Matrix } from '@open-pencil/scene-graph/primitives'
+import { sharedStyleLayers } from '@open-pencil/scene-graph/shared-styles'
+import { EFFECT_BINDING_PROPERTIES, effectBindingField } from '@open-pencil/scene-graph/variables'
+
+import { modeledEffectIndexes } from '../paint'
+import { variableAlias } from '../variable/bindings'
+import { EFFECT_VARIABLE_FIELDS, kiwiEffectWithBindings } from '../variable/effects'
+
+export type KiwiNodeChange = NodeChange & Record<string, unknown>
+
+export interface KiwiSymbolOverridePayload {
+  guidPath?: { guids?: GUID[] }
+  textData?: { characters?: string }
+  fillPaints?: Paint[]
+  [key: string]: unknown
+}
+
+/** Library styles by source id, built once with the rest of the context. */
+export function buildStyleReferences(graph: SceneGraph): ReadonlyMap<string, StyleReference> {
+  const references = new Map<string, StyleReference>()
+  for (const node of graph.getAllNodes()) {
+    if (node.sharedStyleType === null || !node.source.id) continue
+    const raw = effectiveFigmaRawNodeFields(node)
+    if (typeof raw.key !== 'string') continue
+    references.set(node.source.id, {
+      assetRef: {
+        key: raw.key,
+        ...(typeof raw.version === 'string' ? { version: raw.version } : {})
+      }
+    })
+  }
+  return references
+}
+
+/**
+ * The GUID a layer names a style with: the record written for the local style of that ID, or
+ * the GUID the ID spells. Styles made in OpenPencil, by token import or by pasting from another
+ * document, have IDs that spell no GUID, so only their records can name them.
+ */
+export function styleReferenceGuid(
+  context: Pick<SceneNodeToKiwiContext, 'graph' | 'nodeIdToGuid' | 'styleNodeIds'>,
+  id: string
+): GUID {
+  if (!context.styleNodeIds) {
+    context.styleNodeIds = new Map(
+      [...sharedStyleLayers(context.graph)].map(([id, node]) => [id, node.id])
+    )
+  }
+  const styleNodeId = context.styleNodeIds.get(id)
+  const written = styleNodeId ? context.nodeIdToGuid?.get(styleNodeId) : undefined
+  return written ?? context.nodeIdToGuid?.get(id) ?? stringToGuid(id)
+}
+
+/**
+ * How a layer names a style, as Figma writes it: a library style by its key, which Figma
+ * resolves and keeps linked to the library, and a local one by its record.
+ */
+export function exportedStyleReference(
+  context: Pick<
+    SceneNodeToKiwiContext,
+    'graph' | 'nodeIdToGuid' | 'styleNodeIds' | 'styleReferences'
+  >,
+  id: string
+): StyleReference {
+  context.styleReferences ??= buildStyleReferences(context.graph)
+  return context.styleReferences.get(id) ?? { guid: styleReferenceGuid(context, id) }
+}
+
+export interface SceneNodeToKiwiContext {
+  styleReferences?: ReadonlyMap<string, StyleReference>
+  /** Local styles' node IDs by the style IDs layers name them with, built on first use. */
+  styleNodeIds?: ReadonlyMap<string, string>
+  graph: SceneGraph
+  blobs: Uint8Array[]
+  blobIndexByHex?: Map<string, number>
+  nodeIdToGuid?: Map<string, GUID>
+  /** Reverse index of assigned GUID values ("sessionID:localID") for O(1)
+   *  collision detection. Populated alongside every nodeIdToGuid.set() call. */
+  assignedGuidValues?: Set<string>
+  fontDigestMap?: Map<string, Uint8Array>
+  glyphBlobMap?: Map<string, number>
+  varIdToGuid?: Map<string, GUID>
+  modeIdToGuid?: Map<string, GUID>
+  /** GUIDs minted for component property IDs (e.g. "prop:abc123") that aren't
+   *  already Figma-GUID-shaped, keyed by the original ID so refs/assignments/
+   *  variantPropSpecs pointing at the same property reuse the same GUID. */
+  propertyIdToGuid: Map<string, GUID>
+  /**
+   * The GUID each variant's copy of a set property is written with, by variant and property,
+   * so the copy, its layers' references, and its instances' assignments agree.
+   */
+  propertyCopyGuids: Map<string, GUID>
+  componentPropertyDefinitionsById: ReadonlyMap<string, ComponentPropertyDefinition>
+  /**
+   * Writing records into the archive a document came from: the layer each archive GUID
+   * belongs to, so a copy that kept its original's `source.id` gets a GUID of its own.
+   */
+  recordOwners?: ReadonlyMap<string, string>
+  /** Positions the caller decided, kept so untouched siblings keep theirs. */
+  orderKeys?: ReadonlyMap<string, string>
+  /** False to write a layer's record alone, as when only some records change. */
+  writeChildren?: boolean
+  /**
+   * Receives the content frames of instance slots. Figma stores them on the internal canvas,
+   * so the caller re-parents the `isSlotContent` roots there after serializing its nodes.
+   */
+  slotContentRecords?: KiwiNodeChange[]
+  /** Plugin data a node is written with instead of its own, by node ID. */
+  pluginDataOverrides?: ReadonlyMap<string, PluginDataEntry[]>
+  /** Nodes with their bindings resolved, kept for the length of one export. */
+  resolvedNodes?: WeakMap<SceneNode, SceneNode>
+  fractionalPosition: (index: number) => string
+  mapToFigmaType: (type: SceneNode['type']) => string
+  fillToKiwiPaint: (fill: SceneNode['fills'][number]) => Paint
+  safeColor: (color: Color) => Color
+  computeExportTransform: (node: SceneNode) => Matrix
+  serializeCornerRadii: (node: SceneNode, nc: KiwiNodeChange) => void
+  serializeTextProps: (
+    node: SceneNode,
+    nc: KiwiNodeChange,
+    graph: SceneGraph,
+    fontDigestMap: Map<string, Uint8Array> | undefined,
+    blobs: Uint8Array[],
+    glyphBlobMap: Map<string, number> | undefined
+  ) => void
+  serializeLayoutProps: (node: SceneNode, nc: KiwiNodeChange) => void
+  serializeGeometry: (
+    node: SceneNode,
+    nc: KiwiNodeChange,
+    blobs: Uint8Array[],
+    styleReference: (id: string) => StyleReference
+  ) => void
+  serializeVariableBindings: (
+    node: SceneNode,
+    nc: KiwiNodeChange,
+    graph: SceneGraph,
+    varIdToGuid?: Map<string, GUID>
+  ) => void
+  sceneNodeToKiwi: (
+    node: SceneNode,
+    parentGuid: GUID,
+    childIndex: number,
+    localIdCounter: { value: number },
+    context: SceneNodeToKiwiContext
+  ) => KiwiNodeChange[]
+}
+
+/** Figma drops a pasted layer whose GUID part is past a signed 32-bit integer. */
+const MAX_FIGMA_GUID_PART = 0x7fffffff
+
+/**
+ * The GUID an ID spells, or null when it spells none Figma can read. A layer's GUID parts stay
+ * within signed 32 bits; `wholeParts` allows the full unsigned 32 bits Figma itself gives
+ * component properties, in files and on the clipboard alike (desktop 126). The unset GUID never
+ * names anything.
+ */
+export function parseGuidOrNull(value: string, { wholeParts = false } = {}) {
+  if (!/^\d+:\d+$/.test(value)) return null
+  const guid = stringToGuid(value)
+  if (isUnsetGuid(guid)) return null
+  const max = wholeParts ? UNSET_GUID.sessionID : MAX_FIGMA_GUID_PART
+  return guid.sessionID <= max && guid.localID <= max ? guid : null
+}
+
+export function resolveInstanceComponentId(
+  context: SceneNodeToKiwiContext,
+  componentId: string
+): string {
+  const seen = new Set<string>()
+  let currentId = componentId
+  while (!seen.has(currentId)) {
+    seen.add(currentId)
+    const node = context.graph.getNode(currentId)
+    if (node?.type !== 'INSTANCE' || !node.componentId) return currentId
+    currentId = node.componentId
+  }
+  return componentId
+}
+
+export function getOrCreateNodeGuid(
+  context: SceneNodeToKiwiContext,
+  nodeId: string,
+  localIdCounter: { value: number }
+): GUID | undefined {
+  const node = context.graph.getNode(nodeId)
+  if (!node) return undefined
+  const existing = context.nodeIdToGuid?.get(nodeId)
+  if (existing) return existing
+  const ownsSource =
+    !node.source.id || !context.recordOwners || context.recordOwners.get(node.source.id) === nodeId
+  const importedGuid = node.source.id && ownsSource ? parseGuidOrNull(node.source.id) : null
+
+  // When source.id maps to a GUID value that is already assigned to a
+  // different node (e.g. two nodes from different canvases with the same
+  // source.id "1:94"), fall back to the counter to avoid collisions.
+  if (importedGuid && context.assignedGuidValues) {
+    const key = `${importedGuid.sessionID}:${importedGuid.localID}`
+    if (context.assignedGuidValues.has(key)) {
+      const guid: GUID = { sessionID: 1, localID: localIdCounter.value++ }
+      context.nodeIdToGuid?.set(nodeId, guid)
+      context.assignedGuidValues.add(`${guid.sessionID}:${guid.localID}`)
+      return guid
+    }
+  }
+
+  const guid = importedGuid ?? { sessionID: 1, localID: localIdCounter.value++ }
+  context.nodeIdToGuid?.set(nodeId, guid)
+  context.assignedGuidValues?.add(`${guid.sessionID}:${guid.localID}`)
+  return guid
+}
+
+/**
+ * Component property IDs ("prop:abc123") never match the Figma GUID shape,
+ * so parseGuidOrNull always rejects them — mint a stable synthetic GUID from
+ * the shared node-id counter instead, memoized so every def/ref/assignment/
+ * variantPropSpec pointing at the same property ID round-trips consistently.
+ */
+export function getOrCreatePropertyGuid(
+  context: SceneNodeToKiwiContext,
+  propertyId: string,
+  localIdCounter: { value: number }
+): GUID {
+  const existing = context.propertyIdToGuid.get(propertyId)
+  if (existing) return existing
+  const parsed = parseGuidOrNull(propertyId)
+  if (parsed) return parsed
+  const guid = { sessionID: 1, localID: localIdCounter.value++ }
+  context.propertyIdToGuid.set(propertyId, guid)
+  context.assignedGuidValues?.add(`${guid.sessionID}:${guid.localID}`)
+  return guid
+}
+
+export function isDescendantOf(
+  context: SceneNodeToKiwiContext,
+  nodeId: string,
+  ancestorId: string
+) {
+  let current = context.graph.getNode(nodeId)
+  while (current?.parentId) {
+    if (current.parentId === ancestorId) return true
+    current = context.graph.getNode(current.parentId)
+  }
+  return false
+}
+
+export function applyColorVariableBinding(
+  context: SceneNodeToKiwiContext,
+  node: SceneNode,
+  paint: Paint,
+  field: string
+): Paint {
+  const variableId = node.boundVariables[field]
+  // An imported paint carries the binding it arrived with. Unbinding the field has to clear
+  // it, or the export hands Figma back a variable the document no longer references.
+  if (!variableId) {
+    if (!paint.colorVar) return paint
+    const { colorVar: _cleared, ...unbound } = paint
+    return unbound
+  }
+  return {
+    ...paint,
+    colorVar: {
+      dataType: 'ALIAS',
+      resolvedDataType: 'COLOR',
+      value: { alias: variableAlias(context.graph, variableId, context.varIdToGuid) }
+    }
+  }
+}
+
+/** A node's fills with their colour variable aliases, for the record and for override claims alike. */
+export function createFillPaints(context: SceneNodeToKiwiContext, node: SceneNode): Paint[] {
+  return node.fills.map((fill, index) =>
+    applyColorVariableBinding(context, node, context.fillToKiwiPaint(fill), `fills/${index}/color`)
+  )
+}
+
+/** A stroke is a paint, so it writes the same way a fill does, gradients and images included. */
+export function createStrokePaints(context: SceneNodeToKiwiContext, node: SceneNode): Paint[] {
+  return node.strokes.map((stroke, index) =>
+    applyColorVariableBinding(
+      context,
+      node,
+      context.fillToKiwiPaint(stroke),
+      `strokes/${index}/color`
+    )
+  )
+}
+
+/**
+ * `effects` as a record writes them for `node`. Each bound property names its variable as a
+ * paint's colour does and carries the value it resolves to; a property the node no longer binds
+ * loses its alias. With `keepUnresolved`, an imported alias to a library variable the document
+ * never resolved stays as it came, since nothing stands in for it. `effects` may be a record's
+ * raw list: an effect the scene graph does not model stays as it came, and the rest are matched
+ * to the node's effects by their index among the modeled ones.
+ */
+export function bindKiwiEffects(
+  context: SceneNodeToKiwiContext,
+  node: SceneNode,
+  effects: readonly KiwiEffect[],
+  keepUnresolved = false
+): KiwiEffect[] {
+  const alias = (variableId: string) =>
+    variableAlias(context.graph, variableId, context.varIdToGuid)
+  const indexes = modeledEffectIndexes(effects)
+  return effects.map((effect, rawIndex) => {
+    const index = indexes[rawIndex]
+    if (index === null) return effect
+    const bound = kiwiEffectWithBindings(effect, index, node.boundVariables, alias)
+    const current = node.effects.at(index)
+    for (const property of EFFECT_BINDING_PROPERTIES) {
+      const key = EFFECT_VARIABLE_FIELDS[property]
+      const kept = effect[key]?.value?.alias
+      if (keepUnresolved && !bound[key] && kept?.assetRef && !kept.guid) bound[key] = effect[key]
+      if (!current || !node.boundVariables[effectBindingField(index, property)]) continue
+      if (property === 'color') bound.color = context.safeColor(current.color)
+      else if (property === 'radius') bound.radius = current.radius
+      else if (property === 'spread') bound.spread = current.spread
+      else bound.offset = { ...current.offset }
+    }
+    return bound
+  })
+}
+
+/**
+ * A node's effects as its record writes them, `.fig` naming a layer blur a foreground blur and a
+ * texture a grain.
+ */
+export function createEffects(context: SceneNodeToKiwiContext, node: SceneNode): KiwiEffect[] {
+  return bindKiwiEffects(
+    context,
+    node,
+    node.effects.map((effect) => ({
+      type: KIWI_EFFECT_TYPE[effect.type],
+      color: context.safeColor(effect.color),
+      offset: effect.offset,
+      radius: effect.radius,
+      spread: effect.spread,
+      visible: effect.visible,
+      blendMode: effect.blendMode ?? 'NORMAL',
+      showShadowBehindNode: effect.showShadowBehindNode,
+      ...kiwiEffectKindFields(effect)
+    }))
+  )
+}
+
+/** The `.fig` name of each effect type. */
+const KIWI_EFFECT_TYPE: Record<Effect['type'], KiwiEffect['type']> = {
+  DROP_SHADOW: 'DROP_SHADOW',
+  INNER_SHADOW: 'INNER_SHADOW',
+  LAYER_BLUR: 'FOREGROUND_BLUR',
+  BACKGROUND_BLUR: 'BACKGROUND_BLUR',
+  FOREGROUND_BLUR: 'FOREGROUND_BLUR',
+  GLASS: 'GLASS',
+  NOISE: 'NOISE',
+  TEXTURE: 'GRAIN'
+}
+
+/**
+ * The fields only a glass, noise, or texture effect or a progressive blur writes, under the
+ * archive's names.
+ */
+function kiwiEffectKindFields(effect: Effect): Partial<KiwiEffect> {
+  if (effect.type === 'GLASS') return kiwiGlassFields(effect.glass ?? UNSET_GLASS)
+  if (effect.type === 'NOISE') return kiwiNoiseFields(effect.noise ?? UNSET_NOISE, effect.color)
+  if (effect.type === 'TEXTURE') return kiwiTextureFields(effect.texture ?? UNSET_TEXTURE)
+  if (!effect.progressive) return {}
+  return {
+    blurOpType: 'PROGRESSIVE',
+    startRadius: effect.progressive.startRadius,
+    startOffset: { ...effect.progressive.startOffset },
+    endOffset: { ...effect.progressive.endOffset }
+  }
+}
+
+/** A glass effect's lens under the archive's field names, with the bevel Figma always writes. */
+function kiwiGlassFields(glass: GlassEffectParams): Partial<KiwiEffect> {
+  return {
+    refractionRadius: glass.depth,
+    specularAngle: glass.lightAngle,
+    specularIntensity: glass.lightIntensity,
+    bevelSize: 1,
+    chromaticAberration: glass.dispersion,
+    refractionIntensity: glass.refraction
+  }
+}
+
+/**
+ * A noise effect's grain as Figma writes it: a duotone's second colour, its first where it has
+ * none as the renderer draws it, and a multitone's opacity.
+ */
+function kiwiNoiseFields(noise: NoiseEffectParams, color: Color): Partial<KiwiEffect> {
+  const fields: Partial<KiwiEffect> = {
+    noiseType: noise.noiseType,
+    noiseSize: { ...noise.noiseSize },
+    density: noise.density
+  }
+  if (noise.noiseType === 'DUOTONE') fields.secondaryColor = { ...(noise.secondaryColor ?? color) }
+  if (noise.noiseType === 'MULTITONE') fields.opacity = noise.opacity ?? 1
+  if (noise.seed !== undefined) fields.seed = noise.seed
+  return fields
+}
+
+/** A texture's grain under the `.fig` names; its strength is the effect's `radius`. */
+function kiwiTextureFields(texture: TextureEffectParams): Partial<KiwiEffect> {
+  const fields: Partial<KiwiEffect> = {
+    noiseSize: { ...texture.noiseSize },
+    clipToShape: texture.clipToShape
+  }
+  if (texture.seed !== undefined) fields.seed = texture.seed
+  return fields
+}
+
+/** Instances address descendants by override key when one exists, else by node GUID. */
+export function instanceGuidResolver(context: SceneNodeToKiwiContext, counter: { value: number }) {
+  return (id: string): GUID | undefined => {
+    const source = context.graph.getNode(id)
+    return (
+      (source?.overrideKey ? parseGuidOrNull(source.overrideKey) : null) ??
+      getOrCreateNodeGuid(context, id, counter)
+    )
+  }
+}

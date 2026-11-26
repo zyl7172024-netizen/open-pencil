@@ -1,0 +1,253 @@
+import { omit } from 'es-toolkit/object'
+import { isEqual } from 'es-toolkit/predicate'
+
+import type { CharacterStyleOverride, StyleRun, TextDecoration } from '@open-pencil/scene-graph'
+import { appendStyleRun, characterOverrides, styleRunAt } from '@open-pencil/scene-graph/text'
+
+export function getStyleAt(runs: readonly StyleRun[], index: number): CharacterStyleOverride {
+  return styleRunAt(runs, index)?.style ?? {}
+}
+
+export function applyStyleToRange(
+  runs: StyleRun[],
+  start: number,
+  end: number,
+  patch: CharacterStyleOverride,
+  textLength: number
+): StyleRun[] {
+  const chars = characterOverrides(runs, textLength)
+
+  for (let i = start; i < end && i < textLength; i++) {
+    chars[i] = { ...chars[i], ...patch }
+  }
+
+  return compactRuns(chars)
+}
+
+export function removeStyleFromRange(
+  runs: StyleRun[],
+  start: number,
+  end: number,
+  keys: (keyof CharacterStyleOverride)[],
+  textLength: number
+): StyleRun[] {
+  const chars = characterOverrides(runs, textLength)
+
+  for (let i = start; i < end && i < textLength; i++) {
+    chars[i] = omit(chars[i], keys)
+  }
+
+  return compactRuns(chars)
+}
+
+export function selectionHasStyle(
+  runs: StyleRun[],
+  start: number,
+  end: number,
+  key: keyof CharacterStyleOverride,
+  value: unknown
+): boolean {
+  for (let i = start; i < end; i++) {
+    const style = getStyleAt(runs, i)
+    if (style[key] !== value) return false
+  }
+  return true
+}
+
+function isEmptyStyle(style: CharacterStyleOverride): boolean {
+  return Object.keys(style).length === 0
+}
+
+function compactRuns(chars: readonly CharacterStyleOverride[]): StyleRun[] {
+  const result: StyleRun[] = []
+  for (const [index, style] of chars.entries()) appendStyleRun(result, index, 1, style)
+  return result
+}
+
+/** Which neighbour inserted characters copy their style from, as Figma's `insertCharacters` takes it. */
+export type InsertStyleSource = 'BEFORE' | 'AFTER'
+
+/**
+ * The style inserted characters take, as Figma gives it: the preceding character's for `BEFORE`
+ * and the following one's for `AFTER`, or the closest character's at either end of the text.
+ */
+export function insertedStyleAt(
+  runs: StyleRun[],
+  textLength: number,
+  start: number,
+  useStyle: InsertStyleSource
+): CharacterStyleOverride {
+  if (textLength === 0) {
+    return {}
+  }
+  const preferred = useStyle === 'BEFORE' ? start - 1 : start
+  const index = Math.min(Math.max(preferred, 0), textLength - 1)
+  return getStyleAt(runs, index)
+}
+
+/**
+ * The runs after `length` characters are inserted at `pos`, the new characters all in `style`
+ * and every other character keeping its own. Works on the runs, not on each character, so a
+ * long insert costs no more than a short one.
+ */
+export function insertRunsWithStyle(
+  runs: StyleRun[],
+  pos: number,
+  length: number,
+  style: CharacterStyleOverride
+): StyleRun[] {
+  const moved: StyleRun[] = []
+  for (const run of runs) {
+    const end = run.start + run.length
+    if (end <= pos) moved.push(run)
+    else if (run.start >= pos) moved.push({ ...run, start: run.start + length })
+    else {
+      // The insert splits this run in two around the new characters.
+      moved.push({ ...run, length: pos - run.start })
+      moved.push({ ...run, start: pos + length, length: end - pos })
+    }
+  }
+  if (length > 0 && !isEmptyStyle(style)) moved.push({ start: pos, length, style: { ...style } })
+  moved.sort((first, second) => first.start - second.start)
+  const insertEdges = new Set([pos, pos + length])
+  const merged: StyleRun[] = []
+  for (const run of moved) {
+    const last = merged.at(-1)
+    const meetsAtInsertEdge =
+      last !== undefined && last.start + last.length === run.start && insertEdges.has(run.start)
+    if (last && meetsAtInsertEdge && isEqual(last.style, run.style)) {
+      merged[merged.length - 1] = { ...last, length: last.length + run.length }
+    } else {
+      merged.push(run)
+    }
+  }
+  return merged
+}
+
+export function adjustRunsForDelete(
+  runs: StyleRun[],
+  start: number,
+  deleteLength: number
+): StyleRun[] {
+  const end = start + deleteLength
+  const result: StyleRun[] = []
+  for (const run of runs) {
+    const runEnd = run.start + run.length
+    if (runEnd <= start) {
+      result.push(run)
+    } else if (run.start >= end) {
+      result.push({ ...run, start: run.start - deleteLength })
+    } else {
+      const newStart = Math.max(run.start, start)
+      const newEnd = Math.min(runEnd, end)
+      const removed = newEnd - newStart
+      const newLength = run.length - removed
+      if (newLength > 0) {
+        result.push({
+          ...run,
+          start: Math.min(run.start, start),
+          length: newLength
+        })
+      }
+    }
+  }
+  return result
+}
+
+export function runsAfterTyping(
+  runs: StyleRun[],
+  textLength: number,
+  start: number,
+  end: number,
+  typedLength: number
+): StyleRun[] {
+  const replacesSelection = end > start
+  const style = insertedStyleAt(runs, textLength, start, replacesSelection ? 'AFTER' : 'BEFORE')
+  const remaining = replacesSelection ? adjustRunsForDelete(runs, start, end - start) : runs
+  return insertRunsWithStyle(remaining, start, typedLength, style)
+}
+
+export function toggleBoldInRange(
+  runs: StyleRun[],
+  start: number,
+  end: number,
+  nodeWeight: number,
+  textLength: number
+): { runs: StyleRun[]; newWeight: number } {
+  const allBold = selectionAllBold(runs, start, end, nodeWeight)
+  const targetWeight = allBold ? 400 : 700
+  const newRuns = allBold
+    ? removeStyleFromRange(runs, start, end, ['fontWeight'], textLength)
+    : applyStyleToRange(runs, start, end, { fontWeight: 700 }, textLength)
+  return { runs: newRuns, newWeight: targetWeight }
+}
+
+function selectionAllBold(
+  runs: StyleRun[],
+  start: number,
+  end: number,
+  nodeWeight: number
+): boolean {
+  for (let i = start; i < end; i++) {
+    const style = getStyleAt(runs, i)
+    const weight = style.fontWeight ?? nodeWeight
+    if (weight < 700) return false
+  }
+  return true
+}
+
+export function toggleItalicInRange(
+  runs: StyleRun[],
+  start: number,
+  end: number,
+  nodeItalic: boolean,
+  textLength: number
+): { runs: StyleRun[]; newItalic: boolean } {
+  const allItalic = selectionAllItalic(runs, start, end, nodeItalic)
+  const newRuns = allItalic
+    ? removeStyleFromRange(runs, start, end, ['italic'], textLength)
+    : applyStyleToRange(runs, start, end, { italic: true }, textLength)
+  return { runs: newRuns, newItalic: !allItalic }
+}
+
+function selectionAllItalic(
+  runs: StyleRun[],
+  start: number,
+  end: number,
+  nodeItalic: boolean
+): boolean {
+  for (let i = start; i < end; i++) {
+    const style = getStyleAt(runs, i)
+    if (!(style.italic ?? nodeItalic)) return false
+  }
+  return true
+}
+
+export function toggleDecorationInRange(
+  runs: StyleRun[],
+  start: number,
+  end: number,
+  deco: TextDecoration,
+  nodeDeco: TextDecoration,
+  textLength: number
+): { runs: StyleRun[]; newDeco: TextDecoration } {
+  const allHave = selectionAllHasDecoration(runs, start, end, deco, nodeDeco)
+  const newRuns = allHave
+    ? removeStyleFromRange(runs, start, end, ['textDecoration'], textLength)
+    : applyStyleToRange(runs, start, end, { textDecoration: deco }, textLength)
+  return { runs: newRuns, newDeco: allHave ? 'NONE' : deco }
+}
+
+function selectionAllHasDecoration(
+  runs: StyleRun[],
+  start: number,
+  end: number,
+  deco: TextDecoration,
+  nodeDeco: TextDecoration
+): boolean {
+  for (let i = start; i < end; i++) {
+    const style = getStyleAt(runs, i)
+    if ((style.textDecoration ?? nodeDeco) !== deco) return false
+  }
+  return true
+}

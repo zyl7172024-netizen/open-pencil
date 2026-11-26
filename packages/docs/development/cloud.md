@@ -1,0 +1,788 @@
+# Cloud Architecture
+
+OpenPencil Cloud is an optional, self-hostable backend for storing, sharing, and collaborating on
+documents. The editor stays local-first: opening, editing, and saving local files never needs this
+package, a network connection, or an account.
+
+`@open-pencil/cloud` holds the network contracts, a typed client, a runtime-neutral Hono server, and
+two runtimes that wire PostgreSQL, S3-compatible storage, email, and background work into it: a Node
+process, and Cloudflare Workers.
+
+```mermaid
+flowchart LR
+  Editor[Editor and desktop app] -->|typed client| API[Hono server]
+  API --> Auth[Better Auth sessions]
+  API --> Policy[OpenFeature policy]
+  API --> PG[(PostgreSQL metadata)]
+  API -->|presigned URLs| S3[(S3-compatible objects)]
+  Editor -->|presigned PUT and GET| S3
+  Workers[Cleanup and email workers] --> PG
+  Workers --> S3
+  Workers --> SMTP[SMTP]
+```
+
+## Package boundaries
+
+| Subpath                           | Contents                                                                   |
+| --------------------------------- | -------------------------------------------------------------------------- |
+| `@open-pencil/cloud/contract`     | Valibot schemas and the API's oRPC contract, shared by every side          |
+| `@open-pencil/cloud/client`       | Discovery, authentication, device authorization, and the contract's client |
+| `@open-pencil/cloud/email`        | Vue Email rendering for transactional mail                                 |
+| `@open-pencil/cloud/errors`       | The PostHog error reporter, for services beside Cloud; only `posthog-node` |
+| `@open-pencil/cloud/server`       | The contract's procedures, Hono routes, and services; all injected         |
+| `@open-pencil/cloud/runtime/node` | PostgreSQL, S3, SMTP, the HTTP listener, workers, and operator commands    |
+
+The Cloudflare runtime, `src/runtime/cloudflare`, isn't a subpath: Wrangler bundles it from
+a deployment folder, type-checked against the Workers types by its own `tsconfig.json`.
+`deploy/cloudflare` is the folder self-hosters copy; the official deployments are filled-in copies
+under `deploy/openpencil/<target>`, which the Deploy Cloud workflow deploys with the secrets of the
+`cloud-<target>` GitHub environment. A new target needs its folder, that environment, and an option
+in the workflow.
+
+The server never imports `pg`, opens a listener, runs migrations, or starts timers; runtimes do.
+Browser code imports only `contract` and `client`, so it never pulls in server dependencies.
+
+## Documents and revisions
+
+PostgreSQL stores workspaces, membership, documents, revisions, uploads, sharing, and quota state.
+Object storage stores immutable `.fig` revisions; a document points at its current revision, and every
+revision has its own object key.
+
+- Uploads go straight from the client to object storage through presigned single or multipart PUTs.
+  The server verifies a SHA-256 digest before committing; ETags only complete multipart uploads.
+- Each upload names the revision it was based on, so a stale base is rejected instead of silently
+  overwriting a newer revision. The client then chooses: take the Cloud revision, keep both, or
+  replace it.
+- Deleting a document moves it to Trash: `deleted_at` and `deleted_by` are set, and the cleanup
+  worker destroys revisions and objects once the retention period passes. `GET /api/trash` lists
+  what the person may restore across their workspaces, and `POST /api/trash/:documentId/restore`
+  clears the deletion while retention lasts and no cleanup has claimed the document. Restoring
+  needs the `delete` permission; deleting forever, `DELETE /api/trash/:documentId`, the `purge`
+  one, which the document's owner and workspace admins hold. A document in Trash keeps its bytes
+  in the workspace's usage, so restoring checks no quota.
+- Deleting forever (`markPurged` in `src/server/documents/purge.ts`) sets `purged_at` and
+  `purged_by`: the document leaves Trash, and the files only it holds come off the workspace's
+  usage at once, recorded in `purged_bytes`. Its files and rows stay through `purge_grace_days`, so
+  a server administrator can restore it from the console (`POST /api/admin/documents/:id/undelete`,
+  audited as `document.undeleted`), live in its workspace with its bytes counted again, unless the
+  workspace has nobody left in it. Cleanup then destroys it like a document past retention, taking
+  off the usage only what `purged_bytes` didn't, and storage reconciliation leaves such documents
+  out. With no grace, deleting forever destroys the document in the request. An account's deletion
+  deletes the documents of the workspaces only it belonged to forever, with the same grace.
+- Every document, upload, or compaction step cleanup can't finish is reported to error tracking
+  with source `cleanup`, by ID only, and retried by a later pass.
+- Images are stored once per workspace, keyed by the SHA-256 the object store verifies, and a stored
+  revision leaves them out of its file: it lists the images it uses under the names the file gives
+  them, and a download returns a link for each. Before a save the client asks which of its images
+  the workspace lacks and uploads only those, each as an upload of its own kind with its own
+  reservation, committed together in one request; asking renews the images the workspace holds.
+  An image under a name Cloud does not accept stays inside the file. A save that names an image
+  the workspace does not hold is refused. Keying by the verified checksum, with names kept per
+  revision, means bytes uploaded under the wrong name can only reach the revision that named them.
+- Restoring or duplicating a version gives the new revision the same images. Compaction releases an
+  image no kept revision uses once a day has passed since a save last asked for it: its bytes return
+  to the workspace's usage and the object sweep deletes its file.
+
+### Version history
+
+Every save is a revision, but the history a person sees is its versions: checkpoints the server
+keeps on its own, and versions someone named (`document_version`, one per revision).
+
+- When a save lands and the newest version is half an hour old, the server keeps the revision that
+  save replaces as a checkpoint, so each stretch of editing and the state every session ended on stay
+  in the history. A document's first save is always one.
+- Naming the current state, or naming any version, makes it a named version; deleting its info turns
+  it back into a checkpoint. Viewers see the history; editors name, restore, and duplicate.
+- Restoring keeps the replaced state as a checkpoint, adds a revision that points at the restored
+  version's stored file, and advances the collaboration epoch, so the live room starts over on it.
+  Duplicating makes a new document in the same workspace from the same file. Neither uploads
+  anything or uses more storage.
+- A restore ends the document's rooms on the relay with close code `4410`, and the relay turns away
+  tickets for an earlier epoch. A tab told so, or handed a ticket for another room, drops its queued
+  uploads, shows the restored file it downloads, and joins the new room; a saver never overwrites a
+  revision once its room has moved on.
+- In the editor, File → Show version history makes the document read-only and lists its versions in
+  the right sidebar, as Figma does. Choosing a version shows it in a read-only editor of its own in
+  place of the document, whose room keeps syncing underneath; Save to version history (⌥⌘S) names
+  the document once it is uploaded. A tab that does not save asks the room's saver on the `upload`
+  channel, after its own edits, and names it when the saver answers that its upload finished. When
+  a version is named, renamed, or turned back into an autosave, or a save adds a checkpoint, the
+  server sends `versions` to the document's rooms and every open history loads it again; peers
+  cannot send it.
+- A document's address is `/documents/:id` on its server, with `?version=…` for a version; the
+  editor keeps the address bar on the active tab's document and the version it shows when the
+  document is on the server serving the editor, and a version's Copy link builds the address on the
+  document's server. The address carries no secret: opening it signs in to the server at that
+  address, one the app already knows or the official one, and the server's access rules decide. Fetching a version returns the version with its download, so
+  a link can show it without paging the history.
+- The cleanup worker compacts saves that are neither current nor a version once they are a day old,
+  a batch at a time, and returns the bytes of files nothing else uses to the workspace's usage. A
+  freed file's row stays until the object store deletes it, so a failed delete is retried. With
+  the `revision_history` entitlement off, a workspace keeps 30 days of versions, as on a free plan.
+
+### Comments
+
+A Cloud document's comments live on the server (`comment_thread`, `comment`), not in its file: a
+thread is a pin and whether it is resolved, and its comments are the first message and the replies,
+oldest first.
+
+- Each comment names the account that wrote it, and an agent's name when one wrote it for them; an
+  account deleted later reads as nameless. A comment brought in from a file has no account and keeps
+  the name the file gave.
+- Everyone who can read the document reads its comments, guests on a link included. Everyone signed
+  in who can read writes them, on a view link too; guests never do. Only a comment's author changes
+  what it says. Its author or anyone who can edit deletes it, for good; deleting a thread's first
+  comment deletes the thread. Anyone who comments resolves or reopens a thread, and whoever started
+  it or an editor moves its pin. These are the `comment` and `moderate` actions in
+  `src/server/auth/access-control.ts`.
+- Members reach them at `/api/documents/:id/threads`; link visitors at `/api/shares/:id/threads`,
+  with the link secret in every request's body, reads included. A document holds at most 5,000
+  threads and a thread 500 comments (`comment_limit_reached`).
+- After each change the server sends `comments`, with the thread's ID, to the document's rooms, and
+  open editors fetch that thread; peers cannot send it. Comments never enter the room's Yjs state or
+  a revision, and go with their document when it is deleted for good.
+- In the editor, a Cloud tab's document holds the server's threads, so the comment list, pins,
+  scripts, agents and Save As read them as they read a file's (`src/app/cloud/comments/`). What the
+  tab changes in them is sent as the requests that make it, under the IDs the editor chose, so a
+  retry finds what it made; a change the server refuses is taken back. Only a tombstone deletes: a
+  thread the document lacks, as a file opened in its place does, is one it has not heard of. An
+  agent's comment is the signed-in account's, naming the agent.
+- The Cloud storage provider keeps comments (`keepsComments`), so a save to it writes the file
+  without them, while Save As, a download, and the portal's Download all write them in. A document
+  this device has not uploaded yet, as one just saved to Cloud, brings its file's threads along
+  under the names the file gave (`POST /api/documents/:id/threads/import`, editors only).
+- A mention is a Markdown link to the account, `[@Ana](openpencil://person/<id>)`, as chat writes
+  its references; the composer shows `@Ana` and offers, for `@`, the people who can open the
+  document (`GET /api/documents/:id/threads/people`: names and pictures, never addresses). Each
+  request lists the accounts it names, and the server keeps those who can read the document
+  (`comment_mention`), at most 50 a comment.
+- Email (`comment-notification`) goes to the people a comment names, and, for a reply, to the
+  thread's other writers who chose every comment; an edit tells only the people it adds. Each
+  account chooses all, mentions (the default), or none at `/account/notifications`
+  (`GET`/`PUT /api/account/notifications`). One person's comments send at most 200 such emails a
+  day and one account receives at most 50 (`comment_email`); past either a mention is still kept,
+  only not emailed. The email links to `/documents/:id?comment=<thread>`, which opens the thread.
+- A thread is unread for an account while someone else wrote in it after the account last read it
+  (`comment_read`); opening it, or writing in it, reads it. Pins and the list mark unread threads.
+
+## Authentication and authorization
+
+Better Auth owns users, sessions, social sign-in, email and password, passkeys, TOTP, and recovery
+codes. OpenPencil owns workspace and document authorization. For clients that cannot host a browser
+redirect, such as the desktop app, the server supports the OAuth device authorization flow and
+accepts the resulting bearer token.
+
+Access to a document comes from ownership, workspace membership, a direct grant, or a capability
+link, and the strongest source wins. Revoking one source leaves access inherited from another.
+Ownership counts only while the document's maker is still in its workspace, so someone removed
+keeps no way back in; their collaboration tickets lapse within five minutes. A direct grant comes
+only from an invitation the person accepted: sharing can change or revoke a grant, never give one,
+and the server never looks people up by email, so nobody can find out who has an account or put a
+document in a stranger's files. Documents granted to someone outside their own workspaces are
+listed for them separately, so a client can show what was shared with them. A share link stops
+working while the person who made it, or made its document, is banned.
+
+Workspace administrators invite people by email with a role. Workspace invitations use the same
+`/invitations/:id` link as document invitations: preview and accept look for a workspace
+invitation first and fall back to a document one, so email, the desktop handoff, and the editor's
+invitation dialog serve both. A workspace with members always keeps an administrator. Each
+invitation emails the inviter's and the file's names, which the sender chooses, so one person may
+send 100 invitations a day and one address may receive 5, documents and workspaces together
+(`src/server/invitations/budget.ts`).
+
+Database rows use UUIDs. Capability secrets and invitation tokens are random hex; only their SHA-256
+digests are stored, and they travel in URL fragments so they never reach access logs or `Referer`
+headers. Invitation continuations through OAuth are single-use compact JWE.
+
+Every sign-in is recorded in `sign_in` with the session it made and how it was made. A Better
+Auth plugin, `accountActivity` in `src/server/auth/activity.ts`, reads the session an endpoint
+issued from the hook context's `newSession`, which two-step sign-in leaves empty until the second
+step, and the method from the endpoint, as Better Auth's own `lastLoginMethod` does: a password,
+Google or Apple, a passkey, a second step, an email link, or the desktop app's device code. A person's Sessions page lists their live sessions with
+that method and the browser the server reads from the user agent, and their latest sign-ins. A
+sign-in from an address the account was never signed in from is emailed to its owner, except the
+account's first. Adding or removing an authenticator app or a passkey is emailed too, and so is
+an administrator resetting them.
+
+A new email address is confirmed from that address through Better Auth's change-email link, and
+the old address is told which address is taking over. An approved enrollment follows the account
+to its new address, so the approval stays with the account.
+
+Deleting an account goes through Better Auth's `deleteUser`, reached only at
+`POST /api/account/delete`, which wants a session from the last ten minutes or the password. Its
+`beforeDelete` hook (`src/server/account/deletion.ts`) takes Cloud's part in one transaction, or
+refuses and changes nothing while the account is the only admin of a workspace other people
+belong to (`account_sole_admin`) or the deployment's only active administrator
+(`last_admin_required`). The same transaction deletes the user row, whose keys cascade to its
+sessions, sign-in methods, passkeys, and two-step secrets, so a failure leaves the account whole;
+Better Auth's own deletes after the hook then find nothing. Workspaces only the account belongs to lose their documents,
+deleted forever, and the cleanup worker removes each such workspace once it has destroyed
+the last of them after the grace; in the workspaces others keep the account drops out, and the longest-standing
+other admin becomes the owner whose plan the workspace draws on. Its document grants, invitation
+budget, plan, picture, sign-ins, MFA assurances and enrollment go, and invitations it sent are
+withdrawn. `GET /api/account/deletion` says beforehand what would go and what stops it, and
+the account page's Download all saves, as one zip, the documents the account would lose: those
+workspaces' and the ones it created in workspaces it leaves.
+
+Collaboration tickets are signed, epoch-scoped JWTs naming the principal and permission. Rotating a
+capability secret keeps the current epoch; revoking access advances it so old tickets stop working.
+
+## Live collaboration
+
+Collaboration in the editor runs Yjs sync and awareness over a `CollabRoomTransport`. Local
+documents use Trystero peer-to-peer; Cloud documents use the Cloud relay, a WebSocket endpoint at
+`/api/collaboration/relay` on the API origin. Both carry the same room messages, so the editor has
+one sync implementation.
+
+```mermaid
+sequenceDiagram
+  participant A as Editor
+  participant R as Relay (server peer)
+  participant B as Viewer
+  A->>R: auth (ticket)
+  R-->>A: welcome [server]
+  R->>A: sync-step1
+  A->>R: sync-reply (offline edits)
+  B->>R: auth (ticket)
+  R-->>B: welcome [server, A]
+  B->>R: sync-step1 to server
+  R-->>B: sync-reply (room document)
+  A->>R: yjs-update
+  R-->>B: yjs-update
+  B->>R: yjs-update (dropped)
+```
+
+The relay joins every room as a peer named `server`. It holds the room's Yjs document, saved by
+document and collaboration epoch, so a newcomer gets the document even when nobody else is online.
+A save logs what changed since the last one in PostgreSQL as a single update, a few bytes for a
+typical edit, rather than rewriting the room. Once the log reaches 500 updates, or both 4 MiB and a
+quarter of the snapshot, a fresh snapshot replaces it; a closing room writes one only when at least
+a quarter of its snapshot changed, since encoding a large document takes memory it may not have. Snapshots are files in the object store beside the
+documents' revisions, which a room's row names, so the database holds only the updates since the
+last one. A compaction records its file before writing it and points the room at it last, so a
+replaced or abandoned snapshot is one nothing refers to, which the object sweep removes once it is
+15 minutes old. A room reopens from its snapshot and the updates logged after it. Tickets are
+short-lived signed JWTs; the client presents a fresh one before the current one expires, and the
+relay closes a socket whose ticket lapsed or changed identity. It checks a ticket when it hears from
+the peer or sends it anything, not on a timer, so on Cloudflare an idle room's Durable Object
+hibernates while its sockets stay open: each socket keeps its peer as an attachment, and the object
+it wakes to resumes them and loads the room's document only once a message needs it. Presence alone
+wakes the object without loading the document.
+
+A socket message carries at most 256 KiB of a frame, under the deployment's per-message limit,
+which may not be lower. A larger frame, such as a big paste, the first editor's copy of a large
+document, or a newcomer's sync reply, travels as fragments in a row that the receiver joins again.
+The relay joins an editor's fragments up to the room's limit and holds viewers and peers not yet
+admitted to one message, so only an editor can make it buffer more. A room's document may hold at
+most 256 MiB, or 32 MiB on Cloudflare, where a Durable Object has 128 MB of memory; an editor's
+update that would grow it past that is refused, while one that only deletes always goes through. A peer the relay turns away for good, for a
+ticket, a full room, or a frame past those limits, leaves the room: the document's status says it
+is not editing live and offers to rejoin, a viewer stays read-only, and an editor saves on its own,
+since a tab that was not the room's saver had its edits counted as saved by the room.
+
+Each runtime decides where rooms live. The Node process holds every room in one relay. On
+Cloudflare, a Durable Object per document holds that document's rooms, and the Worker routes a
+socket to it by the document named in the ticket's relay URL (`?document=`), since the ticket itself
+arrives only after the upgrade; the object refuses tickets for any other document.
+
+A Cloud room names its images instead of carrying them: an editor stores an image it adds in the
+document's workspace and puts only its SHA-256 in the room's `imageRefs` map, and every peer loads
+the images it lacks through links the server signs for anyone who may view the document, or for a
+guest through its share link. A guest or a viewer cannot store images, so the ones it adds travel as
+bytes until an editor in the room stores them and swaps them for references; a store that fails
+leaves the bytes in the room. The room's state, which the relay saves, therefore holds no image
+bytes once an editor has stored them. A peer that cannot load an image asks again later, waiting
+longer each time up to a minute, while the room still names it.
+
+The relay enforces what the ticket allows: a viewer's document updates and sync replies never leave
+it, and presence updates are rewritten so others see the ticket's name and a `cloud` field with the
+verified identity and permission. A peer cannot claim presence clients another peer owns. Voice is
+not carried over the relay yet; the transport reports no media.
+
+## Enrollment and administration
+
+Enrollment is `open`, `approval`, or `closed`. In approval mode a verified identity creates a
+pending request that a deployment administrator approves or rejects; approval can be revoked later.
+Deployment administrators are separate from workspace administrators, and startup never grants
+either role: the first operator is approved and promoted through the `admin` command. An official
+deployment must require a second sign-in step from them (`required_for_admins`).
+
+The console's lists are tables the server pages, searches, and filters: each admin list endpoint
+takes `search`, `filter`, `limit`, and `offset` and answers with its rows, the `total` matching, and
+how many match the search under each filter (`src/admin/list.ts`). A list declares its filters once, as conditions on its table; one query counts them all with `count(*) filter (where …)`, and the page uses the same condition. People lists accounts in sign-up
+order, searched by name or email and filtered to administrators, suspended accounts, or accounts
+without two-step sign-in; access requests are searched by name or email in each status; email by
+recipient and delivery; activity by the names of who acted and whom it was about, and by what it
+was about. In the portal, `usePortalList` (`src/app/cloud-portal/list.ts`) holds a list's search,
+filter, and page and builds its TanStack Table; `PortalTable` draws the toolbar, the shared
+`AppDataTable`, and the pages, and each list only defines its columns, which render their cells with the components in `src/components/cloud-portal/table/`. A row has at most one inline
+action, such as Approve; the rest are in its “…” menu. A person's page shows how they sign in, their workspaces, sessions, and recent
+sign-ins. Administrators make and remove administrators, sign people out everywhere, suspend
+with a reason the activity log keeps, and reset a locked-out person's two-step sign-in, which
+removes their authenticator app, recovery codes, and passkeys, and take down a person's picture.
+Every action asks once more.
+
+Anyone a share link lets in, guest or signed in, may report its document: why (spam or
+phishing, illegal content, copyright, harassment, or something else), what to look at, and,
+optionally, where to answer. `POST /api/shares/:shareId/reports` resolves the link as opening it
+does, so a wrong secret, a revoked link, or a server that turns guests away refuses the report,
+and its answer says only that it arrived. One reporter may report a link three times a day and a
+link gathers at most fifty reports a day (`src/server/reports/service.ts`), besides the public
+routes' per-address limit. Where email delivery is configured, each report emails the
+deployment's administrator notification addresses, the ones enrollment uses; without it, reports
+wait in the console's Reports list unannounced. The console's Reports list shows open reports first, with
+the document, its workspace and owner, and the link; from a report an administrator takes the
+document down, revokes the link, suspends the owner, dismisses the report, or marks it handled.
+Documents lists every document, searched by name, ID, or the owner's name or email, and filtered
+to reported or taken-down ones. A document taken down (`document.disabled_at`) is out of reach
+for everyone, its owner included: access, listings, share links, invitations, and collaboration
+tickets all treat it as gone, and the relay admits nobody to its rooms even with a ticket issued
+before. Its live rooms close and are saved, and its collaboration epoch stays, so restoring it
+gives everything back, edits not yet in a revision included; its open reports count as acted on.
+Revoking a link from the console works as the owner's revocation does: the epoch moves on, so the
+link's guests lose their tickets while members keep editing. Each of these actions goes into the
+activity log.
+
+Account pictures live in `user_picture`, one per account, and `user.image` holds the address the
+server serves them from, `/api/pictures/:userId/:version`, where the version is the start of the
+picture's SHA-256: a new picture is a new address. Responses are cached for one day, so a
+picture an administrator removes may stay visible until the cache expires. The
+page crops and shrinks a picture to a 256-pixel JPEG; the server accepts PNG or JPEG of at most
+256 KB and 1024 pixels a side, reading the type and size from the bytes. A Google picture is
+fetched when Better Auth writes the account's ID token, as it does when the account is linked and
+at each sign-in with it, from the token's `picture` claim, and kept the same way unless the person
+already shows a picture of their own; one that cannot be fetched leaves initials, never a link to
+Google. The server fetches only from Google's picture host and follows no redirects. Nothing written
+through Better Auth sets `user.image`; the server writes the addresses of the pictures it keeps
+itself.
+
+## Portal
+
+The server shows its own pages on its public address: a welcome page, sign-in and sign-up, email
+verification, password reset, two-step sign-in, desktop sign-in approval, account pages (profile,
+sign-in and security, and sessions), and the administration console. They are a separate Vite entry, `cloud.html`, in the app project, so they
+reuse the editor's components and theme without loading the editor. `bun run build:cloud` writes
+them to `dist-cloud/` beside the editor itself, which every Cloud server serves at its root. The
+editor never embeds these pages; when it needs them, for a social provider or a second sign-in
+step, it opens them in a browser and gets the person back through `/auth/return` or the device
+code. A verification link started in the editor lands on `/auth/verified`, which sends the person
+back to the editor.
+
+`CLOUD_PORTAL_PAGE_ROOTS` in the contract lists the page paths, and every runtime serves
+`cloud.html` at and below them with a fixed content security policy that runs only the site's own
+scripts and Turnstile, and with `frame-ancestors 'none'`, so the approval page cannot be framed.
+The pages carry no inline script for it to allow: a build loads the boot splash's script from its
+own file. The desktop approval page never shows the code it
+was opened with: the person types the code the app shows, so a link someone else sent cannot be
+approved in one click. Both runtimes put the API behind the same Hono router, `createCloudServer` in
+`src/runtime/site`, which answers portal pages before the API, and only where the API returns 404
+the site's files, then the editor's `index.html` for any other page, so the editor's router keeps
+its own addresses. Node reads the build named by `OPENPENCIL_CLOUD_SITE_DIR`, and the Worker reads
+its static assets. `bun run cloud:dev` builds nothing: it runs Vite's development server for the
+site under its own portless name and points the Node server at it with
+`OPENPENCIL_CLOUD_DEV_SITE_URL`, so the server takes each file from source, uncached, and pages
+update in place. Vite's update socket connects to its own address, since the server accepts
+WebSockets only for collaboration.
+
+The editor a server serves knows it from the build (`__OPENPENCIL_CLOUD_SITE__`). Before it boots,
+it asks who is signed in: an account that may use the server gets the editor, and anyone else at
+the root goes to `/welcome`, which signs them in, sends an account waiting for review to its
+standing page, or opens the editor without an account; this browser then keeps that choice.
+`[deployment] local_editor = false` takes that choice away and sends every editor page there.
+Links to documents, shared files, and invitations always open the editor, which signs in for them,
+and an unreachable server does too, since the editor works without it. The editor adds its server at startup and reaches it with the
+server's own sign-in session, and the portal leaves for the editor as a page load, never through
+its router. An official deployment builds the editor with its own address as
+`VITE_OPENPENCIL_OFFICIAL_CLOUD_URL`, so staging is the official server in its own editor.
+
+## Editor client
+
+The editor treats each Cloud server as a profile of the `openpencil-cloud` storage provider, with a
+workspace as the container, so the sync engine, recent files, and tabs handle Cloud documents the
+way they handle a bucket. A server's id is hex from its address, which also names its credentials.
+Email and password sign in inside the connect dialog wherever the server accepts the editor's
+requests, which is the desktop app and the server's own editor address; the session's bearer token
+goes in the credential store. Social providers and accounts with two-step sign-in finish in the
+browser: the server's own editor address leaves for its pages and comes back, and the desktop app
+approves a device code. Each connection tells a signed-in account from one waiting for approval, one
+whose sign-in expired, and one never signed in.
+
+Saves name the revision they were edited from, so a write over someone else's newer revision
+becomes a conflict to resolve. Opening a Cloud document also joins its room on the relay. An empty
+room takes the first editor's document once the relay has answered; a tab that opened the stored
+file takes the room's copy when the room already has one, because each read of a `.fig` gives the
+layers new IDs. One signed-in editor, the one with the lowest presence client, saves for the room;
+the others drop their queued uploads and count their edits as saved. Guests who open a link join
+the room with the link's permission and never save.
+
+The room says what is unsaved, not the tab. Each peer counts its own edits to the room's document
+under its Yjs client in the `edits` map, and the saver copies the counts its upload held into
+`saved` once the server has that upload. What a tab takes from the room, including the replay when
+it opens the stored file, is no edit of its own. The saver saves whenever any client has more edits
+than `saved` records, so a tab that becomes the saver also saves edits an earlier saver left, and
+opening a document nobody edited uploads nothing.
+
+## Community gallery examples
+
+A deployment's community gallery is the workspace its `openpencil-cloud.toml` names with
+`[community] workspace`. The gallery's examples are ordinary documents there, published from CI as
+an account that belongs to that workspace. The **Publish gallery examples** workflow runs
+`tools/ci/cloud-examples` with the `cloud-<target>` environment's `CLOUD_URL` and
+`CLOUD_COMMUNITY_WORKSPACE` variables and its `CLOUD_COMMUNITY_TOKEN` secret, a personal access
+token of that account.
+
+The tool builds each example in its manifest (`src/examples.ts`; the tour is the editor's demo
+document) and saves it as the editor does, through `saveCloudDocument` in
+`@open-pencil/cloud/client`: the document is created the first time, gets a new revision only when
+its file changed, takes the manifest's description when it differs, and, given a version, has its
+current state named after the release once. A run with the same files, descriptions, and version
+changes nothing.
+
+A document's description says what the file is, and editors set it with `PATCH
+/api/documents/:id`; it is not a change to the file, so the document's last change stays. The
+gallery's pages show it and give it to search engines and link previews, falling back to the newest
+named version's notes, which say what changed in that release.
+
+`[community] tour` names the gallery document editors open as their tour: discovery advertises it as
+`community.tourDocumentId`, and the editor and the docs landing download it with `fetchCommunityTour`
+from `@open-pencil/cloud/client`, as the version named for their release when there is one. Set it to
+the Welcome tour's document ID once the workflow has published it. Discovery and the gallery's
+public reads answer any origin without credentials, so the docs site can fetch them; everything else
+keeps the server's trusted origins.
+
+## Configuration
+
+Operators author one schema-versioned TOML file. It owns URLs, trusted origins and proxies,
+authentication providers, enrollment, object storage, email, worker schedules, retention,
+entitlements, and technical limits, each in the section it limits. Environment variables only supply secrets, through references
+such as `{ from_env = "DATABASE_URL" }`, and never override a value the file sets. TOML is parsed
+with `smol-toml` and then validated and normalised by Valibot.
+
+Technical limits are safety ceilings, not entitlements: runtime policy can be stricter but never
+looser.
+
+## Policy, entitlements, and quotas
+
+OpenFeature answers concrete questions such as whether links work, whether guests, people who
+follow a link without signing in, may view or edit through one, or whether full revision history
+is kept, and what a numeric limit is. Links always work for people signed in to the server: the
+share routes resolve the session, and a guest the server turns away gets `401` so the editor signs
+in and opens the link again. A guest who may view but not edit opens an edit link view-only; the
+resolution names the link's own permission as well, so the editor offers signing in to edit. Its provider reads one entitlement
+source, chosen by `[entitlements] source`: the static table in the deployment TOML, which applies to
+every account, or per-account rows in the database that the `entitlements` command and the internal
+API set. The two are alternatives, not layers. With `source = "database"`, the same table under
+`[entitlements]` holds the defaults: what an account without a row takes, which is the free plan
+when billing writes rows only for paid accounts, and what a row leaves out. Technical limits cap the
+file size and participant limits the source reports.
+
+Plans belong to accounts, not workspaces. Every workspace has an owner, its creator at first, and
+every question about a workspace or its documents is asked of the owner's plan
+(`workspacePolicyContext`), so a person's workspaces share one allowance however many they create.
+When the owner leaves the workspace or stops being an admin, it passes to the longest-standing other
+admin.
+
+Storage quota uses reservations: an upload takes a transaction lock on the workspace's owner, counts
+committed usage plus active reservations across every workspace that owner owns, reserves the
+requested bytes, and commits the verified size when the upload finishes. Usage is still recorded per
+workspace, and the entitlements endpoint reports the owner's total. Cleanup releases reservations
+from abandoned uploads.
+
+An owner who holds their whole storage allowance or more is read-only (`storageLimitReached`):
+their documents open, download, and can be deleted, but take no saves or uploads, and no new
+documents. Collaboration tickets for them carry `view` and `readOnly: "storage-limit"`, so the
+editor opens the file view-only and says why, with the server's plan page when it bills.
+A plan that shrinks below what the account holds, as when billing moves a lapsed subscription to
+the free plan, reaches this the same way as filling it; nothing is deleted. Freeing space or a
+bigger plan lifts it at the next ticket.
+
+## Services and billing
+
+Cloud does not proxy models or other paid capabilities, and keeps no credit balances. A
+`[services]` table advertises a separate service in discovery, and `POST /api/services/token` signs
+a short-lived ES256 token for a workspace member when the workspace owner's plan has the
+`services.enabled` entitlement. The token names the user, the workspace, the account whose credits it
+spends (`accountId`, the owner), and that plan's `services.monthly_credit_allowance`;
+the service verifies it against the keys at `/.well-known/jwks.json`, so it never reads Cloud's
+database. A service refuses a token that names no account. The contract editors and services share, including the service's catalog, wallet, and
+error codes, is `src/contract/services.ts`; it has its own version so a service can change without
+a Cloud release. AI models are the first capability; image generation and search join the same
+contract and the same credits.
+
+A `[billing]` table advertises a billing service by its `endpoint`, which needs the services'
+signing key and the internal API. `POST /api/billing/token` signs a short-lived token for the
+signed-in person's own account, with the services' key but the `openpencil-billing` audience, so it
+spends no credits. Cloud has no billing pages of its own: its plan page shows the account's storage
+and monthly credits, and, when the server advertises billing, posts a fresh token as the form field
+`token` to the service's `CLOUD_BILLING_PAGE_PATHS.session`. Cloud's pages send `Referrer-Policy: strict-origin`,
+so that post names Cloud's origin: under `no-referrer` or `same-origin`, browsers send
+`Origin: null` with it, which the service's check of where a form came from refuses. The service verifies it against the
+same published keys and keeps its own session from there: its pages sell the plans and credit packs
+of its catalog, send the person to its payment provider's checkout or portal, and set the account's
+plan through the internal API as it is paid. A service whose session ended sends the person to
+`CLOUD_ACCOUNT_BILLING_PATH`, the plan page, which opens billing again at once. Billing's own pages, at the
+advertised endpoint's origin, may also ask for a token themselves (`CLOUD_BILLING_TOKEN_PATH`):
+Cloud's CORS lets that one origin call that one route with the visitor's session, so someone
+already signed in to Cloud is signed in to billing as its pages open, and its pricing page knows
+their plan. The session cookie reaches it only where billing is on the same site as Cloud, as
+`billing.openpencil.dev` is to `cloud.openpencil.dev`; elsewhere billing's pages fall back to the
+plan page's handoff. A Cloud from
+before the handoff called the service's JSON account, checkout, and portal routes, which a service
+with its own pages need not keep, and this one posts to `/session`. Upgrade the service first,
+then Cloud straight after, in the same window: between the two, the old plan page cannot buy. Discovery's
+`billing.freePlan` is what an account without a plan has, from the default entitlements, so the
+service's pricing page compares its plans with it. The contract is `src/contract/billing.ts`. Editors
+link to the server's plan page, `CLOUD_ACCOUNT_PLAN_PATH`, whenever it advertises billing.
+
+`bun run cloud:dev` runs with a billing service when `OPENPENCIL_CLOUD_DEV_BILLING_URL` names one,
+such as the official service run locally: it generates the services' signing key and the internal
+API's token into `deploy/generated/`, adds the `[services]`, `[billing]`, and `[internal_api]`
+tables, keeps entitlements in the database where billing writes plans, and gives the free plan the
+official Cloud's 300 MB, which the service's pricing page shows. `OPENPENCIL_CLOUD_DEV_SERVICES_URL`
+names the services, `http://127.0.0.1:8788` by default. The billing URL must be HTTPS, with the
+service run under portless as Cloud is: a browser names no origin for a form posted from an HTTPS
+page to an HTTP one, which the service refuses. The service reaches Cloud over portless's HTTPS
+too, so both trust its certificate through `NODE_EXTRA_CA_CERTS`.
+
+A plan may be priced by the seat (`billingSeatPricingSchema`): an account's seats are the people
+who can edit, as editors or admins, across the workspaces it owns, each counted once, the owner
+too, and viewers not at all (`accountSeats` in `src/server/billing/seats.ts`). Billing reads the
+count from the internal API at `GET /api/internal/accounts/:userId/seats`. Whenever a role change, a
+removal, an invitation accepted, a workspace deleted, or ownership passing on may change it, Cloud
+posts a billing token for each owner it touched to the service's `CLOUD_BILLING_API_PATHS.seats`
+after the change commits (`createSeatNotifier`), on Workers through `waitUntil`. A notice carries
+no count and may be lost, so the service treats it as a prompt to read the count and also
+reconciles on its own.
+
+A service answers below its endpoint at the paths in `CLOUD_SERVICES_API_PATHS`: model requests
+follow the OpenAI chat completions API, so editors reach it with an OpenAI-compatible client, and the
+catalog, wallet, and usage pages are the contract's own. The catalog's `roleModels` names the model the service recommends for each of the editor's roles; an editor signed in to the service with only a fresh install's unset model sets itself up with them (`src/app/ai/providers/openpencil/setup.ts`), and a service without them has its `defaultModelID` take every role, except Vision, which stays unassigned when that model reads no images. A catalog from before roles whose default model calls no tools starts without `roleModels`, and editors then set nothing up. `CloudServicesSchema` types those routes as
+Hono does, so the client calls them through `hc` and still parses each answer, since a service is
+deployed apart from the editor; a service built with Hono can check its app against the same type.
+The reference service is the services server in `src/services`, run by `src/runtime/node/services`:
+it verifies tokens against Cloud's keys, forwards completions to one upstream with one key, and
+keeps one usage row per settled request, so an account's monthly spend is the sum of its rows across
+the workspaces it owns. The usage page lists one workspace's requests only, since the owner's other
+workspaces have other members. It reads usage from the upstream's answer, asking
+streams for it with `stream_options.include_usage`, and keeps reading after the editor disconnects
+so a request is still charged. It admits a request while credits remain and charges it afterwards,
+so in-flight requests can overdraw an allowance; the official service reserves credits instead. An
+answer ends only after its charge is recorded, so the wallet the editor reads once a reply ends
+includes it, and a refusal for lack of credits says when the allowance renews. It forwards only
+chat completion fields, so a router's fallback or provider fields cannot run a model outside the
+catalog on its key. An upstream answer has ten minutes in all, streamed or not, before the services server ends it.
+
+Other capabilities are optional: a service lists each one it offers in its catalog with its price,
+and answers `capability_unavailable` for one it does not. Web search is the first. A catalog with
+`search` takes `POST /v1/search` with a query and up to ten results, and returns each page's URL,
+title, date, author, and an excerpt; the contract names no search engine. The editor offers the
+model OpenPencil's `search_web` tool, which also reaches agents through OpenPencil's MCP server.
+It searches the services when the Design model runs on them and their catalog lists search, charged
+to the same account; the reference services server offers no search. In the desktop app, an Exa key saved
+under Settings › Integrations is used instead, whatever the model, and Exa bills its owner; Exa
+refuses browsers' cross-origin requests, so the web app has no such setting. Without either, the
+tool tells the model how to set search up.
+
+Services that decide entitlements, such as billing, write them through the internal API rather than
+the database: `setAccountEntitlements` in `src/server/internal`, which runtimes expose over HTTP at
+`PUT /api/internal/accounts/:userId/entitlements` with a bearer token (`[internal_api]`) or a
+private transport of their own, and read an account's seats at
+`GET /api/internal/accounts/:userId/seats`. Every write carries an
+increasing `externalVersion`, and a write older than the stored one is refused, because billing
+events arrive out of order. Cloud keeps answering from the last entitlements it received while the
+writer is down.
+
+## Rate limiting
+
+OpenPencil routes use `hono-rate-limiter` with one PostgreSQL store that atomically increments
+hashed, namespaced keys, so limits hold across instances. Better Auth keeps its own limiter for
+`/api/auth/**`; those routes mount before OpenPencil middleware and are never counted twice.
+
+## Transactional email
+
+Vue Email renders matching HTML and plain-text bodies. Email goes through a PostgreSQL outbox: the
+row is written in the same transaction as the change that caused it, payloads are encrypted at rest,
+and a worker claims bounded batches with retries. The Node runtime sends through SMTP with
+Nodemailer. On Cloudflare, Email Service sends what a request queued once the request finishes, and
+a Cron Trigger retries the rest; `email.transport = "none"` disables delivery.
+
+## Tests
+
+| Level       | Location                                                      | Needs                   |
+| ----------- | ------------------------------------------------------------- | ----------------------- |
+| Unit        | `packages/cloud/tests/{client,contract,email,runtime,server}` | nothing                 |
+| Integration | `packages/cloud/tests/integration`, mirroring `src`           | PGlite, in process      |
+| End-to-end  | `packages/cloud/tests/e2e`                                    | Docker Compose services |
+
+`bun run test:cloud` type-checks the package and runs unit and integration tests. The end-to-end
+runners start PostgreSQL and SeaweedFS (or Garage) in an isolated Compose project, exercise presigned
+and multipart uploads and the full revision flow, and remove the project afterwards. `test:e2e:cloudflare`
+runs the Worker under `wrangler dev` against the same services and checks the API, the portal, and
+the relay's Durable Object from outside.
+
+## Decisions
+
+Choices made while porting Cloud, with what was rejected and why. Add new entries at the end with
+their date; revise an entry only by adding one that supersedes it.
+
+**2026-10 · A relay instead of Hocuspocus.** The relay speaks the same room messages as Trystero, so
+local and Cloud documents share one sync implementation. A Hocuspocus server would have needed a
+second provider in the editor and its own authorization hooks for tickets and viewer filtering.
+
+**2026-10 · The portal is a second Vite entry served only by the server.** Sign-in, approval, and
+administration pages reuse the editor's components and theme without shipping in the editor
+bundle, and a self-hosted server serves pages that match its own version. Pages inside the editor
+would put the approval page under an origin the server does not control; a separate frontend
+package would have duplicated the UI kit.
+
+**2026-10 · Rooms are live whenever a Cloud document is open, and one editor saves.** Every open
+tab joins the room, and the signed-in editor with the lowest presence client uploads for everyone,
+so two people editing together never conflict with each other. Joining only on demand left
+concurrent saves to the conflict dialog; building files on the server from the room's Yjs state
+needs a headless `.fig` writer on the server, which is a later step.
+
+**2026-10 · A tab takes the room's copy when the room has one.** Reading a `.fig` gives layers new
+IDs, so two tabs that read the same file cannot merge their Yjs states. The first editor seeds an
+empty room only after the relay answers, and later tabs adopt the room root.
+
+**2026-10 · The room records what its revisions hold.** A tab compared with its own copy saw the
+room's values as edits wherever a `.fig` round trip changes them, such as defaults it writes, so
+every open uploaded a revision. Matching the round trip field by field breaks again with each new
+field. Per-client edit counts in the room are what Yjs already merges, so no server change is
+needed.
+
+**2026-10 · Redirect sign-in only on the server's own editor address.** There the session cookie is
+first-party and the server can send the person back to the same tab. The desktop app and editors on
+other origins approve a device code instead of relying on third-party cookies or custom URL
+schemes.
+
+**2026-10 · Link secrets stay on the device that created them.** The server stores only digests,
+like every capability secret, so a leaked database does not open documents. Other devices offer
+**Reset link**, which rotates the secret, instead of a server that can hand the link back.
+
+**2026-10 · Guests never save, and viewers are not locked yet.** A link opens a room with the link's
+permission but no account to save under, so a signed-in editor saves for guests. The relay already
+drops a viewer's document updates; locking the canvas for viewers needs a read-only mode in Core and
+is a follow-up.
+
+**2026-10 · Save to Cloud copies rather than moves.** The local file keeps its last saved contents
+and the tab moves to the Cloud document, matching **Save to storage**. Moving would delete a file
+the person may still open elsewhere.
+
+**2026-10 · Home is split into places.** Recent files, each server's workspaces, documents shared
+with the person, and the storage bucket are separate places in a sidebar, so Cloud does not crowd
+the local file list and one server's workspaces show at a time.
+
+**2026-10 · Cloud entry points wait for the official server's listing.** Settings → OpenPencil Cloud
+and Save to Cloud stay hidden until `cloud.openpencil.dev` answers discovery with a `listing` whose
+minimum editor version this editor meets, a server is already connected on the device, or someone
+opened the editor with `?cloud=preview`. Launching, or pulling back, is a change to that server's
+config rather than an editor release, and a launch that needs a client change sets the minimum to the
+release that has it. A separate flags file or a third-party flag service would be one more thing to
+deploy for one switch.
+
+**2026-10 · Email and password sign in inside the editor.** The connect dialog signs in, signs up,
+and waits for the verification link itself, and keeps a bearer token, so no cookie has to cross
+from the server's address to the editor's; Safari treats sibling `.localhost` hosts as separate
+sites and dropped that cookie. Signing in on the server's pages stays for social providers and the
+second sign-in step, which need the server's own origin. This supersedes the redirect decision for
+email and password.
+
+**2026-10 · Settings → Cloud is always there.** Before the hosted service opens, its card holds the
+waitlist, which used to sit under Storage, and a team's own server can be connected at any time.
+This supersedes hiding Settings and Save to Cloud until the official server's listing.
+
+**2026-10 · Every account starts with a workspace, and Save to asks only when there is a choice.**
+An active account with no workspace gets one of its own when it first asks for its status, under a
+slug fixed per person so concurrent requests make one. Save to goes straight to the only workspace
+or bucket a document can go to, and New design creates in the place Home shows, so neither asks a
+question with one answer. A setup step that makes people name a first workspace would stop them
+before they have anything to put in it.
+
+**2026-10 · Workspace invitations share the document invitation link.** Previewing an invitation
+says whether it is for a document or a workspace, so one link format, one email path, and one
+editor dialog cover both, and the desktop app's link handling needs no new kind. Invitation
+continuations through OAuth stay document-only; the editor keeps a pending invitation itself.
+
+**2026-10 · Cloud links hand off to the desktop app through `openpencil://cloud`.** Links stay web
+addresses on the server's editor, so they work for anyone; the web editor on a computer offers the
+desktop app, which gets the web link as `openpencil://cloud?url=<link>#<secret>`. The native side
+checks the link, ID, and secret before the editor sees it. The secret is
+visible in the launch arguments to other processes on the same computer; pasting links into the
+app would avoid that at the cost of a manual step for everyone.
+
+**2026-10 · Cloud's server is Apache-2.0, and the editor builds without it.** The server, relay,
+administration, and the pages the server serves are Apache-2.0 for its patent grant; the protocol
+in `contract` and `client` stays MIT, so the editor and other clients stay MIT. `REUSE.toml` maps
+the paths rather than a separate package, which would have moved the protocol out of
+`packages/cloud` for no legal gain. `VITE_OPENPENCIL_CLOUD=off` swaps Cloud's two entry points for
+stand-ins, and `check:cloud-off` proves that build bundles none of Cloud.
+
+**2026-10 · History is versions over revisions, compacted on the server.** Every save stays a
+revision so saving and conflicts work as before, but the history lists only server-made checkpoints
+and named versions, and saves between them are compacted after a day. Checkpoints are made when a
+save lands rather than on a timer, so they need no client clock and cover every writer. History stores
+`.fig` revisions rather than Yjs snapshots: snapshots would need garbage collection off in every room
+and a version would still have to become a file to open, restore, or duplicate.
+
+**2026-10 · AI services verify Cloud-signed tokens instead of calling Cloud.** A service checks a
+token against a published key on every model request, with no round-trip to Cloud or its database,
+and the same check serves the official service and self-hosted ones. Entitlements are read when a
+token is signed, so a plan change reaches the service within one token lifetime; asking Cloud on
+every request would have made model calls depend on Cloud's database. Entitlements are pushed to
+Cloud rather than read from billing, so documents keep opening when billing is down.
+
+**2026-10 · On Cloudflare, a Durable Object per document runs the relay.** The relay holds a room's
+Yjs document and its peers in memory, which a stateless Worker can't, and keeping every epoch of a
+document in one object lets a restore or a version change reach all its rooms in one call. Routing
+needs the document before the ticket arrives, so the ticket's relay URL names it. Objects keep their
+sockets without hibernation, so the relay runs unchanged; hibernating would need the relay to
+rebuild rooms and peers on every wake.
+
+**2026-10 · Every Cloud server serves the editor at its root.** The official web editor moves from
+app.openpencil.dev to the official server's own address, so one site holds the editor, sign-in,
+and documents, and a self-hosted server is a complete product too. On its own origin the editor
+signs in through the server's pages and its session, with no device code and no CORS. A welcome
+page meets visitors who are not signed in, and the editor stays usable without an account, as it
+is on app.openpencil.dev, which can then redirect there. Keeping the editor only on a separate
+static host left a signed-in person on account settings with no way to their files.
+
+**2026-10 · Links name their server by their own address.** A document is `/documents/:id`, a
+shared link `/share/:id`, and an invitation `/invitations/:id` on the server that holds them, with
+no `server` parameter and no `/cloud` prefix, and the server has no separate editor address to
+send them to. Peer-to-peer rooms move to `/rooms/:id` so "share" names a shared document. The
+cost is that a browser editor at any other address cannot keep a Cloud document in its address
+bar; every server serves its own editor, and the desktop app gets links through `openpencil://`.
+
+**2026-10 · A link shows nothing until its document does.** A document link asks someone signed
+out to sign in on the server's page before the editor loads, and comes back to the document. A
+link that opens, or a sign-in the tab comes back from, keeps the boot splash's look over the
+window until the document is drawn, over Home rather than an empty document, so a link that
+fails or waits for a sign-in leaves the person on Home. A tab that holds its document never shows
+the room's joining screen, since the room's state can arrive in parts. The cost is a longer
+splash on a slow connection in place of an editor that fills in.
+
+**2026-10 · Workspaces are deleted at once, not after a grace period.** GitLab keeps a deleted group
+for 30 days so it can be restored; a Cloud workspace can only be deleted once it holds no
+documents, and deleted documents already have their own retention, so a delay would protect
+nothing but the name and members. Workspace settings stay in the editor's Members dialog, which
+the desktop app reaches without leaving for a browser.
+
+**2026-10 · Pictures are kept in the database, and Gravatar is not used.** A 256-pixel JPEG is
+a few dozen kilobytes. Object storage only hands out short-lived signed links, so pictures there
+would need upload tracking, a quota exemption, and a redirect for every picture a page shows; in a
+table the server reads the bytes, checks them, and serves them itself. Gravatar would send every
+viewer's address and a hash of each person's email to a third party, which a self-hosted server
+should not do by default; copying a linked Google picture instead of linking to it follows the
+same rule.
+
+**2026-10 · Tables are named for what they hold.** OpenPencil's tables beside Better Auth's had a
+`cloud_` prefix the rest never had; they lose it, and only a name Better Auth already uses gets a
+qualifier (`api_rate_limit` beside its `rate_limit`). Migrations that shipped before the rename
+type their queries against the names they ran with, so their SQL never changes.
+
+**2026-11 · Comments on Cloud documents belong to the server.** Kept in the file, a comment's author
+is a name anyone who can edit may type, deleting one only marks it while its text stays in every
+revision, viewers cannot comment without being able to edit, and the server cannot tell anyone they
+were mentioned. Files written from a Cloud document still carry its comments, so leaving Cloud loses
+none; local files and peer-to-peer rooms keep theirs in the document.

@@ -1,0 +1,38 @@
+<script setup lang="ts">
+import { computed } from 'vue'
+
+import { useMessages } from '@open-pencil/vue/i18n'
+
+import { chatThinkingLevel } from '@/app/ai/chat/thinking'
+import { thinkingLevelLabel, thinkingLevelOptions } from '@/app/ai/models/thinking'
+import ChatThinkingMeter from '@/components/chat/ChatThinkingMeter.vue'
+import AppSelect from '@/components/ui/select/AppSelect.vue'
+
+import { chatProfileTheme, chatThinkingTheme } from './ui'
+
+const ai = useMessages('ai')
+const ui = chatProfileTheme()
+const thinking = chatThinkingTheme()
+const options = computed(() => thinkingLevelOptions(ai.value))
+const selectedLabel = computed(() => thinkingLevelLabel(chatThinkingLevel.value, ai.value))
+</script>
+
+<template>
+  <AppSelect
+    v-model="chatThinkingLevel"
+    :label="`${ai.thinkingLevel}: ${selectedLabel}`"
+    :options="options"
+    data-test-id="chat-thinking-selector"
+  >
+    <template #trigger>
+      <button type="button" :class="ui.trigger({ class: thinking.trigger() })">
+        <ChatThinkingMeter :level="chatThinkingLevel" />
+        <span :class="thinking.label()">{{ selectedLabel }}</span>
+        <icon-lucide-chevron-down :class="ui.triggerChevron()" aria-hidden="true" />
+      </button>
+    </template>
+    <template #option-end="{ option }">
+      <ChatThinkingMeter :level="option.value" :class="thinking.option()" />
+    </template>
+  </AppSelect>
+</template>

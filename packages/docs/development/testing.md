@@ -1,0 +1,130 @@
+# Testing
+
+## Ownership and location
+
+Place a test with the source that owns its contract. Choose the runtime separately: using a browser does not automatically make a test application E2E, and importing several packages does not automatically make it cross-package integration.
+
+| Contract                                | Canonical location                                             |
+| --------------------------------------- | -------------------------------------------------------------- |
+| Package unit and in-process integration | `packages/<owner>/tests/<source-relative-domain>/**/*.test.ts` |
+| App services and state                  | `tests/app/<path-relative-to-src/app>/**/*.test.ts`            |
+| Cross-package/system integration        | `tests/integration/<contract>/`                                |
+| Application workflows and visuals       | `tests/e2e/<workflow>/**/*.spec.ts`                            |
+| Native WebView and shell delivery       | `tests/e2e/native/**/*.spec.ts`                                |
+| Figma compatibility acceptance          | `tests/figma/**/*.spec.ts`                                     |
+| Private tool contracts                  | `tools/<owner>/tests/`                                         |
+
+For example, `packages/core/src/canvas/text/shape.ts` maps to `packages/core/tests/canvas/text/shape.test.ts`; `src/app/demo/viewport.ts` maps to `tests/app/demo/viewport.test.ts`. A substantial module may have a matching test directory rather than one large test file. Application E2E, external-system acceptance and large contract suites are intentional exceptions to file-for-file mirroring.
+
+Core tests using SceneGraph still belong to Core. Central integration is for contracts without a single owning implementation, such as interoperability between published packages. Name that contract explicitly; do not use integration as a miscellaneous bucket.
+
+Discovery follows the table: `tools/dev/unit-tests/src/shards.ts` groups the canonical homes by owner, and a file belongs to the group with the longest path that contains it, so `render` runs `packages/core/tests/canvas` in its own shard. Only a new owner or a new top-level home needs a shard entry. The shard map's own test fails on any `*.test.ts` under `tests/` or `packages/*/tests` that no group owns, so a test placed outside a canonical home cannot hide from the runner.
+
+Helpers shared by more than one owner's tests live in the private `@open-pencil/test-support` package (`packages/test-support`): assertions, repository paths, fetch doubles, scene and geometry builders, `.fig` fixtures and traversal, bundled fonts. Import them by package name; never keep a second copy of a helper in another owner's `tests/helpers`. Helpers only one owner uses stay in that owner's `tests/helpers` (`#core-tests/*`, `#fig-tests/*`, `#cli-tests/*`), and helpers for app and E2E specs stay under `tests/helpers`. `bun run test:dupes:helpers` runs jscpd over all of these helpers and fails on a copied block.
+
+`test:unit:quick` runs files in Bun worker processes (`--parallel`), which is the fastest local loop. CI shards still run each group in one process; `test:unit:isolated` (`--isolate`, also run nightly) gives every file a fresh global object and is the check to run when a suite passes alone but fails in a shard. Shards share one Bun process, so module-level state (a `fake-indexeddb/auto` import, an IndexedDB connection left open by `createEditorStore()`, a patched global) leaks into later files in the same shard. A package-local run (`bun test tests` inside the package) is a fresh process and will not reproduce that leak. Close what a test opens and restore what it patches.
+
+Run `bun --filter @open-pencil/core build` before unit tests. Files under `tests/` and under `packages/core/tests` resolve `@open-pencil/core` and its subpaths to `packages/core/src` through the root and Core tsconfig path mappings, but other package sources (`packages/dom-css/src`, `packages/mcp/src`, …) use their own tsconfig, where `@open-pencil/core/<subpath>` falls back to the package `exports` and therefore to `dist`. One process can hold both copies; only `packages/vue` maps Core to `src`. Aligning the other package tsconfigs is a packaging change (it affects `tsdown` declaration output), not a test change.
+
+## Test purpose
+
+- Unit tests cover isolated rules and state transitions.
+- Package integration tests exercise real collaborators owned by that package.
+- Browser integration tests cover browser CSS, WebGL, fonts and DOM behavior where that runtime matters. They need not launch the whole app if the contract can be exercised independently.
+- E2E tests exercise application workflows, accessibility and representative visual integration.
+- Native tests answer whether the real WebView or shell delivers an interaction. A CPU CanvasKit test is not native desktop acceptance; synthetic composition is not real IME acceptance.
+- Benchmarks belong to performance tooling and opt-in runs, not ordinary correctness E2E. Bounded assertions about redundant work may accompany a real interaction, but exhaustive cache policy belongs with the owning implementation.
+
+Test observable behavior and contracts, not source text. A test claiming a UI update must observe the UI, not merely read a Set after calling an editor action.
+
+## Fixtures, builders, drivers and probes
+
+These responsibilities are distinct:
+
+| Kind           | Responsibility                                                               |
+| -------------- | ---------------------------------------------------------------------------- |
+| Runner fixture | Acquire a context/editor/resource and guarantee teardown.                    |
+| Data builder   | Construct deterministic plain inputs; no browser, assertions or hidden I/O.  |
+| UI driver      | Perform named user interactions through roles, labels and semantic controls. |
+| Probe          | Read a bounded typed observation, or install scoped instrumentation.         |
+| Asset fixture  | Immutable document, font, image or reference data.                           |
+| Snapshot       | Expected visual output colocated with its spec.                              |
+
+Owner-specific builders and support belong under that owner's `tests/helpers/<domain>/`; owner-specific assets belong under `tests/fixtures/` within the owning package. Central `tests/helpers/<domain>/` and `tests/fixtures/<format-or-domain>/` are reserved for genuine shared consumers, runner adapters and large shared corpora. Keep existing LFS assets in place until all consumers are mapped; binary moves are not a prerequisite for clarity. Record font licenses and fixture provenance beside the assets.
+
+Do not import another package's test internals or import test support from production. Share production contracts through public exports. Promote test support only when multiple owners actually need it. Avoid catch-all `utils`, `store` and `test-utils` collections with mixed runtime dependencies. Keep temporary diagnostics and profiling specs in ignored scratch space; extract a small durable regression when an investigation finds a bug.
+
+Prefer test-runner-owned fixtures, such as Playwright `test.extend`, over implicit shared pages. Serial mode is for an intentionally dependent scenario, not a side effect of importing a helper. A failed screenshot must not silently prevent unrelated contracts from executing. A fixture's housekeeping should not be counted as separate native acceptance.
+
+## Browser and native boundaries
+
+Specs should read as fixture setup, user action, observation and assertion. Do not scatter `window.openPencil`, store/renderer traversal, internal module URLs or resource-timing module discovery through specs.
+
+Keep unavoidable transport access in a small guarded adapter with named domain operations. Separate:
+
+1. Explicit fixture setup mutations.
+2. User interactions through the UI.
+3. Read-only serializable observations.
+4. Scoped instrumentation with restoration and disposal in `finally`.
+
+Do not replace global digging with a generic `evaluateEditor(callback)` escape hatch or a giant driver exposing the mutable store. Use public named types and precise result projections; do not maintain inconsistent handcrafted copies of node shapes. A UI test must not call the editor action instead of performing the interaction it claims to test. A renderer test may deliberately use a bounded renderer probe because rendering is its subject.
+
+Existing global-based helpers are migration debt, not the preferred API. Migrate a complete domain slice rather than adding forwarding-only wrappers. Test-only browser entrypoints must stay out of production artifacts. Do not enlarge production Window declarations for fixtures or counters. Native adapters retain guarded vendor-typed invocation and the test-only Cargo feature; browser and native drivers need not share an implementation or pretend they support the same capabilities.
+
+## Execution and iteration
+
+Current commands:
+
+| Suite                          | Command                      |
+| ------------------------------ | ---------------------------- |
+| Engine/unit                    | `bun run test:unit`          |
+| Quick unit, parallel           | `bun run test:unit:quick`    |
+| Quick unit, per-file isolation | `bun run test:unit:isolated` |
+| App browser E2E                | `bun run test`               |
+| Storybook browser              | `bun run test:storybook`     |
+| Figma acceptance               | `bun run test:figma`         |
+| Native WebView                 | `bun run test:native`        |
+| Load every browser spec        | `bun run check:specs`        |
+
+During implementation, run the affected unit files or one representative browser scenario. Inspect discovery changes without executing the whole suite when reorganizing files; `bun run check:specs` lists every spec and fails when one cannot load, such as on an import only a bundler reads. Use the final CI gate after integration; do not rerun full suites for each edit. Report commands actually run, and distinguish focused coverage from full acceptance.
+
+Visual changes require inspection and committed coverage. Update only a justified affected snapshot, then rerun that test without update mode. Never relax tolerances or regenerate unrelated baselines to turn a failed run green. Browser GPU parity and real glyph coverage complement CPU rendering tests; they are not redundant merely because both compare pixels.
+
+### When a run disagrees with the code
+
+These environment faults look exactly like a code regression, and each has cost real debugging time.
+
+Browser suites resolve `@open-pencil/*` through each package's built `dist`, which Vite then pre-bundles. Rebuilding a package does not invalidate that cache, so a Playwright run can execute code from before your change — including throwing on a field you just added. If a browser run contradicts the source you are reading, delete `node_modules/.vite` and run again before believing it.
+
+Heavy tests, the ones that parse the large fixtures or a populated `gold-preview.fig` more than once, run only with `BUN_HEAVY_TESTS=true`. The unit test runner sets it and gives each heavy file its own Bun process, because one such graph takes gigabytes and a process keeps every graph a test module holds until it exits: a bare `bun test` over `packages/core/tests/io/formats/fig` with heavy tests enabled has reached 37 GB. A bare `bun test` and `test:unit:quick` therefore skip them; `bun run test:unit` runs them, and `bun run test:unit:heavy` or `bun tools/dev/unit-tests/src/run.ts <group> --heavy-only` runs the heavy files alone.
+
+Heavier `.fig` suites are sensitive to machine load. A full run alongside other work has reported failures that vanish on a quiet re-run, with the same suite taking three times as long. Re-run a failing heavy test alone before concluding anything, and compare against the same test on `master` under the same load rather than against a remembered baseline. Raising its timeout is still never the fix.
+
+A unit group's quick files share one Bun process, and they run in directory-listing order, which differs between CI runs. A test can therefore fail in one run and pass in the next on the same commit, because an earlier file left global state behind. To reproduce it, take the `##[group]<file>:` lines from the failing job's log up to the failing file and run `BUN_HEAVY_TESTS=false bun test <those files, in that order>` from the repository root; then halve the list until the smallest set that still fails is left. When a replay never fails, look at process-wide state instead: font providers attached to the shared font manager, a registered font that makes a `.fig` export shape text, or an installed text measurer. A test that attaches a font provider goes through `attachFontProvider` in `packages/core/tests/canvas/helpers.ts`, which detaches it when the test finishes.
+
+A spec that loads app modules from the page with `import('/src/…')` gets a second module instance once Vite has reloaded those modules, or once the server's branch changed under it: the store it reads is then empty, or the app fails to boot with a duplicate declaration. Restart the server rather than debug the spec.
+
+A few local results need a second look before they count:
+
+- `bun run format:check` compares `git status` before and after formatting, so any uncommitted or untracked file fails it. Run it on a clean tree.
+- The root `bun run typecheck` does not reach packages with their own `tsconfig.json`; after moving or renaming exports, also run `bun run typecheck` in each package you touched.
+- WebKit, Safari included, can fail to load the app through a `dev:portless` URL with "Importing a module script failed", because the proxy answers some of its parallel module requests with 502. Load the direct Vite URL to check WebKit.
+
+## Server ownership and worktrees
+
+The canonical `playwright.config.ts` owns app, Figma and Storybook projects. The `test`, `test:update`, `test:real-llm` and `test:figma` scripts select only the app server; `test:storybook` selects Storybook on port `6017`. Direct Playwright commands start both servers by default. Set `OPENPENCIL_TEST_SERVER=app`, `storybook` or `all`; `--project` selects tests, not servers.
+
+App tests start Vite from the current checkout and wait for its HTTP URL. Vite owns its MCP companion. Reuse is off by default and always off in CI. Default ports are app `1420` and MCP `7600`; concurrent worktrees need distinct free pairs:
+
+```sh
+OPENPENCIL_TEST_SERVER=app OPENPENCIL_TEST_PORT=1482 OPENPENCIL_TEST_MCP_PORT=7682 \
+  bunx playwright test tests/e2e/properties/effects/panel.spec.ts --project=openpencil
+```
+
+Use the configured base URL and same-origin paths, never hard-coded ports in specs or adapters. For intentional debugging against a verified matching server, set `OPENPENCIL_TEST_REUSE_SERVER=1`. HTTP readiness alone does not prove checkout identity, so do not reuse servers for baseline comparisons. Portless remains the preferred interactive preview workflow, separate from managed fixed-port tests.
+
+## External-system acceptance
+
+Storybook uses its own viewport, device scale and reduced-motion context. Its specs are excluded from app projects. Figma acceptance requires the desktop app's configured CDP connection.
+
+Native tests use an explicit test-only binary, separate application identity and test-owned credentials/profile. Never run acceptance against production secrets or clear user recovery data. Skip unsupported platforms rather than claim coverage. Ordinary WebDriver text input, trusted clipboard events, real IME and persistence across restarts are separate contracts.

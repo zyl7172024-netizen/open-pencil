@@ -1,0 +1,407 @@
+import { randomUUID } from 'node:crypto'
+
+import * as v from 'valibot'
+import type { WebSocket } from 'ws'
+
+import { errorMessage, toError } from '@open-pencil/std/errors'
+
+import type { MCPAccess } from '#mcp/auth'
+import type { RPCJSONObject } from '#mcp/json'
+import type { PendingRequest } from '#mcp/rpc-types'
+import { scopeRPC, type MCPToolScope } from '#mcp/tool/scope'
+import { APP_RPC_DEADLINE_MS, APP_WAIT_DEADLINE_MS } from '#mcp/transport/deadlines'
+
+const RPC_TIMEOUT = APP_RPC_DEADLINE_MS
+const APP_WAIT_TIMEOUT = APP_WAIT_DEADLINE_MS
+
+const APP_NOT_CONNECTED_MESSAGE =
+  'OpenPencil app is not connected. STOP and tell the user: "The OpenPencil desktop app is not running, no document is open, or the desktop app is connected to a different MCP server. Please start OpenPencil, open a document, and try again." Do NOT attempt to start the app yourself or retry automatically.'
+
+type BrowserRPCBridgeOptions = {
+  /** Who may register as the app (`app`) and send it requests over the socket (`rpc`). */
+  access: MCPAccess
+  /** What callers can reach in the app; see `MCPToolScope`. Defaults to the whole document. */
+  scope?: MCPToolScope
+  onConnectionChange: () => void
+  /** How long an RPC waits for the app to register before failing with APP_NOT_CONNECTED. Defaults to 10 s. */
+  appWaitTimeoutMs?: number
+  /**
+   * How long an RPC waits for the app's answer. On timeout the app is told to cancel the call, so
+   * a call still waiting for its turn never runs. Defaults to 20 s.
+   */
+  rpcTimeoutMs?: number
+}
+
+type ConnectionListener = (connected: boolean) => void
+
+/** Any JSON object; the per-type schemas below run only once its `type` is known. */
+const browserEnvelopeSchema = v.pipe(
+  v.string(),
+  v.parseJson(),
+  v.custom<Record<string, unknown>>(
+    (value) => typeof value === 'object' && value !== null && !Array.isArray(value)
+  )
+)
+
+const handshakeMessageSchema = v.looseObject({ token: v.optional(v.nullable(v.string())) })
+
+const requestMessageSchema = v.looseObject({
+  type: v.literal('request'),
+  id: v.pipe(v.string(), v.nonEmpty())
+})
+
+const responseMessageSchema = v.looseObject({
+  type: v.literal('response'),
+  id: v.pipe(v.string(), v.nonEmpty()),
+  ok: v.optional(v.boolean()),
+  error: v.optional(v.string())
+})
+
+type BrowserMessage =
+  | v.InferOutput<typeof requestMessageSchema>
+  | v.InferOutput<typeof responseMessageSchema>
+
+function stripEnvelope(msg: BrowserMessage): Record<string, unknown> {
+  const { type: _type, id: _id, ...body } = msg
+  return body
+}
+
+function responsePayload(result: unknown): RPCJSONObject {
+  if (result && typeof result === 'object' && !Array.isArray(result)) {
+    return result as RPCJSONObject
+  }
+  return { result }
+}
+
+function sendJSON(ws: WebSocket, body: Record<string, unknown>) {
+  if (ws.readyState === ws.OPEN) ws.send(JSON.stringify(body))
+}
+
+function createSettler<T>(resolve: (value: T) => void, reject: (error: Error) => void) {
+  let settled = false
+  return {
+    resolve: (value: T) => {
+      if (settled) return
+      settled = true
+      resolve(value)
+    },
+    reject: (error: Error) => {
+      if (settled) return
+      settled = true
+      reject(error)
+    },
+    isSettled: () => settled
+  }
+}
+
+export function createBrowserRPCBridge({
+  access,
+  scope = 'document',
+  onConnectionChange,
+  appWaitTimeoutMs = APP_WAIT_TIMEOUT,
+  rpcTimeoutMs = RPC_TIMEOUT
+}: BrowserRPCBridgeOptions) {
+  const pending = new Map<string, PendingRequest>()
+  const clients = new Set<WebSocket>()
+  const connectionWaiters = new Set<PendingRequest>()
+  // Track which WebSocket clients have authenticated via a valid
+  // register message. Unauthenticated clients can only send register;
+  // all other message types (request, response) are rejected.
+  const authenticatedClients = new Set<WebSocket>()
+  const connectionListeners = new Set<ConnectionListener>()
+  let browserWs: WebSocket | null = null
+  let browserRegistered = false
+  let bridgeClosed = false
+
+  function isConnected(): boolean {
+    return Boolean(browserWs && browserRegistered)
+  }
+
+  function notifyConnectionChange() {
+    onConnectionChange()
+    const connected = isConnected()
+    for (const listener of connectionListeners) listener(connected)
+  }
+
+  function subscribeConnectionChange(listener: ConnectionListener): () => void {
+    connectionListeners.add(listener)
+    listener(isConnected())
+    return () => connectionListeners.delete(listener)
+  }
+
+  function notifyConnectionWaiters() {
+    for (const waiter of connectionWaiters) {
+      clearTimeout(waiter.timer)
+      waiter.resolve(undefined)
+    }
+    connectionWaiters.clear()
+  }
+
+  function rejectConnectionWaiters(reason: string) {
+    for (const waiter of connectionWaiters) {
+      clearTimeout(waiter.timer)
+      waiter.reject(new Error(reason))
+    }
+    connectionWaiters.clear()
+  }
+
+  function waitForConnection(): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      let waiter: PendingRequest | null = null
+
+      const timer = setTimeout(() => {
+        if (waiter) connectionWaiters.delete(waiter)
+        reject(new Error(APP_NOT_CONNECTED_MESSAGE))
+      }, appWaitTimeoutMs)
+
+      waiter = {
+        resolve: () => {
+          clearTimeout(timer)
+          resolve()
+        },
+        reject: (error: Error) => {
+          clearTimeout(timer)
+          reject(error)
+        },
+        timer
+      }
+      // Add the waiter BEFORE checking browser state to avoid a lost-wakeup
+      // race: if the browser registers between sendRPC's initial check and
+      // this point, notifyConnectionWaiters() will have already fired and
+      // cleared the set. Without this re-check, the waiter would stall for
+      // appWaitTimeoutMs even though the browser is connected.
+      connectionWaiters.add(waiter)
+      if (browserWs && browserWs.readyState === browserWs.OPEN && browserRegistered) {
+        waiter.resolve(undefined)
+        connectionWaiters.delete(waiter)
+      }
+    })
+  }
+
+  function rejectAllPending(reason: string) {
+    for (const [, req] of pending) {
+      clearTimeout(req.timer)
+      req.reject(new Error(reason))
+    }
+    pending.clear()
+  }
+
+  function sendRegisterPrompt(ws: WebSocket) {
+    // Send a prompt inviting the client to register as the browser.
+    // IMPORTANT: Do NOT include the auth token here. On TCP, any local
+    // process can connect via WebSocket — sending the secret token would
+    // leak credentials to unauthenticated clients. The legitimate browser
+    // app already knows the token (from the discovery file or Vite env)
+    // and sends it proactively in its ws.onopen handler. The token field
+    // is set to null to signal that auth is required without revealing
+    // the secret. When auth is disabled, null is
+    // still correct — it means "no token needed."
+    sendJSON(ws, { type: 'register', token: null })
+  }
+
+  function broadcastRegisterPrompt() {
+    for (const client of clients) sendRegisterPrompt(client)
+  }
+
+  /** Writes a request to the app as given. Nothing outside the bridge calls it: see `sendRPC`. */
+  function sendUnscopedRPC(body: Record<string, unknown>): Promise<unknown> {
+    if (bridgeClosed) return Promise.reject(new Error('Server shutting down'))
+    return new Promise((resolve, reject) => {
+      const doSend = () => {
+        const ws = browserWs
+        if (!ws || ws.readyState !== ws.OPEN || !browserRegistered) {
+          reject(new Error(APP_NOT_CONNECTED_MESSAGE))
+          return
+        }
+        const id = randomUUID()
+        const settle = createSettler(resolve, reject)
+        const timer = setTimeout(() => {
+          pending.delete(id)
+          // The caller has its answer; the app stops the call rather than finish it unseen.
+          sendJSON(ws, { type: 'cancel', id })
+          settle.reject(new Error(`RPC timeout (${Math.round(rpcTimeoutMs / 1000)}s)`))
+        }, rpcTimeoutMs)
+        pending.set(id, { resolve: settle.resolve, reject: settle.reject, timer })
+        try {
+          ws.send(JSON.stringify({ ...body, type: 'request', id }))
+        } catch (e) {
+          clearTimeout(timer)
+          pending.delete(id)
+          if (!settle.isSettled()) {
+            settle.reject(toError(e))
+          }
+        }
+      }
+
+      if (browserWs && browserWs.readyState === browserWs.OPEN && browserRegistered) {
+        doSend()
+      } else {
+        void waitForConnection().then(doSend).catch(reject)
+      }
+    })
+  }
+
+  /**
+   * Sends a request to the app within the scope. This is the only way in: MCP sessions, `/rpc`,
+   * and requests an authenticated socket sends all pass through it, so none reaches further.
+   */
+  const sendRPC = scopeRPC(sendUnscopedRPC, scope)
+
+  async function handleClientRequest(
+    ws: WebSocket,
+    msg: v.InferOutput<typeof requestMessageSchema>
+  ) {
+    try {
+      const result = await sendRPC(stripEnvelope(msg))
+      // A call the scope refuses comes back as a result that says so, and keeps saying so here.
+      sendJSON(ws, { ok: true, ...responsePayload(result), type: 'response', id: msg.id })
+    } catch (e) {
+      sendJSON(ws, {
+        type: 'response',
+        id: msg.id,
+        ok: false,
+        error: errorMessage(e)
+      })
+    }
+  }
+
+  function registerBrowser(ws: WebSocket, token: string | null) {
+    if (bridgeClosed) return
+    if (!access.scopes(token).includes('app')) {
+      ws.close()
+      return
+    }
+    // Mark this client as authenticated — it can now send requests.
+    authenticatedClients.add(ws)
+    const previousBrowserWs = browserWs
+    browserWs = ws
+    browserRegistered = true
+    if (previousBrowserWs && previousBrowserWs !== ws) {
+      // Reject in-flight requests to the old browser. Without this, pending
+      // requests sit in the pending map until the RPC timeout (20s), because
+      // handleClose for the old socket returns early (browserWs is already
+      // set to the new socket, so browserWs !== previousBrowserWs).
+      rejectAllPending('Browser reconnected')
+      if (previousBrowserWs.readyState === ws.OPEN) {
+        previousBrowserWs.close()
+      }
+    }
+    notifyConnectionWaiters()
+    notifyConnectionChange()
+    broadcastRegisterPrompt()
+  }
+
+  function handleBrowserResponse(msg: v.InferOutput<typeof responseMessageSchema>, ws: WebSocket) {
+    if (!browserRegistered || browserWs !== ws) return
+    const req = pending.get(msg.id)
+    if (!req) return
+    pending.delete(msg.id)
+    clearTimeout(req.timer)
+    if (msg.ok === false) {
+      req.reject(new Error(msg.error ?? 'RPC failed'))
+    } else {
+      req.resolve(stripEnvelope(msg))
+    }
+  }
+
+  function handleMessage(data: string, ws: WebSocket) {
+    if (bridgeClosed) return
+    const envelope = v.safeParse(browserEnvelopeSchema, data)
+    if (!envelope.success) {
+      if (envelope.issues.some((issue) => issue.type === 'parse_json')) {
+        console.warn('Malformed automation message:', v.summarize(envelope.issues))
+      } else {
+        ws.close()
+      }
+      return
+    }
+    const msg = envelope.output
+
+    if (msg.type === 'auth' || msg.type === 'register') {
+      // `auth` authenticates a stdio bridge client without registering it as
+      // the browser app, so it can send request/response messages without
+      // becoming the RPC target, so it needs the `rpc` scope where
+      // registering needs `app`. When auth is disabled, any token is accepted. A message without a token is ignored; a token of
+      // any other type closes the socket.
+      const handshake = v.safeParse(handshakeMessageSchema, msg)
+      if (!handshake.success) {
+        ws.close()
+        return
+      }
+      const { token } = handshake.output
+      if (token === undefined) return
+      if (msg.type === 'register') {
+        registerBrowser(ws, token)
+      } else if (access.scopes(token).includes('rpc')) {
+        authenticatedClients.add(ws)
+      } else {
+        ws.close()
+      }
+      return
+    }
+    // All non-register messages require authentication. Without this
+    // check, an unauthenticated WebSocket client (that hasn't sent a
+    // valid register message) could bypass the HTTP auth on /rpc by
+    // sending request messages over the WebSocket directly.
+    if (!authenticatedClients.has(ws)) {
+      ws.close()
+      return
+    }
+    const request = v.safeParse(requestMessageSchema, msg)
+    if (request.success) {
+      void handleClientRequest(ws, request.output)
+      return
+    }
+    const response = v.safeParse(responseMessageSchema, msg)
+    if (response.success) handleBrowserResponse(response.output, ws)
+  }
+
+  function handleClose(ws: WebSocket) {
+    clients.delete(ws)
+    authenticatedClients.delete(ws)
+    if (browserWs !== ws) return
+    browserWs = null
+    browserRegistered = false
+    rejectAllPending('Browser disconnected')
+    // Intentionally NOT rejecting connectionWaiters here. If a request
+    // entered waitForConnection() before the close event (e.g. during a
+    // CLOSING→CLOSED transition), the waiter should keep waiting the full
+    // APP_WAIT_TIMEOUT for a reconnect. registerBrowser will resolve it
+    // via notifyConnectionWaiters if the browser reconnects in time.
+    notifyConnectionChange()
+  }
+
+  function handleConnection(ws: WebSocket) {
+    if (bridgeClosed) return
+    clients.add(ws)
+    // Transport security restricts WHO can connect: Unix socket with
+    // 0o600 permissions (same-user only) or TCP localhost (any local
+    // process). The authenticatedClients set gates WHAT connected clients
+    // can do: only those that sent a valid register message may forward
+    // requests. The register prompt does NOT include the auth token —
+    // the browser app sends the token proactively (from the discovery
+    // file or Vite env).
+    sendRegisterPrompt(ws)
+  }
+
+  function close() {
+    bridgeClosed = true
+    rejectAllPending('Server shutting down')
+    rejectConnectionWaiters('Server shutting down')
+    browserWs = null
+    browserRegistered = false
+    clients.clear()
+    authenticatedClients.clear()
+    connectionListeners.clear()
+  }
+
+  return {
+    close,
+    isConnected,
+    subscribeConnectionChange,
+    sendRPC,
+    handleConnection,
+    handleMessage,
+    handleClose
+  }
+}

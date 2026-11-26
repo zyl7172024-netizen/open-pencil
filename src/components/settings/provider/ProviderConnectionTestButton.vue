@@ -1,0 +1,98 @@
+<script setup lang="ts">
+import { tv } from 'tailwind-variants'
+import { computed } from 'vue'
+
+import { useMessages } from '@open-pencil/vue/i18n'
+
+import type { ProviderConnectionTestFailureReason } from '@/app/ai/models/connection-test'
+import AppButton from '@/components/ui/button/AppButton.vue'
+import statusTheme from '@/theme/feedback/status'
+
+interface ProviderConnectionTestButtonProps {
+  status: 'idle' | 'testing' | 'success' | 'error'
+  reason?: ProviderConnectionTestFailureReason | null
+  /** The result in place of the model messages, for services that are not models. */
+  message?: string
+  disabled?: boolean
+}
+
+const {
+  status,
+  reason,
+  message,
+  disabled = false
+} = defineProps<ProviderConnectionTestButtonProps>()
+const emit = defineEmits<{ test: [] }>()
+const ai = useMessages('ai')
+const common = useMessages('common')
+
+const resultMessage = computed(() => {
+  if (status !== 'success' && status !== 'error') return null
+  if (message) return message
+  if (status === 'success') return ai.value.connectionTestSuccess
+
+  switch (reason) {
+    case 'missing-api-key':
+      return ai.value.connectionTestMissingAPIKey
+    case 'missing-sign-in':
+      return ai.value.connectionTestMissingSignIn
+    case 'missing-base-url':
+      return ai.value.connectionTestMissingBaseURL
+    case 'missing-model':
+      return ai.value.connectionTestMissingModel
+    case 'invalid-base-url':
+      return ai.value.connectionTestInvalidBaseURL
+    case 'auth':
+      return ai.value.connectionTestAuthFailed
+    case 'sign-in-expired':
+      return ai.value.connectionTestSignInExpired
+    case 'plan-forbidden':
+      return ai.value.connectionTestPlanForbidden
+    case 'insufficient-credit':
+      return ai.value.connectionTestInsufficientCredit
+    case 'model-not-found':
+      return ai.value.connectionTestModelNotFound
+    case 'api-type':
+      return ai.value.connectionTestAPITypeMismatch
+    case 'browser-network':
+      return ai.value.connectionTestBrowserNetworkFailed
+    case 'network':
+      return ai.value.connectionTestNetworkFailed
+    case 'cloud-unavailable':
+      return ai.value.cloudAIUnavailable
+    case 'cloud-credits-exhausted':
+      return ai.value.connectionTestCloudCreditsExhausted
+    default:
+      return ai.value.connectionTestUnknownFailed
+  }
+})
+
+const isTesting = computed(() => status === 'testing')
+const resultTone = computed(() => (status === 'success' ? 'success' : 'error'))
+const statusStyles = computed(() => tv(statusTheme)({ tone: resultTone.value }))
+</script>
+
+<template>
+  <div class="flex flex-col gap-1">
+    <AppButton
+      class="self-start"
+      variant="outline"
+      data-test-id="provider-test-connection"
+      :loading="isTesting"
+      :disabled="disabled"
+      @click="emit('test')"
+    >
+      <template #leading><icon-lucide-plug-zap class="size-3" /></template>
+      {{ isTesting ? common.testingConnection : common.testConnection }}
+    </AppButton>
+
+    <p
+      v-if="resultMessage"
+      :data-tone="resultTone"
+      :class="statusStyles.text()"
+      data-test-id="provider-test-connection-result"
+    >
+      {{ resultMessage }}
+    </p>
+  </div>
+</template>

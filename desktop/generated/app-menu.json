@@ -1,0 +1,16 @@
+{
+  "about": {
+    "label": "About OpenPencil"
+  },
+  "check-updates": {
+    "label": "Check for Updates…"
+  },
+  "settings": {
+    "label": "Settings…",
+    "accelerator": "CmdOrCtrl+,"
+  },
+  "quit": {
+    "label": "Quit OpenPencil",
+    "accelerator": "CmdOrCtrl+Q"
+  }
+}

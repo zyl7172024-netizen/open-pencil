@@ -1,0 +1,21 @@
+{
+  "name": "@open-pencil/package-quality-tools",
+  "private": true,
+  "type": "module",
+  "imports": {
+    "#package-quality/*": "./src/*.ts"
+  },
+  "exports": {
+    "./consumer": "./src/smoke/consumer.ts"
+  },
+  "scripts": {
+    "test": "bun test tests"
+  },
+  "dependencies": {
+    "@open-pencil/package-artifacts-tools": "workspace:*",
+    "@open-pencil/std": "workspace:*",
+    "citty": "^0.2.2",
+    "es-toolkit": "^1.52.0",
+    "typescript": "npm:@typescript/typescript6@^6.0.2"
+  }
+}

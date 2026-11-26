@@ -1,0 +1,9 @@
+@import 'tailwindcss/theme' layer(theme);
+/* Unlayered, so utilities on app components win over VitePress's unlayered element resets. */
+@import 'tailwindcss/utilities';
+@import 'tw-animate-css';
+@import '../../../theme/src/tokens.css';
+
+@source '../../../vue/src/primitives/**/*.vue';
+@source '../../../../src';
+@source './landing';

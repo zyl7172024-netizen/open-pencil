@@ -1,0 +1,328 @@
+import { beforeAll, describe, expect, test } from 'bun:test'
+
+import { parseFigBuffer, readStreamBytes, writeFigArchive, writeFigContainer } from '#fig/index'
+import {
+  figArchiveRecordInfo,
+  figComponentUsePages,
+  figRecordPages,
+  patchFigArchive,
+  patchFigMessage,
+  patchFigRecords
+} from '#fig/record-patch/index'
+import { deflateSync } from 'fflate'
+
+import {
+  createNodeChangesMessage,
+  encodeMessage,
+  getCompiledSchema,
+  getSchemaBytes,
+  initCodec,
+  type NodeChange
+} from '@open-pencil/kiwi/fig/codec'
+import { guid } from '@open-pencil/test-support/fig/guid'
+
+const record = (localID: number, parent: number | null, extra: Partial<NodeChange> = {}) =>
+  ({
+    guid: guid(localID),
+    ...(parent === null ? {} : { parentIndex: { guid: guid(parent), position: `${localID}` } }),
+    type: 'FRAME',
+    ...extra
+  }) as NodeChange
+
+const ids = (records: readonly NodeChange[]) => records.map((change) => change.guid?.localID)
+
+describe('patching archive records', () => {
+  const archive = [
+    record(0, null, { type: 'DOCUMENT' }),
+    record(1, 0, { type: 'CANVAS' }),
+    record(2, 1),
+    record(3, 2),
+    record(4, 2),
+    record(5, 1)
+  ]
+
+  test('keeps untouched records and writes a changed one in its place', () => {
+    const renamed = record(3, 2, { name: 'Renamed' })
+    const result = patchFigRecords(archive, {
+      records: [renamed],
+      removed: [],
+      replaceVariables: false
+    })
+    expect(ids(result)).toEqual([0, 1, 2, 3, 4, 5])
+    expect(result[3]).toBe(renamed)
+    expect(result[4]).toBe(archive[4])
+  })
+
+  test('merges the fields an edit changed into a record, keeping the rest of it', () => {
+    const saved = record(3, 2, { name: 'Saved', opacity: 0.5, editInfo: { userId: 'a' } })
+    const result = patchFigRecords([...archive.slice(0, 3), saved, ...archive.slice(4)], {
+      records: [],
+      fields: [{ guid: guid(3), set: { name: 'Renamed' }, unset: ['opacity'] }],
+      removed: [],
+      replaceVariables: false
+    })
+    expect(ids(result)).toEqual([0, 1, 2, 3, 4, 5])
+    expect(result[3]).toEqual(record(3, 2, { name: 'Renamed', editInfo: { userId: 'a' } }))
+  })
+
+  test('keeps a record whose patched fields move it out of a removed parent', () => {
+    const result = patchFigRecords(archive, {
+      records: [],
+      fields: [
+        { guid: guid(4), set: { parentIndex: { guid: guid(1), position: '9' } }, unset: [] },
+        { guid: guid(3), set: { name: 'Stays below' }, unset: [] }
+      ],
+      removed: [guid(2)],
+      replaceVariables: false
+    })
+    expect(ids(result)).toEqual([0, 1, 4, 5])
+  })
+
+  test('removes a record with those below it, but not one the patch moved out', () => {
+    const moved = record(4, 1)
+    const result = patchFigRecords(archive, {
+      records: [moved],
+      removed: [guid(2)],
+      replaceVariables: false
+    })
+    expect(ids(result)).toEqual([0, 1, 4, 5])
+  })
+
+  test('writes a record moved into a new layer after that layer', () => {
+    const added = record(9, 1)
+    const moved = record(5, 9)
+    const result = patchFigRecords(archive, {
+      records: [moved, added],
+      removed: [],
+      replaceVariables: false
+    })
+    expect(ids(result)).toEqual([0, 1, 2, 3, 4, 9, 5])
+  })
+
+  test('replaces variables, keeping the places of those that remain', () => {
+    const variables = [
+      record(6, 1, { type: 'VARIABLE_SET' }),
+      record(7, 6, { type: 'VARIABLE' }),
+      record(8, 6, { type: 'VARIABLE' })
+    ]
+    const result = patchFigRecords([...archive, ...variables], {
+      records: [
+        record(7, 6, { type: 'VARIABLE', name: 'Kept' }),
+        record(9, 6, { type: 'VARIABLE' })
+      ],
+      removed: [],
+      replaceVariables: true
+    })
+    expect(ids(result)).toEqual([0, 1, 2, 3, 4, 5, 7, 9])
+    expect(result.find((change) => change.guid?.localID === 7)?.parentIndex?.position).toBe('7')
+    const added = result.find((change) => change.guid?.localID === 9)?.parentIndex?.position ?? ''
+    expect(added > '7').toBe(true)
+  })
+})
+
+describe('pages using components', () => {
+  test('follows instances through the components that nest them', () => {
+    const records = [
+      record(1, 0, { type: 'CANVAS' }),
+      record(2, 0, { type: 'CANVAS' }),
+      record(3, 0, { type: 'CANVAS' }),
+      record(10, 1, { type: 'SYMBOL' }),
+      record(11, 1, { type: 'SYMBOL' }),
+      record(12, 11, { type: 'INSTANCE', symbolData: { symbolID: guid(10) } }),
+      record(13, 2, { type: 'INSTANCE', symbolData: { symbolID: guid(11) } }),
+      record(14, 3, { type: 'FRAME' })
+    ]
+    expect(figComponentUsePages(records, ['1:10']).toSorted()).toEqual(['1:1', '1:2'])
+  })
+})
+
+describe('the page a record is on', () => {
+  test('is the page above it, through its parents, whether that page is loaded or not', () => {
+    const records = [
+      record(0, null, { type: 'DOCUMENT' }),
+      record(1, 0, { type: 'CANVAS' }),
+      record(2, 1),
+      record(3, 2, { type: 'TEXT' }),
+      record(4, 0, { type: 'CANVAS' }),
+      record(5, 4)
+    ]
+    expect(figRecordPages(records, ['1:3', '1:5', '1:4', '1:0', '9:9'])).toEqual([
+      '1:1',
+      '1:4',
+      '1:4',
+      undefined,
+      undefined
+    ])
+  })
+})
+
+describe('splicing an encoded message', () => {
+  beforeAll(() => initCodec())
+
+  test('decodes as merging the decoded records would, copying untouched records as bytes', () => {
+    const codec = getCompiledSchema()
+    const archive = [
+      record(0, null, { type: 'DOCUMENT', name: 'Document' }),
+      record(1, 0, { type: 'CANVAS', name: 'Page' }),
+      record(2, 1, { name: 'Frame', opacity: 0.5 }),
+      record(3, 2, { name: 'Kept' }),
+      record(4, 2, { name: 'Renamed' })
+    ]
+    const message = {
+      type: 'NODE_CHANGES',
+      sessionID: 0,
+      ackID: 0,
+      nodeChanges: archive,
+      blobs: [{ bytes: new Uint8Array([1, 2]) }]
+    }
+    const data = codec.encodeMessage(message)
+    const patch = {
+      records: [record(4, 2, { name: 'Renamed again' }), record(9, 2, { name: 'Added' })],
+      fields: [{ guid: guid(2), set: { name: 'Frame renamed' }, unset: ['opacity'] }],
+      blobs: [new Uint8Array([3])],
+      removed: [guid(3)],
+      replaceVariables: false
+    }
+    const spliced = codec.decodeMessage(
+      patchFigMessage(deflateSync(getSchemaBytes()), data, patch)
+    ) as typeof message
+    const merged = codec.decodeMessage(
+      codec.encodeMessage({
+        ...message,
+        nodeChanges: patchFigRecords(archive, patch),
+        blobs: [...message.blobs, { bytes: new Uint8Array([3]) }]
+      })
+    )
+    expect(spliced).toEqual(merged as typeof message)
+    expect(spliced.nodeChanges[2].opacity).toBeUndefined()
+    expect(spliced.nodeChanges.map((change) => change.name)).toEqual([
+      'Document',
+      'Page',
+      'Frame renamed',
+      'Renamed again',
+      'Added'
+    ])
+  })
+})
+
+describe('writing the patched archive', () => {
+  const PATCH = { records: [], blobs: [], removed: [], replaceVariables: false }
+  const IMAGE = new Uint8Array(64 * 1024).map((_, index) => index % 251)
+  const input = {
+    thumbnailPNG: new Uint8Array([1]),
+    metaJSON: '{"file_name":"Patched"}',
+    images: [{ name: 'images/new', data: new Uint8Array([4, 5, 6]) }]
+  }
+  const document = () =>
+    encodeMessage(
+      createNodeChangesMessage(0, 0, [
+        { guid: guid(0), type: 'DOCUMENT', phase: 'CREATED', name: 'Doc' }
+      ])
+    )
+
+  beforeAll(async () => {
+    await initCodec()
+  })
+
+  test('passes the archive images through as views of it and adds the new ones', async () => {
+    const archive = writeFigArchive({
+      schemaDeflated: deflateSync(getSchemaBytes()),
+      kiwiData: document(),
+      thumbnailPNG: new Uint8Array(),
+      metaJSON: '{}',
+      images: [
+        { name: 'images/kept', data: IMAGE },
+        { name: 'images/new', data: new Uint8Array([7]) }
+      ]
+    })
+    const buffer = archive.slice().buffer
+    const reader = patchFigArchive(buffer, PATCH, input).getReader()
+    const chunks: Uint8Array[] = []
+    for (let next = await reader.read(); !next.done; next = await reader.read()) {
+      chunks.push(next.value)
+    }
+    const written = parseFigBuffer(
+      await new Blob(chunks.map((chunk) => chunk.slice())).arrayBuffer()
+    )
+
+    expect(chunks.some((chunk) => chunk.buffer === buffer)).toBe(true)
+    // An image the archive holds wins over a new one of the same name.
+    expect(Object.fromEntries(written.images)).toEqual({ kept: IMAGE, new: new Uint8Array([7]) })
+    expect(written.metaJSON).toBe(input.metaJSON)
+  })
+
+  test('writes a bare fig-kiwi file as an archive', async () => {
+    const bare = writeFigContainer({
+      schemaDeflated: deflateSync(getSchemaBytes()),
+      dataRaw: document()
+    })
+    const written = parseFigBuffer(
+      (await readStreamBytes(patchFigArchive(bare.slice().buffer, PATCH, input))).buffer
+    )
+
+    expect(written.nodeChanges.map((change) => change.name)).toEqual(['Doc'])
+    expect(written.images).toEqual([['new', new Uint8Array([4, 5, 6])]])
+  })
+})
+
+describe('what the archive tells a save', () => {
+  const paint = (localID: number, extra: Partial<NodeChange>) =>
+    ({
+      guid: guid(localID),
+      type: 'VARIABLE',
+      variableResolvedType: 'PAINT',
+      ...extra
+    }) as NodeChange
+  const info = (extra: Partial<Parameters<typeof figArchiveRecordInfo>[0]>) =>
+    figArchiveRecordInfo({
+      records: [],
+      resources: [],
+      slotContent: [],
+      blobs: [],
+      imageHashes: [],
+      ...extra
+    })
+
+  test('names the variable records the reader leaves out, with the collection each names', () => {
+    const sets = [
+      { guid: guid(3), type: 'VARIABLE_SET', key: 'lib', version: '1' },
+      { guid: guid(4), type: 'VARIABLE_SET', key: 'lib', version: '2' }
+    ] as NodeChange[]
+    const byGuid = paint(5, { variableSetID: { guid: guid(3) } })
+    const byParent = paint(6, { parentIndex: { guid: guid(4), position: '0' } })
+    const byVersion = paint(7, { variableSetID: { assetRef: { key: 'lib', version: '2' } } })
+    const unknown = paint(8, { variableSetID: { assetRef: { key: 'other', version: '1' } } })
+    const color = { guid: guid(9), type: 'VARIABLE', variableResolvedType: 'COLOR' } as NodeChange
+    const { unreadVariables } = info({
+      resources: [...sets, byGuid, byParent, byVersion, unknown, color]
+    })
+    expect(unreadVariables).toEqual([
+      { record: byGuid, collectionId: '1:3' },
+      { record: byParent, collectionId: '1:4' },
+      { record: byVersion, collectionId: '1:4' },
+      { record: unknown }
+    ])
+  })
+
+  test('hands over slot content with the blobs it cites, numbered from the first', () => {
+    const geometry = (index: number) => [{ windingRule: 'NONZERO', commandsBlob: index }]
+    const frame = record(10, 1, { fillGeometry: geometry(4) } as Partial<NodeChange>)
+    const child = record(11, 10, {
+      fillGeometry: geometry(2),
+      strokeGeometry: geometry(4),
+      fillPaints: [{ type: 'IMAGE', image: { dataBlob: 3 } }]
+    } as Partial<NodeChange>)
+    const blobs = [0, 1, 2, 3, 4].map((value) => new Uint8Array([value]))
+    const { slotContent } = info({ slotContent: [frame, child], blobs })
+    expect(slotContent.blobs).toEqual([4, 2, 3].map((value) => new Uint8Array([value])))
+    expect(slotContent.records).toEqual([
+      { ...frame, fillGeometry: geometry(0) },
+      {
+        ...child,
+        fillGeometry: geometry(1),
+        strokeGeometry: geometry(0),
+        fillPaints: [{ type: 'IMAGE', image: { dataBlob: 2 } }]
+      } as NodeChange
+    ])
+  })
+})

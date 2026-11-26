@@ -1,0 +1,187 @@
+<script setup lang="ts">
+import {
+  HoverCardContent,
+  HoverCardPortal,
+  HoverCardRoot,
+  HoverCardTrigger,
+  PopoverContent,
+  PopoverPortal,
+  PopoverTrigger
+} from 'reka-ui'
+import { tv } from 'tailwind-variants'
+
+import { useMessages } from '@open-pencil/vue/i18n'
+
+import type { FollowTarget } from '@/app/presence/types'
+import AvatarStack from '@/components/presence/AvatarStack.vue'
+import PersonAvatar from '@/components/presence/PersonAvatar.vue'
+import PresenceList from '@/components/presence/PresenceList.vue'
+import { isFollowing, type PresencePersonRow } from '@/components/presence/rows'
+import AppButton from '@/components/ui/button/AppButton.vue'
+import AppPopoverRoot from '@/components/ui/overlay/AppPopoverRoot.vue'
+import presenceAvatarsTheme from '@/theme/collaboration/presence-avatars'
+
+const presenceAvatars = tv(presenceAvatarsTheme)
+
+/** How many collaborators the stack shows besides you before "+N". */
+const MAX_PEERS = 3
+
+const {
+  rows,
+  following,
+  connected = false,
+  canLeave = false
+} = defineProps<{
+  /** Ourselves first, then everyone else in the room. */
+  rows: PresencePersonRow[]
+  following: FollowTarget | null
+  /** Whether someone else in the room answered, so the room is live. */
+  connected?: boolean
+  /** Whether the self menu offers leaving the room, which a stored document's room never does. */
+  canLeave?: boolean
+}>()
+
+const emit = defineEmits<{
+  follow: [target: FollowTarget | null]
+  rename: [agentId: string, name: string]
+  leave: []
+}>()
+
+const common = useMessages('common')
+const messages = useMessages('collaboration')
+const ui = presenceAvatars()
+
+function personTarget(clientId: number): FollowTarget {
+  return { kind: 'person', clientId }
+}
+
+function toggleFollow(clientId: number) {
+  const target = personTarget(clientId)
+  emit('follow', isFollowing(following, target) ? null : target)
+}
+</script>
+
+<template>
+  <AvatarStack data-test-id="collab-avatars" :people="rows" :max="MAX_PEERS + 1">
+    <template #person="{ person }">
+      <AppPopoverRoot v-if="person.clientId === undefined">
+        <PopoverTrigger as-child>
+          <button
+            type="button"
+            data-test-id="collab-local-avatar"
+            :aria-label="`${person.name || common.you} (${common.youSuffix})`"
+            :class="ui.trigger()"
+          >
+            <PersonAvatar
+              :name="person.name || common.you"
+              :color="person.color"
+              :agent-count="person.agents.length"
+              :voice="person.voice"
+              interactive
+            />
+            <span
+              v-if="connected"
+              data-test-id="collab-live"
+              role="img"
+              :aria-label="messages.connected"
+              :class="ui.live()"
+            />
+          </button>
+        </PopoverTrigger>
+        <PopoverPortal>
+          <PopoverContent
+            data-test-id="collab-self-menu"
+            :class="ui.card()"
+            :side-offset="8"
+            align="end"
+          >
+            <PresenceList
+              :rows="[person]"
+              :following="following"
+              @follow="emit('follow', $event)"
+              @rename="(id, name) => emit('rename', id, name)"
+            />
+            <AppButton
+              v-if="canLeave"
+              variant="outline"
+              :class="ui.leave()"
+              data-test-id="collab-leave-room"
+              @click="emit('leave')"
+            >
+              {{ messages.leaveRoom }}
+            </AppButton>
+          </PopoverContent>
+        </PopoverPortal>
+      </AppPopoverRoot>
+
+      <HoverCardRoot v-else :open-delay="250" :close-delay="150">
+        <HoverCardTrigger as-child>
+          <button
+            type="button"
+            data-test-id="collab-peer-avatar"
+            :data-following="isFollowing(following, personTarget(person.clientId)) || undefined"
+            :aria-label="
+              isFollowing(following, personTarget(person.clientId))
+                ? messages.stopFollowing({ name: person.name })
+                : messages.follow({ name: person.name })
+            "
+            :class="ui.trigger()"
+            @click="toggleFollow(person.clientId)"
+          >
+            <PersonAvatar
+              :name="person.name"
+              :color="person.color"
+              :agent-count="person.agents.length"
+              :following="isFollowing(following, personTarget(person.clientId))"
+              :voice="person.voice"
+              interactive
+            />
+          </button>
+        </HoverCardTrigger>
+        <HoverCardPortal>
+          <HoverCardContent
+            data-test-id="collab-peer-card"
+            :class="ui.card()"
+            :side-offset="8"
+            align="end"
+          >
+            <PresenceList
+              :rows="[person]"
+              :following="following"
+              @follow="emit('follow', $event)"
+            />
+          </HoverCardContent>
+        </HoverCardPortal>
+      </HoverCardRoot>
+    </template>
+
+    <!-- Everyone, by click or keyboard: hover cards are mouse-only. -->
+    <template #overflow="{ hidden }">
+      <AppPopoverRoot v-if="rows.length > 1">
+        <PopoverTrigger as-child>
+          <button
+            type="button"
+            data-test-id="collab-everyone"
+            :aria-label="
+              hidden > 0 ? messages.morePeople({ count: String(hidden) }) : messages.inThisRoom
+            "
+            :class="ui.overflow()"
+          >
+            <template v-if="hidden > 0">+{{ hidden }}</template>
+            <icon-lucide-chevron-down v-else :class="ui.chevron()" />
+          </button>
+        </PopoverTrigger>
+        <PopoverPortal>
+          <PopoverContent :class="ui.card()" :side-offset="8" align="end">
+            <PresenceList
+              :rows="rows"
+              :following="following"
+              @follow="emit('follow', $event)"
+              @rename="(id, name) => emit('rename', id, name)"
+            />
+          </PopoverContent>
+        </PopoverPortal>
+      </AppPopoverRoot>
+    </template>
+  </AvatarStack>
+</template>

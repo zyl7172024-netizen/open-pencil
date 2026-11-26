@@ -1,0 +1,211 @@
+import { fromUint8Array } from 'js-base64'
+import * as v from 'valibot'
+
+import { graphOf } from '#core/figma-api/graph'
+import { PDF_MODES, PDFPlanError, planPDFPages } from '#core/io/formats/pdf/plan'
+import type { RasterExportFormat } from '#core/io/formats/raster'
+import type { ExportEffectWarning } from '#core/io/formats/svg'
+import { toolNumber, defineTool } from '#core/tools/schema'
+
+const exportInputs = {
+  ids: v.optional(
+    v.pipe(
+      v.array(v.string()),
+      v.minLength(1),
+      v.description('Node IDs to export. Omit to export all top-level nodes on the current page.')
+    )
+  ),
+  path: v.optional(
+    v.pipe(
+      v.string(),
+      v.description(
+        'Write exported data to this path instead of returning it (requires OPENPENCIL_MCP_ROOT)'
+      )
+    )
+  )
+}
+
+/** Scale inputs shared by every tool that returns a raster image to a model. */
+export const rasterScaleInputs = {
+  scale: v.optional(
+    toolNumber(
+      v.pipe(
+        v.number(),
+        v.minValue(0.1),
+        v.maxValue(4),
+        v.description(
+          'Export scale multiplier before the maximum-edge limit is applied (default: 1)'
+        )
+      )
+    ),
+    1
+  ),
+  maxEdge: v.optional(
+    toolNumber(
+      v.pipe(
+        v.number(),
+        v.minValue(64),
+        v.maxValue(4096),
+        v.description(
+          'Maximum output width or height in pixels. Preserves aspect ratio and never upscales. Defaults to 1280 for bounded model input.'
+        )
+      )
+    ),
+    1280
+  )
+}
+
+/** The requested scale, reduced so the longest edge fits `maxEdge`; 0 for empty content. */
+export function boundedRasterScale(
+  width: number,
+  height: number,
+  scale: number,
+  maxEdge: number
+): number {
+  const longestEdge = Math.max(width, height)
+  return longestEdge > 0 ? Math.min(scale, maxEdge / longestEdge) : 0
+}
+
+export const exportSVG = defineTool({
+  name: 'export_svg',
+  description:
+    'Export nodes as SVG markup. Returns the SVG string, and `warnings` naming each effect SVG cannot draw, such as glass, which the SVG leaves out.',
+  execution: { kind: 'async', mutation: 'none' },
+  exposure: { webmcp: false },
+  input: v.strictObject({ ...exportInputs }),
+  execute: async (figma, args) => {
+    const { renderNodesToLaidOutSVG } = await import('#core/io/formats/svg/text/layout')
+    const pageId = figma.currentPageId
+    const ids =
+      args.ids && args.ids.length > 0 ? args.ids : figma.currentPage.children.map((node) => node.id)
+    const warnings: ExportEffectWarning[] = []
+    const svg = await renderNodesToLaidOutSVG(graphOf(figma), pageId, ids, {
+      onWarning: (warning) => warnings.push(warning)
+    })
+    if (!svg) return { error: 'No visible nodes to export' }
+    return { svg, ...(warnings.length > 0 ? { warnings } : {}) }
+  }
+})
+
+export const exportPDF = defineTool({
+  name: 'export_pdf',
+  description:
+    'Export nodes as a vector PDF document, with selectable text and sharp paths. Returns base64-encoded PDF data and the size of each PDF page. ' +
+    'Pages are drawn as the canvas draws them, with the fonts the text uses embedded; blurs, shadows, and shader fills are drawn as images.',
+  execution: { kind: 'async', mutation: 'none' },
+  exposure: { webmcp: false },
+  input: v.strictObject({
+    ...exportInputs,
+    mode: v.optional(
+      v.pipe(
+        v.picklist(PDF_MODES),
+        v.description(
+          'single: one PDF page for all ids. frames: one per id, or per top-level frame of the current page. pages: one per design page'
+        )
+      ),
+      'single'
+    ),
+    page_ids: v.optional(
+      v.pipe(
+        v.array(v.string()),
+        v.description('mode "pages": the design pages to export, in order (default: all pages)')
+      )
+    )
+  }),
+  execute: async (figma, args) => {
+    const { exportPDFDocument, readPDFPages } = await import('#core/io/formats/pdf/document')
+    try {
+      if (args.mode === 'pages') readPDFPages(graphOf(figma), args.page_ids)
+      const specs = planPDFPages(graphOf(figma), {
+        mode: args.mode,
+        ids: args.ids,
+        pageIds: args.page_ids,
+        currentPageId: figma.currentPageId
+      })
+      const result = await exportPDFDocument(graphOf(figma), specs, { renderer: figma.renderer })
+      if (!result || result.data.length === 0) return { error: 'No visible nodes to export' }
+      return {
+        mimeType: 'application/pdf',
+        base64: fromUint8Array(result.data),
+        byteLength: result.data.length,
+        pageCount: result.pages.length,
+        pages: result.pages.map((page, index) => ({
+          page: index + 1,
+          ...(page.label ? { name: page.label } : {}),
+          width: Math.round(page.width),
+          height: Math.round(page.height)
+        }))
+      }
+    } catch (error) {
+      if (error instanceof PDFPlanError) return { error: error.message }
+      throw error
+    }
+  }
+})
+
+export const exportImage = defineTool({
+  name: 'export_image',
+  description:
+    'Export nodes as a raster image (PNG, JPG, or WEBP). Returns base64-encoded image data. Use to visually verify designs.',
+  execution: { kind: 'async', mutation: 'none' },
+  exposure: { webmcp: false },
+  input: v.strictObject({
+    ...exportInputs,
+    format: v.optional(
+      v.pipe(v.picklist(['PNG', 'JPG', 'WEBP']), v.description('Image format')),
+      'PNG'
+    ),
+    ...rasterScaleInputs
+  }),
+  execute: async (figma, args) => {
+    if (!figma.exportImage) {
+      return { error: 'Image export is not available in this environment' }
+    }
+    const ids =
+      args.ids && args.ids.length > 0 ? args.ids : figma.currentPage.children.map((node) => node.id)
+    const format = args.format.toUpperCase() as RasterExportFormat
+    const requestedScale = args.scale
+    const maxEdge = args.maxEdge
+    const missing = ids.find((id) => !figma.getNodeById(id))
+    if (missing) return { error: `Node "${missing}" not found` }
+    const nodes = ids.map((id) => figma.getNodeById(id)).filter((node) => node !== null)
+    if (!nodes.some((node) => node.visible)) return { error: 'No visible nodes to export' }
+    const bounds = nodes.reduce(
+      (result, node) => {
+        const box = node.absoluteBoundingBox
+        const minX = Math.min(result.minX, box.x)
+        const minY = Math.min(result.minY, box.y)
+        const maxX = Math.max(result.maxX, box.x + box.width)
+        const maxY = Math.max(result.maxY, box.y + box.height)
+        return { minX, minY, maxX, maxY }
+      },
+      {
+        minX: Number.POSITIVE_INFINITY,
+        minY: Number.POSITIVE_INFINITY,
+        maxX: Number.NEGATIVE_INFINITY,
+        maxY: Number.NEGATIVE_INFINITY
+      }
+    )
+    const width = bounds.maxX - bounds.minX
+    const height = bounds.maxY - bounds.minY
+    const boundedScale = boundedRasterScale(width, height, requestedScale, maxEdge)
+    if (boundedScale <= 0) return { error: 'No visible nodes to export' }
+    const data = await figma.exportImage(ids, {
+      scale: boundedScale,
+      format
+    })
+    if (!data || data.length === 0) {
+      return { error: 'The renderer returned no image for these nodes' }
+    }
+    const base64 = fromUint8Array(data)
+    const mimeMap = { PNG: 'image/png', JPG: 'image/jpeg', WEBP: 'image/webp' } as const
+    return {
+      mimeType: mimeMap[format],
+      base64,
+      byteLength: data.length,
+      width: Math.ceil(width * boundedScale),
+      height: Math.ceil(height * boundedScale),
+      scale: boundedScale
+    }
+  }
+})

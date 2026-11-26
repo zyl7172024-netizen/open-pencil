@@ -1,0 +1,495 @@
+import type { CanvasKit } from '@open-pencil/canvaskit'
+import type { DerivedTextGlyph, SceneNode } from '@open-pencil/scene-graph'
+import { faceStyleKey } from '@open-pencil/scene-graph/font-style'
+import type { Rect, Vector } from '@open-pencil/scene-graph/primitives'
+import { textVerticalOffset } from '@open-pencil/scene-graph/text'
+import { resolveNodeTextDirection } from '@open-pencil/scene-graph/text/direction'
+
+import type { SkiaRenderer } from '#core/canvas'
+import type { TextLayout } from '#core/canvas/text/layout'
+import { fontVerticalMetricsSync } from '#core/text/font/glyphs'
+import { nextGraphemeBoundary, previousGraphemeBoundary } from '#core/text/graphemes'
+import {
+  pathTextCaret,
+  pathTextIndexAt,
+  pathTextSelectionQuads,
+  type PathTextCaret,
+  type PathTextLineMetrics
+} from '#core/text/path/caret'
+
+/**
+ * The line a caret at `pos` is on. The layout finds no line past the text, but the caret after
+ * the last character stands on the last line: after a closing line break, the empty line it opens.
+ */
+function caretLine(paragraph: TextLayout, pos: number, textLength: number): number {
+  const line = paragraph.getLineNumberAt(pos)
+  if (line >= 0 || pos !== textLength) return line
+  return paragraph.getLineMetrics().length - 1
+}
+
+export interface TextCaret {
+  x: number
+  y0: number
+  y1: number
+}
+
+export interface TextEditorState {
+  nodeId: string
+  text: string
+  cursor: number
+  selectionAnchor: number | null
+  paragraph: TextLayout | null
+  paragraphFontGeneration: number
+  textDirection: 'LTR' | 'RTL'
+}
+
+export class TextEditor {
+  private ck: CanvasKit
+  private renderer: SkiaRenderer | null = null
+  private _state: TextEditorState | null = null
+  private paragraphNode: SceneNode | null = null
+  /** The edited node as it changed outside the editor, laid out again on the next read. */
+  private staleNode: SceneNode | null = null
+  caretVisible = true
+
+  constructor(ck: CanvasKit) {
+    this.ck = ck
+  }
+
+  private paragraphVerticalOffset(): number {
+    const s = this.current()
+    const node = this.paragraphNode
+    if (!s?.paragraph || !node) return 0
+    return textVerticalOffset(node, s.paragraph.getHeight())
+  }
+
+  private paragraphY(y: number): number {
+    return y - this.paragraphVerticalOffset()
+  }
+
+  /**
+   * Text on a path is edited on its glyphs rather than the flat paragraph: the caret, the
+   * selection and the character a point hits follow the path, as in Figma.
+   */
+  private pathText(): { glyphs: DerivedTextGlyph[]; metrics: PathTextLineMetrics } | null {
+    const node = this.paragraphNode
+    if (!node?.textPathData || !node.derivedTextGlyphs?.length) return null
+    const metrics = fontVerticalMetricsSync(node.fontFamily, faceStyleKey(node))
+    return metrics ? { glyphs: node.derivedTextGlyphs, metrics } : null
+  }
+
+  /** The character boundary at a node-local point. */
+  private indexAt(s: TextEditorState, x: number, y: number): number | null {
+    const path = this.pathText()
+    if (path) return pathTextIndexAt(path.glyphs, s.text.length, { x, y }, path.metrics)
+    return s.paragraph?.getGlyphPositionAtCoordinate(x, this.paragraphY(y)).pos ?? null
+  }
+
+  private prepareMove(extend: boolean): TextEditorState | null {
+    const s = this.current()
+    if (!s) return null
+    if (extend && s.selectionAnchor === null) s.selectionAnchor = s.cursor
+    if (!extend) s.selectionAnchor = null
+    return s
+  }
+
+  private replaceRange(start: number, end: number, text: string): TextEditorState | null {
+    const s = this.current()
+    if (!s) return null
+    s.text = s.text.slice(0, start) + text + s.text.slice(end)
+    s.cursor = start + text.length
+    s.selectionAnchor = null
+    return s
+  }
+
+  private currentLineMetrics() {
+    const s = this.current()
+    if (!s?.paragraph) return null
+    const lineNum = caretLine(s.paragraph, s.cursor, s.text.length)
+    return lineNum < 0 ? null : s.paragraph.getLineMetricsAt(lineNum)
+  }
+
+  private collapseSelectionTo(edge: 0 | 1): boolean {
+    const s = this.current()
+    if (!s || !this.hasSelection()) return false
+    const range = this.getSelectionRange()
+    if (range) s.cursor = range[edge]
+    s.selectionAnchor = null
+    return true
+  }
+
+  get state(): TextEditorState | null {
+    return this.current()
+  }
+
+  /** The editing state with its layout brought up to date with the node and its fonts. */
+  private current(): TextEditorState | null {
+    const state = this._state
+    if (state && this.staleNode) this.rebuildParagraph(this.staleNode)
+    if (
+      state &&
+      this.renderer &&
+      this.paragraphNode &&
+      state.paragraphFontGeneration !== this.renderer.fontGeneration
+    ) {
+      this.rebuildParagraph(this.paragraphNode)
+    }
+    return state
+  }
+
+  get isActive(): boolean {
+    return this._state !== null
+  }
+
+  get nodeId(): string | null {
+    return this._state?.nodeId ?? null
+  }
+
+  setRenderer(renderer: SkiaRenderer | null): void {
+    this.renderer = renderer
+  }
+
+  start(node: SceneNode): void {
+    this._state = {
+      nodeId: node.id,
+      text: node.text,
+      cursor: node.text.length,
+      selectionAnchor: null,
+      paragraph: null,
+      paragraphFontGeneration: -1,
+      textDirection: resolveNodeTextDirection(node)
+    }
+    this.rebuildParagraph(node)
+  }
+
+  stop(): { nodeId: string; text: string } | null {
+    if (!this._state) return null
+    const result = { nodeId: this._state.nodeId, text: this._state.text }
+    this._state.paragraph?.delete()
+    this._state = null
+    this.paragraphNode = null
+    this.staleNode = null
+    return result
+  }
+
+  /**
+   * Marks the layout out of date after the edited node changed outside the editor, as a panel
+   * field does while it is dragged; the caret and selection follow on the next read.
+   */
+  invalidateParagraph(node: SceneNode): void {
+    if (this._state?.nodeId === node.id) this.staleNode = node
+  }
+
+  rebuildParagraph(node: SceneNode): void {
+    const s = this._state
+    this.staleNode = null
+    if (!s || !this.renderer) return
+    s.paragraph?.delete()
+    this.paragraphNode = node
+    s.textDirection = resolveNodeTextDirection(node)
+    s.paragraph = this.renderer.buildParagraph({ ...node, text: s.text })
+    s.paragraphFontGeneration = this.renderer.fontGeneration
+  }
+
+  /** Takes the node's text back after it changed outside the editor, as an undo does. */
+  syncToNode(node: SceneNode): void {
+    const s = this.current()
+    if (!s) return
+    if (s.text !== node.text) {
+      s.text = node.text
+      s.cursor = Math.min(s.cursor, node.text.length)
+      s.selectionAnchor = null
+    }
+    this.rebuildParagraph(node)
+  }
+
+  hasSelection(): boolean {
+    const s = this.current()
+    return s !== null && s.selectionAnchor !== null && s.selectionAnchor !== s.cursor
+  }
+
+  /** Character index of the caret, or null when not editing. */
+  get caretIndex(): number | null {
+    return this._state?.cursor ?? null
+  }
+
+  getSelectionRange(): [number, number] | null {
+    const s = this.current()
+    if (!s || s.selectionAnchor === null || s.selectionAnchor === s.cursor) return null
+    const lo = Math.min(s.cursor, s.selectionAnchor)
+    const hi = Math.max(s.cursor, s.selectionAnchor)
+    return [lo, hi]
+  }
+
+  getSelectedText(): string {
+    const range = this.getSelectionRange()
+    if (!range || !this._state) return ''
+    return this._state.text.slice(range[0], range[1])
+  }
+
+  selectAll(): void {
+    const s = this.current()
+    if (!s) return
+    s.selectionAnchor = 0
+    s.cursor = s.text.length
+  }
+
+  selectWord(pos: number): void {
+    const s = this.current()
+    if (!s) return
+    const text = s.text
+    let start = pos
+    let end = pos
+    while (start > 0 && !isWordBoundary(text[start - 1])) start--
+    while (end < text.length && !isWordBoundary(text[end])) end++
+    s.selectionAnchor = start
+    s.cursor = end
+  }
+
+  setCursorAt(x: number, y: number, extend = false): void {
+    const s = this.current()
+    if (!s) return
+    const pos = this.indexAt(s, x, y)
+    if (pos === null) return
+    if (extend) {
+      if (s.selectionAnchor === null) s.selectionAnchor = s.cursor
+    } else {
+      s.selectionAnchor = null
+    }
+    s.cursor = pos
+  }
+
+  selectLine(pos: number): void {
+    const s = this.current()
+    if (!s?.paragraph) return
+    const lineNum = caretLine(s.paragraph, pos, s.text.length)
+    if (lineNum < 0) return
+    const metrics = s.paragraph.getLineMetricsAt(lineNum)
+    if (!metrics) return
+    s.selectionAnchor = metrics.startIndex
+    s.cursor = metrics.endExcludingWhitespaces
+  }
+
+  selectWordAt(x: number, y: number): void {
+    const s = this.current()
+    const pos = s && this.indexAt(s, x, y)
+    if (pos !== null) this.selectWord(pos)
+  }
+
+  selectLineAt(x: number, y: number): void {
+    const s = this.current()
+    const pos = s && this.indexAt(s, x, y)
+    if (pos !== null) this.selectLine(pos)
+  }
+
+  insert(text: string, node: SceneNode): void {
+    const s = this.current()
+    if (!s) return
+    const range = this.getSelectionRange() ?? [s.cursor, s.cursor]
+    this.replaceRange(range[0], range[1], text)
+    this.rebuildParagraph(node)
+  }
+
+  backspace(node: SceneNode): void {
+    const s = this.current()
+    if (!s) return
+    const range =
+      this.getSelectionRange() ??
+      (s.cursor > 0 ? [previousGraphemeBoundary(s.text, s.cursor), s.cursor] : null)
+    if (range) this.replaceRange(range[0], range[1], '')
+    this.rebuildParagraph(node)
+  }
+
+  delete(node: SceneNode): void {
+    const s = this.current()
+    if (!s) return
+    const range =
+      this.getSelectionRange() ??
+      (s.cursor < s.text.length ? [s.cursor, nextGraphemeBoundary(s.text, s.cursor)] : null)
+    if (range) this.replaceRange(range[0], range[1], '')
+    this.rebuildParagraph(node)
+  }
+
+  private moveHorizontal(extend: boolean, visualDirection: 'left' | 'right'): void {
+    const s = this.current()
+    if (!s) return
+    if (!extend && this.collapseSelectionTo(visualDirection === 'left' ? 0 : 1)) return
+    this.prepareMove(extend)
+    const movesForward = (visualDirection === 'left') === (s.textDirection === 'RTL')
+    s.cursor = movesForward
+      ? nextGraphemeBoundary(s.text, s.cursor)
+      : previousGraphemeBoundary(s.text, s.cursor)
+  }
+
+  moveLeft(extend = false): void {
+    this.moveHorizontal(extend, 'left')
+  }
+
+  moveRight(extend = false): void {
+    this.moveHorizontal(extend, 'right')
+  }
+
+  private moveVertical(extend: boolean, edge: 'up' | 'down'): void {
+    const s = this.current()
+    if (!s?.paragraph) return
+    this.prepareMove(extend)
+    const caret = this.getCaretRect()
+    if (!caret) return
+    const fontSize = s.paragraph.getLineMetrics()[0]?.height ?? 14
+    const y = edge === 'up' ? caret.y0 - fontSize / 2 : caret.y1 + fontSize / 2
+    s.cursor = s.paragraph.getGlyphPositionAtCoordinate(caret.x, this.paragraphY(y)).pos
+  }
+
+  moveUp(extend = false): void {
+    this.moveVertical(extend, 'up')
+  }
+
+  moveDown(extend = false): void {
+    this.moveVertical(extend, 'down')
+  }
+
+  private moveToLineEdge(extend: boolean, edge: 'start' | 'end'): void {
+    const s = this.current()
+    if (!s?.paragraph) return
+    this.prepareMove(extend)
+    const metrics = this.currentLineMetrics()
+    if (!metrics) return
+    const isRTLStart = s.textDirection === 'RTL' && edge === 'start'
+    const isLTREnd = s.textDirection !== 'RTL' && edge === 'end'
+    s.cursor = isRTLStart || isLTREnd ? metrics.endExcludingWhitespaces : metrics.startIndex
+  }
+
+  moveToLineStart(extend = false): void {
+    this.moveToLineEdge(extend, 'start')
+  }
+
+  moveToLineEnd(extend = false): void {
+    this.moveToLineEdge(extend, 'end')
+  }
+
+  private moveWord(extend: boolean, direction: 'left' | 'right'): void {
+    const s = this.prepareMove(extend)
+    if (!s) return
+    const movingLeft = direction === 'left'
+    let pos = this.skipWordBoundaryRun(s.text, s.cursor, movingLeft)
+    pos = this.skipWordInteriorRun(s.text, pos, movingLeft)
+    s.cursor = pos
+  }
+
+  private skipWordBoundaryRun(text: string, start: number, movingLeft: boolean): number {
+    return this.advanceWhile(text, start, movingLeft, (boundary) => movingLeft === boundary)
+  }
+
+  private skipWordInteriorRun(text: string, start: number, movingLeft: boolean): number {
+    return this.advanceWhile(text, start, movingLeft, (boundary) => movingLeft !== boundary)
+  }
+
+  private advanceWhile(
+    text: string,
+    start: number,
+    movingLeft: boolean,
+    shouldMove: (isBoundary: boolean) => boolean
+  ): number {
+    let pos = start
+    const step = movingLeft ? -1 : 1
+    while (movingLeft ? pos > 0 : pos < text.length) {
+      const char = movingLeft ? text[pos - 1] : text[pos]
+      if (!shouldMove(isWordBoundary(char))) break
+      pos += step
+    }
+    return pos
+  }
+
+  moveWordLeft(extend = false): void {
+    this.moveWord(extend, 'left')
+  }
+
+  moveWordRight(extend = false): void {
+    this.moveWord(extend, 'right')
+  }
+
+  /**
+   * The caret of empty text. CanvasKit lays out no line for an empty paragraph, so a line
+   * holding one space gives the caret's height, and the alignment its place.
+   */
+  private emptyCaret(paragraph: TextLayout): TextCaret | null {
+    const node = this.paragraphNode
+    const line = paragraph.getLineMetrics().at(0)
+    if (line) {
+      const offsetY = this.paragraphVerticalOffset()
+      return { x: line.left, y0: offsetY, y1: offsetY + line.height }
+    }
+    if (!node || !this.renderer) return null
+    const probe = this.renderer.buildParagraph({ ...node, text: ' ' })
+    const height = probe.getLineMetrics()[0]?.height ?? probe.getHeight()
+    probe.delete()
+    const offsetY = textVerticalOffset(node, height)
+    let x = 0
+    if (node.textAlignHorizontal === 'CENTER') x = node.width / 2
+    if (node.textAlignHorizontal === 'RIGHT') x = node.width
+    return { x, y0: offsetY, y1: offsetY + height }
+  }
+
+  /** The caret along the path, for text on a path. */
+  getPathCaret(): PathTextCaret | null {
+    const s = this.current()
+    const path = this.pathText()
+    if (!s || !path) return null
+    return pathTextCaret(path.glyphs, s.text.length, s.cursor, path.metrics)
+  }
+
+  /** The boxes of every glyph along the path, for outlining the lettering while it is edited. */
+  getPathTextQuads(): Vector[][] {
+    const s = this.current()
+    const path = this.pathText()
+    if (!s || !path) return []
+    return pathTextSelectionQuads(path.glyphs, s.text.length, 0, s.text.length, path.metrics)
+  }
+
+  /** The selection along the path, one box per glyph, for text on a path. */
+  getPathSelectionQuads(): Vector[][] {
+    const s = this.current()
+    const path = this.pathText()
+    const range = this.getSelectionRange()
+    if (!s || !path || !range) return []
+    return pathTextSelectionQuads(path.glyphs, s.text.length, range[0], range[1], path.metrics)
+  }
+
+  getCaretRect(): TextCaret | null {
+    const s = this.current()
+    if (!s?.paragraph) return null
+
+    const text = s.text
+    const cursor = s.cursor
+
+    if (text.length === 0) return this.emptyCaret(s.paragraph)
+
+    const caret = s.paragraph.getCaretRect(cursor, s.textDirection === 'RTL')
+    if (!caret) return null
+    const offsetY = this.paragraphVerticalOffset()
+    return { x: caret.x, y0: caret.top + offsetY, y1: caret.bottom + offsetY }
+  }
+
+  getSelectionRects(): Rect[] {
+    const s = this.current()
+    if (!s?.paragraph) return []
+    const range = this.getSelectionRange()
+    if (!range) return []
+
+    const rects = s.paragraph.getRectsForRange(
+      range[0],
+      range[1],
+      this.ck.RectHeightStyle.Max,
+      this.ck.RectWidthStyle.Tight
+    )
+    const offsetY = this.paragraphVerticalOffset()
+    return rects.map((r) => {
+      const [left, top, right, bottom] = r.rect
+      return { x: left, y: top + offsetY, width: right - left, height: bottom - top }
+    })
+  }
+}
+
+function isWordBoundary(ch: string): boolean {
+  return /\s|[.,;:!?()[\]{}"'`<>/\\|@#$%^&*~+=\-_]/.test(ch)
+}

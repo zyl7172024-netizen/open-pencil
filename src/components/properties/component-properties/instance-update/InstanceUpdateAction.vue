@@ -1,0 +1,78 @@
+<script setup lang="ts">
+import {
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuPortal,
+  DropdownMenuTrigger
+} from 'reka-ui'
+import { toRef } from 'vue'
+
+import type { SceneNode } from '@open-pencil/scene-graph'
+import { useMessages } from '@open-pencil/vue/i18n'
+import { useRetainedPopup } from '@open-pencil/vue/lifecycle/retention'
+
+import type { EditorStore } from '@/app/editor/session'
+import type { LibraryService } from '@/app/libraries'
+import { useInstanceUpdate } from '@/components/properties/component-properties/instance-update/use'
+import AppDropdownMenuRoot from '@/components/ui/menu/AppDropdownMenuRoot.vue'
+import { useMenuUI } from '@/components/ui/menu/menu'
+import MenuScrollArea from '@/components/ui/menu/MenuScrollArea.vue'
+import Tip from '@/components/ui/overlay/Tip.vue'
+
+const { node, editor, service } = defineProps<{
+  node: SceneNode | null | undefined
+  editor: EditorStore
+  service: LibraryService
+}>()
+const emit = defineEmits<{ review: [] }>()
+const libraryMessages = useMessages('panels/libraries')
+const { open: popupOpen, portalActive } = useRetainedPopup()
+const menu = useMenuUI({ content: 'min-w-48' })
+const { available, updating, updateSelectedInstance } = useInstanceUpdate(
+  toRef(() => node),
+  editor,
+  service
+)
+</script>
+
+<template>
+  <AppDropdownMenuRoot v-if="available" v-model:open="popupOpen">
+    <Tip :label="libraryMessages.updateSelectedInstance">
+      <DropdownMenuTrigger as-child>
+        <button
+          type="button"
+          data-test-id="instance-update-action"
+          class="flex size-7 items-center justify-center rounded bg-accent/10 text-primary hover:bg-accent/20 data-[state=open]:bg-accent/20 disabled:opacity-50"
+          :disabled="updating"
+          :aria-label="libraryMessages.updateSelectedInstance"
+        >
+          <icon-lucide-refresh-cw
+            :data-loading="updating"
+            class="size-3.5 data-[loading=true]:animate-spin motion-reduce:data-[loading=true]:animate-none"
+          />
+        </button>
+      </DropdownMenuTrigger>
+    </Tip>
+    <DropdownMenuPortal v-if="portalActive">
+      <DropdownMenuContent align="end" side="bottom" :side-offset="4" :class="menu.content">
+        <MenuScrollArea>
+          <DropdownMenuItem
+            data-test-id="instance-update-selected"
+            :class="menu.item"
+            :disabled="updating"
+            @select="updateSelectedInstance"
+          >
+            {{ libraryMessages.updateSelectedInstance }}
+          </DropdownMenuItem>
+          <DropdownMenuItem
+            data-test-id="instance-review-update"
+            :class="menu.item"
+            @select="emit('review')"
+          >
+            {{ libraryMessages.reviewLibraryUpdate }}
+          </DropdownMenuItem>
+        </MenuScrollArea>
+      </DropdownMenuContent>
+    </DropdownMenuPortal>
+  </AppDropdownMenuRoot>
+</template>

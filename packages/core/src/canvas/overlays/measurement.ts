@@ -1,0 +1,223 @@
+import type { Canvas } from '@open-pencil/canvaskit'
+import type { SceneGraph, SceneNode } from '@open-pencil/scene-graph'
+import { getAxisAlignedWorldBounds } from '@open-pencil/scene-graph/coordinate'
+import { computeBounds } from '@open-pencil/scene-graph/geometry'
+import type { Rect } from '@open-pencil/scene-graph/primitives'
+
+import { drawTextPill } from '#core/canvas/labels/pill'
+import type { SkiaRenderer } from '#core/canvas/renderer/skia'
+import {
+  MEASUREMENT_COLOR,
+  MEASUREMENT_PILL_HEIGHT,
+  MEASUREMENT_PILL_PADDING_X,
+  MEASUREMENT_PILL_RADIUS,
+  MEASUREMENT_TEXT_BASELINE
+} from '#core/constants'
+import { worldXToScreen, worldYToScreen } from '#core/geometry/viewport'
+
+import { outlineNode } from './outline'
+
+export interface MeasurementSegment {
+  axis: 'x' | 'y'
+  from: number
+  to: number
+  cross: number
+  value: number
+}
+
+function center(start: number, size: number) {
+  return start + size / 2
+}
+
+function overlapCenter(startA: number, endA: number, startB: number, endB: number) {
+  return (Math.max(startA, startB) + Math.min(endA, endB)) / 2
+}
+
+function horizontalCross(from: Rect, to: Rect) {
+  const fromBottom = from.y + from.height
+  const toBottom = to.y + to.height
+  if (fromBottom < to.y) return fromBottom
+  if (toBottom < from.y) return from.y
+  return overlapCenter(from.y, fromBottom, to.y, toBottom)
+}
+
+function verticalCross(from: Rect, to: Rect) {
+  const fromRight = from.x + from.width
+  const toRight = to.x + to.width
+  if (fromRight < to.x) return to.x
+  if (toRight < from.x) return toRight
+  return overlapCenter(from.x, fromRight, to.x, toRight)
+}
+
+export function computeMeasurementSegments(from: Rect, to: Rect): MeasurementSegment[] {
+  const segments: MeasurementSegment[] = []
+  const fromRight = from.x + from.width
+  const toRight = to.x + to.width
+  const fromBottom = from.y + from.height
+  const toBottom = to.y + to.height
+
+  const fromInsideTo =
+    from.x >= to.x && fromRight <= toRight && from.y >= to.y && fromBottom <= toBottom
+  const toInsideFrom =
+    to.x >= from.x && toRight <= fromRight && to.y >= from.y && toBottom <= fromBottom
+
+  if (fromInsideTo) {
+    segments.push(
+      {
+        axis: 'x',
+        from: to.x,
+        to: from.x,
+        cross: center(from.y, from.height),
+        value: from.x - to.x
+      },
+      {
+        axis: 'x',
+        from: fromRight,
+        to: toRight,
+        cross: center(from.y, from.height),
+        value: toRight - fromRight
+      },
+      {
+        axis: 'y',
+        from: to.y,
+        to: from.y,
+        cross: center(from.x, from.width),
+        value: from.y - to.y
+      },
+      {
+        axis: 'y',
+        from: fromBottom,
+        to: toBottom,
+        cross: center(from.x, from.width),
+        value: toBottom - fromBottom
+      }
+    )
+    return segments.filter((segment) => segment.value > 0)
+  }
+
+  if (toInsideFrom) {
+    return computeMeasurementSegments(to, from)
+  }
+
+  if (fromRight <= to.x) {
+    segments.push({
+      axis: 'x',
+      from: fromRight,
+      to: to.x,
+      cross: horizontalCross(from, to),
+      value: to.x - fromRight
+    })
+  } else if (toRight <= from.x) {
+    segments.push({
+      axis: 'x',
+      from: toRight,
+      to: from.x,
+      cross: horizontalCross(from, to),
+      value: from.x - toRight
+    })
+  }
+
+  if (fromBottom <= to.y) {
+    segments.push({
+      axis: 'y',
+      from: fromBottom,
+      to: to.y,
+      cross: verticalCross(from, to),
+      value: to.y - fromBottom
+    })
+  } else if (toBottom <= from.y) {
+    segments.push({
+      axis: 'y',
+      from: toBottom,
+      to: from.y,
+      cross: verticalCross(from, to),
+      value: from.y - toBottom
+    })
+  }
+
+  return segments.filter((segment) => segment.value > 0 && Number.isFinite(segment.cross))
+}
+
+function selectedBounds(graph: SceneGraph, selectedIds: Set<string>): Rect | null {
+  const nodes: SceneNode[] = []
+  for (const id of selectedIds) {
+    const node = graph.getNode(id)
+    if (node) nodes.push(node)
+  }
+  if (nodes.length === 0) return null
+  return computeBounds(nodes.map((node) => getAxisAlignedWorldBounds(node, graph)))
+}
+
+function drawPill(r: SkiaRenderer, canvas: Canvas, text: string, x: number, y: number) {
+  const font = r.chromeFonts.size
+  if (!font) return
+  drawTextPill(r, canvas, {
+    text,
+    font,
+    centerX: x,
+    top: y - MEASUREMENT_PILL_HEIGHT / 2,
+    height: MEASUREMENT_PILL_HEIGHT,
+    paddingX: MEASUREMENT_PILL_PADDING_X,
+    radius: MEASUREMENT_PILL_RADIUS,
+    baseline: MEASUREMENT_PILL_HEIGHT / 2 + MEASUREMENT_TEXT_BASELINE,
+    fill: r.ck.Color4f(MEASUREMENT_COLOR.r, MEASUREMENT_COLOR.g, MEASUREMENT_COLOR.b, 1),
+    textColor: r.ck.WHITE
+  })
+}
+
+function drawTargetOutline(r: SkiaRenderer, canvas: Canvas, graph: SceneGraph, target: SceneNode) {
+  outlineNode(r, canvas, graph, target.id, {
+    color: r.ck.Color4f(MEASUREMENT_COLOR.r, MEASUREMENT_COLOR.g, MEASUREMENT_COLOR.b, 1)
+  })
+}
+
+export function drawMeasurementSegment(
+  r: SkiaRenderer,
+  canvas: Canvas,
+  segment: MeasurementSegment
+): void {
+  r.auxStroke.setStrokeWidth(1)
+  r.auxStroke.setColor(
+    r.ck.Color4f(MEASUREMENT_COLOR.r, MEASUREMENT_COLOR.g, MEASUREMENT_COLOR.b, 1)
+  )
+  r.auxStroke.setPathEffect(null)
+  if (segment.axis === 'x') {
+    const x1 = worldXToScreen(r, segment.from)
+    const x2 = worldXToScreen(r, segment.to)
+    const y = worldYToScreen(r, segment.cross)
+    canvas.drawLine(x1, y, x2, y, r.auxStroke)
+    drawPill(r, canvas, String(Math.round(segment.value)), center(x1, x2 - x1), y)
+  } else {
+    const x = worldXToScreen(r, segment.cross)
+    const y1 = worldYToScreen(r, segment.from)
+    const y2 = worldYToScreen(r, segment.to)
+    canvas.drawLine(x, y1, x, y2, r.auxStroke)
+    drawPill(r, canvas, String(Math.round(segment.value)), x, center(y1, y2 - y1))
+  }
+}
+
+export function drawMeasurements(
+  r: SkiaRenderer,
+  canvas: Canvas,
+  graph: SceneGraph,
+  selectedIds: Set<string>,
+  targetId?: string | null
+): void {
+  if (!targetId || selectedIds.size === 0 || selectedIds.has(targetId)) return
+  const target = graph.getNode(targetId)
+  const from = selectedBounds(graph, selectedIds)
+  if (!target || !from) return
+  const to = getAxisAlignedWorldBounds(target, graph)
+  const segments = computeMeasurementSegments(from, to)
+
+  r.auxStroke.setStrokeWidth(1)
+  r.auxStroke.setColor(
+    r.ck.Color4f(MEASUREMENT_COLOR.r, MEASUREMENT_COLOR.g, MEASUREMENT_COLOR.b, 1)
+  )
+  r.auxStroke.setPathEffect(null)
+
+  drawTargetOutline(r, canvas, graph, target)
+  if (segments.length === 0) return
+
+  for (const segment of segments) drawMeasurementSegment(r, canvas, segment)
+}

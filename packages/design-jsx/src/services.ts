@@ -1,0 +1,60 @@
+import type { SceneGraph, SceneNode, VectorNetwork } from '@open-pencil/scene-graph'
+import type { IconOptions } from '@open-pencil/scene-graph/icons'
+import type { Color, Rect, Size } from '@open-pencil/scene-graph/primitives'
+
+import type { TreeNode } from './tree'
+
+/** Inline `<svg>` content: markup, parsed shape elements, or both, with the element's props. */
+export interface SVGSource {
+  body: string
+  elements: TreeNode[]
+  props: Record<string, unknown>
+}
+
+/** Where to put artwork and how to size and color it. */
+export interface ArtworkPlacement {
+  parentId: string
+  size: number
+  color: Color
+  overrides: Partial<SceneNode>
+}
+
+/**
+ * Engine work the renderer delegates. `Artwork` is whatever the engine uses to describe
+ * vector paths; the renderer only passes it from `icon`/`svg` to `createArtwork`.
+ */
+export interface DesignJSXServices<Artwork> {
+  /**
+   * A named icon such as `lucide:heart` at `size`, drawn with `options` where its set takes them,
+   * or null when it does not exist.
+   */
+  icon(name: string, size: number, options?: IconOptions): Promise<Artwork | null>
+  /** Inline SVG mapped into `box`, the layer's own size, or null when it has no supported shapes. */
+  svg(source: SVGSource, box: Size): Artwork | null
+  /**
+   * Vector nodes for the artwork, created under the placement's parent. A path whose paint takes
+   * `placement.color` records it as iconTint plugin data (`withIconTint`), so a color drawn from a
+   * variable binds to that variable; paints without it keep their own colors.
+   */
+  createArtwork(graph: SceneGraph, artwork: Artwork, placement: ArtworkPlacement): SceneNode
+  /**
+   * Prepare the fonts the rendered roots' text uses, before they are laid out, so layout measures
+   * that text in its own fonts. An engine without fonts leaves it out.
+   */
+  prepareFonts?(graph: SceneGraph, rootIds: readonly string[]): Promise<unknown>
+  /** Size and lay out the rendered roots once they are in place and their fonts prepared. */
+  layout(graph: SceneGraph, rootIds: readonly string[]): void
+  /** The tight bounds of a vector network, its curves included, which size a `<Vector>`. */
+  vectorBounds(network: VectorNetwork): Rect
+  /**
+   * `<Text markdown>`: Markdown as a text's characters, ranges, and paragraphs over `base`. An
+   * engine without it renders everything else and refuses only `<Text markdown>`.
+   */
+  markdown?: MarkdownService
+}
+
+/** Markdown as a text's characters, ranges, and paragraphs, relative to its own style. */
+export type MarkdownService = (
+  source: string,
+  base: Pick<SceneNode, 'fontSize' | 'fontWeight'>
+) => Pick<SceneNode, 'text' | 'styleRuns' | 'textParagraphs'>

@@ -1,0 +1,143 @@
+import type {
+  FigArchiveRecordInfo,
+  FigPatchedArchiveInput,
+  FigRecordPatch,
+  FigSessionCheckpoint
+} from '@open-pencil/fig'
+import type { FigPageManifestEntry } from '@open-pencil/kiwi/fig'
+import type { SceneNode } from '@open-pencil/scene-graph'
+
+import type { ParseFigFileOptions } from '#core/io/formats/fig/read'
+import type { SerializedSceneGraph } from '#core/kiwi/fig/parse/transfer'
+import type { FigPopulationDelta } from '#core/kiwi/fig/population/delta'
+import type { FigGraphEdits } from '#core/kiwi/fig/population/edits'
+
+export interface FigSessionOpenRequest {
+  type: 'open'
+  /** The file, transferred: the worker reads it and keeps it as the original archive. */
+  buffer: ArrayBuffer
+  options?: Pick<ParseFigFileOptions, 'populate'>
+  port: MessagePort
+}
+
+export interface FigSessionPopulateRequest {
+  type: 'populate'
+  requestId: string
+  baseRevision: number
+  pageId: string
+}
+
+/** Build components no page brought, such as variants of a set no instance uses. */
+export interface FigSessionLoadComponentsRequest {
+  type: 'load-components'
+  requestId: string
+  baseRevision: number
+  /** Archive GUIDs of the components, as `session:local`. */
+  componentIds: string[]
+}
+
+/** A load whose layers come back as a page load's do. */
+export type FigSessionLoadRequest = FigSessionPopulateRequest | FigSessionLoadComponentsRequest
+
+/** Edits made on the main thread since the last batch, for the worker's copy of the graph. */
+export interface FigSessionEditsRequest {
+  type: 'edits'
+  edits: FigGraphEdits
+}
+
+export interface FigSessionOriginalArchiveRequest {
+  type: 'original-archive'
+  requestId: string
+}
+
+export interface FigSessionArchiveInfoRequest {
+  type: 'archive-info'
+  requestId: string
+}
+
+export interface FigSessionComponentPagesRequest {
+  type: 'component-pages'
+  requestId: string
+  /** Archive GUIDs of the components, as `session:local`. */
+  componentIds: string[]
+}
+
+export interface FigSessionRecordPagesRequest {
+  type: 'record-pages'
+  requestId: string
+  /** Archive GUIDs of the records, as `session:local`. */
+  recordIds: string[]
+}
+
+export interface FigSessionPatchArchiveRequest {
+  type: 'patch-archive'
+  requestId: string
+  patch: FigRecordPatch
+  input: FigPatchedArchiveInput
+  /** Where the patched archive streams, transferred: `receiveStream` reads it there. */
+  port: MessagePort
+}
+
+/** Loading a page failed: stop loading pages there, keep serving the archive. */
+export interface FigSessionRetireRequest {
+  type: 'retire'
+}
+
+export interface FigSessionCancelRequest {
+  type: 'cancel'
+  requestId?: string
+}
+
+export interface FigSessionDisposeRequest {
+  type: 'dispose'
+}
+
+export type FigSessionRequest =
+  | FigSessionPopulateRequest
+  | FigSessionLoadComponentsRequest
+  | FigSessionEditsRequest
+  | FigSessionOriginalArchiveRequest
+  | FigSessionArchiveInfoRequest
+  | FigSessionComponentPagesRequest
+  | FigSessionRecordPagesRequest
+  | FigSessionPatchArchiveRequest
+  | FigSessionRetireRequest
+  | FigSessionCancelRequest
+  | FigSessionDisposeRequest
+
+export type FigSessionResponse =
+  | { type: 'page-manifest'; pages: FigPageManifestEntry[] }
+  | {
+      type: 'graph'
+      graph?: SerializedSceneGraph
+      checkpoint?: FigSessionCheckpoint
+      /** Taken while the records are decoded, for writing the archive back later. */
+      archiveInfo?: FigArchiveRecordInfo
+      /** A copy of the archive, transferred, for the main thread to recover pages from. */
+      archive?: ArrayBuffer
+      error?: string
+    }
+  | {
+      type: 'population-result'
+      requestId: string
+      baseRevision: number
+      populated: boolean
+      checkpoint?: FigSessionCheckpoint
+      delta: FigPopulationDelta
+    }
+  /**
+   * Some of a page load's new layers, each after its parent, sent ahead of its result so the main
+   * thread applies a large page piece by piece.
+   */
+  | { type: 'population-chunk'; requestId: string; created: SceneNode[] }
+  /** A page load is still advancing; sent at most once a second while it runs. */
+  | { type: 'population-progress'; requestId: string }
+  | { type: 'population-error'; requestId?: string; error: string }
+  | { type: 'original-archive-result'; requestId: string; bytes: Uint8Array }
+  | { type: 'archive-info-result'; requestId: string; info: FigArchiveRecordInfo }
+  | { type: 'component-pages-result'; requestId: string; pageIds: string[] }
+  | { type: 'record-pages-result'; requestId: string; pageIds: (string | null)[] }
+  /** The archive is patched and streaming on the request's port. */
+  | { type: 'patch-archive-result'; requestId: string }
+  | { type: 'archive-error'; requestId: string; error: string }
+  | { type: 'disposed' }

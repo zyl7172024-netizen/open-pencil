@@ -1,0 +1,94 @@
+import { describe, expect, test } from 'bun:test'
+
+import {
+  collectExportTargets,
+  concreteImportSpecifiers,
+  validateManifest
+} from '#package-artifacts/manifest/exports'
+import type { PackageManifest } from '#package-artifacts/manifest/types'
+
+const validManifest: PackageManifest = {
+  name: '@open-pencil/example',
+  version: '1.0.0',
+  files: ['dist'],
+  exports: {
+    '.': {
+      types: './dist/index.d.ts',
+      bun: './dist/index.js',
+      import: './dist/index.js'
+    },
+    './feature': { import: './dist/feature.js' },
+    './pattern/*': { import: './dist/*.js' },
+    './package.json': './package.json'
+  }
+}
+
+describe('export metadata', () => {
+  test('collects conditional targets with their fields', () => {
+    expect(collectExportTargets(validManifest.exports, ['exports'])).toContainEqual({
+      condition: 'bun',
+      field: 'exports["."].bun',
+      target: './dist/index.js'
+    })
+  })
+
+  test('derives only concrete public import specifiers', () => {
+    expect(concreteImportSpecifiers(validManifest)).toEqual([
+      '@open-pencil/example',
+      '@open-pencil/example/feature'
+    ])
+  })
+
+  test('accepts pack-safe runtime targets', () => {
+    expect(validateManifest(validManifest)).toEqual([])
+  })
+
+  test('rejects source bun targets and runtime declarations', () => {
+    const diagnostics = validateManifest({
+      ...validManifest,
+      exports: {
+        '.': {
+          bun: './src/index.ts',
+          import: './dist/index.d.ts'
+        }
+      }
+    })
+    expect(diagnostics.map(({ message }) => message)).toEqual([
+      'target is excluded by files (./src/index.ts)',
+      'runtime target is a declaration file (./dist/index.d.ts)'
+    ])
+  })
+
+  test('rejects wildcard import targets without an extension', () => {
+    const diagnostics = validateManifest({
+      ...validManifest,
+      imports: {
+        '#example/*': { types: './dist/*.d.ts', bun: './src/*', default: './dist/*.js' }
+      }
+    })
+    expect(diagnostics.map(({ message }) => message)).toEqual([
+      'wildcard target names no extension (./src/*)'
+    ])
+  })
+
+  test('accepts a wildcard import target whose extension has a digit', () => {
+    expect(
+      validateManifest({ ...validManifest, imports: { '#fonts/*.woff2': './assets/*.woff2' } })
+    ).toEqual([])
+  })
+
+  test('accepts a wildcard import target that names an index file', () => {
+    expect(
+      validateManifest({
+        ...validManifest,
+        imports: { '#example/*': { types: './dist/*/index.d.ts', default: './dist/*/index.js' } }
+      })
+    ).toEqual([])
+  })
+
+  test('accepts a wildcard import target in another package', () => {
+    expect(validateManifest({ ...validManifest, imports: { '#icons/*': 'icon-pack/*' } })).toEqual(
+      []
+    )
+  })
+})

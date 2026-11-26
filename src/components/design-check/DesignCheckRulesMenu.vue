@@ -1,0 +1,91 @@
+<script setup lang="ts">
+import {
+  DropdownMenuCheckboxItem,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuItemIndicator,
+  DropdownMenuLabel,
+  DropdownMenuPortal,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuSeparator,
+  DropdownMenuTrigger
+} from 'reka-ui'
+import { computed } from 'vue'
+
+import { useMessages } from '@open-pencil/vue/i18n'
+
+import {
+  setDesignCheckPreset,
+  setDesignIssuesOnCanvas,
+  turnOnDesignCheckRules
+} from '@/app/settings/preferences/apply'
+import { appPreferences, DESIGN_CHECK_PRESETS } from '@/app/settings/preferences/store'
+import IconButton from '@/components/ui/button/IconButton.vue'
+import AppDropdownMenuRoot from '@/components/ui/menu/AppDropdownMenuRoot.vue'
+import { menuItem, useMenuUI } from '@/components/ui/menu/menu'
+import MenuScrollArea from '@/components/ui/menu/MenuScrollArea.vue'
+
+import { usePresetLabels } from './usePresetLabels'
+
+const messages = useMessages('design-check')
+const presetLabels = usePresetLabels()
+const menuCls = useMenuUI({ content: 'min-w-56' })
+const itemCls = menuItem({ justify: 'start', class: 'relative pl-7' })
+const preferences = computed(() => appPreferences.value.designCheck)
+
+const presetModel = computed({
+  get: () => preferences.value.preset,
+  set: (value: string) => {
+    const preset = DESIGN_CHECK_PRESETS.find((candidate) => candidate === value)
+    if (preset) setDesignCheckPreset(preset)
+  }
+})
+</script>
+
+<template>
+  <AppDropdownMenuRoot :modal="false">
+    <DropdownMenuTrigger as-child>
+      <IconButton size="xs" :label="messages.rules">
+        <icon-lucide-settings-2 class="size-3.5" />
+      </IconButton>
+    </DropdownMenuTrigger>
+    <DropdownMenuPortal>
+      <DropdownMenuContent side="bottom" align="end" :side-offset="4" :class="menuCls.content">
+        <MenuScrollArea>
+          <DropdownMenuLabel :class="menuCls.label">{{ messages.rules }}</DropdownMenuLabel>
+          <DropdownMenuRadioGroup v-model="presetModel">
+            <DropdownMenuRadioItem
+              v-for="preset in DESIGN_CHECK_PRESETS"
+              :key="preset"
+              :value="preset"
+              :class="itemCls"
+            >
+              <DropdownMenuItemIndicator class="absolute inset-s-2">
+                <icon-lucide-check class="size-3.5" />
+              </DropdownMenuItemIndicator>
+              {{ presetLabels[preset] }}
+            </DropdownMenuRadioItem>
+          </DropdownMenuRadioGroup>
+          <template v-if="preferences.disabledRules.length > 0">
+            <DropdownMenuSeparator :class="menuCls.separator" />
+            <DropdownMenuItem :class="itemCls" @select="turnOnDesignCheckRules">
+              {{ messages.turnOnRules({ count: preferences.disabledRules.length }) }}
+            </DropdownMenuItem>
+          </template>
+          <DropdownMenuSeparator :class="menuCls.separator" />
+          <DropdownMenuCheckboxItem
+            :model-value="preferences.showOnCanvas"
+            :class="itemCls"
+            @update:model-value="setDesignIssuesOnCanvas"
+          >
+            <DropdownMenuItemIndicator class="absolute inset-s-2">
+              <icon-lucide-check class="size-3.5" />
+            </DropdownMenuItemIndicator>
+            {{ messages.showOnCanvas }}
+          </DropdownMenuCheckboxItem>
+        </MenuScrollArea>
+      </DropdownMenuContent>
+    </DropdownMenuPortal>
+  </AppDropdownMenuRoot>
+</template>
