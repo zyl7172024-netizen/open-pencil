@@ -8,6 +8,11 @@
 # It unpacks ci\artifacts.tar.gz and puts the prebuilt dist trees where the app resolves them.
 $ErrorActionPreference = 'Stop'
 
+# Resolve the repository root from the script's own location (ci\..), so it works from any cwd.
+$Root = Split-Path -Parent $PSScriptRoot
+Set-Location $Root
+Write-Host "Repository root: $Root"
+
 if (-not (Test-Path 'ci\artifacts.tar.gz')) {
   throw 'ci\artifacts.tar.gz not found. Run this from the repository root.'
 }
@@ -33,6 +38,15 @@ Get-ChildItem 'ci\artifacts\package-dist\packages' -Directory | ForEach-Object {
 }
 
 $count = (Get-ChildItem 'ci\artifacts\package-dist\packages' -Directory | Measure-Object).Count
+
+$missing = @()
+foreach ($file in 'packages\canvaskit\dist\canvaskit.wasm', 'packages\taffy\dist\taffy.wasm', 'packages\core\dist\index.js') {
+  if (-not (Test-Path $file)) { $missing += $file }
+}
+if ($missing.Count -gt 0) {
+  throw "restore incomplete, missing: $($missing -join ', ')"
+}
+
 Write-Host "Restored CanvasKit, Taffy and $count package dist trees."
 Write-Host 'Next:'
 Write-Host '  bun install --frozen-lockfile'
