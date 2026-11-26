@@ -133,6 +133,23 @@ Notes:
   shim is not enough on Windows.
 - `bun install --frozen-lockfile` is safe: no dependency change is required for this pipeline.
 
+## Custom build command for a pipeline UI
+
+When the pipeline UI takes one command instead of a YAML job:
+
+| Runner | Fill in |
+|---|---|
+| Linux / macOS | `sh ci/build-web.sh` |
+| Windows | `powershell -ExecutionPolicy Bypass -File ci\build-web.ps1` |
+
+Both run the same sequence: unpack `ci/artifacts.tar.gz`, restore the fork and package `dist`
+trees, `bun install --frozen-lockfile`, `bun run lint`, then
+`node node_modules/vite/bin/vite.js build`. They set `NODE_OPTIONS` themselves when Node is older
+than 22.18. The deployable output is `dist/`.
+
+Do not fill in `npm install`, `npm run build`, `bun run build` or `bun run check`: npm cannot
+resolve `workspace:*`, and `build:packages` fails under Bun 1.4.x.
+
 ## Deployment
 
 Publish the contents of `dist/` at the root of an intranet HTTP server. nginx example:
@@ -165,16 +182,41 @@ Behaviour by access mode:
 
 ## Local development on the intranet
 
-Verified: `bun run dev` → HTTP 200, editor renders, MCP automation on port 7600.
+Verified on Windows with this repository's snapshot: `bun run dev` → HTTP 200, editor renders,
+MCP automation on port 7600.
+
+### Windows, step by step
+
+```powershell
+# In the repository root
+powershell -ExecutionPolicy Bypass -File .\ci\local-run.ps1
+
+# The real bun.exe directory, so the dev server can spawn `bun`
+$env:PATH = "$env:APPDATA\npm\node_modules\bun\bin;$env:PATH"
+# Only when Node is older than 22.18
+$env:NODE_OPTIONS = "--experimental-strip-types"
+
+bun install --frozen-lockfile
+bun run dev
+```
+
+Two log lines are expected and harmless on an offline workstation:
+
+| Log | Meaning |
+|---|---|
+| `Failed to fetch dynamically imported module: /src/boot.ts` on the first load | Vite is still optimizing dependencies; reload once |
+| `Could not initialize provider 'fontsource' … TypeError: Failed to fetch` every 40 s | Web-font providers are unreachable offline; bundled fonts still work |
+
+`ci/dev-web.cmd` sets PATH and NODE_OPTIONS and starts Vite, for a one-click launch.
 
 Requirements:
 
-1. `bun` **1.4.4** with the real executable on PATH (`~/.bun/bin`, or `%APPDATA%\npm\node_modules\bun\bin` for an npm install). Under Git Bash this is `command -v bun`.
+1. `bun` **1.4.4** with the real executable on PATH (`~/.bun/bin`, or
+   `%APPDATA%\npm\node_modules\bun\bin` for an npm install).
 2. Node 22.18+ or 26.x (upstream CI uses 26.x). Older Node needs
-   `NODE_OPTIONS=--experimental-strip-types`; `ci/dev-web.cmd` sets it on Windows.
+   `NODE_OPTIONS=--experimental-strip-types`.
 3. Port 1420 free (`strictPort`) and port 7600 free for the MCP automation server.
-
-`ci/dev-web.cmd` is a Windows fallback; on Node 22.18+ plain `bun run dev` works.
+4. `bun install` needs the internal registry or a populated `~/.bun/install/cache`.
 
 ## Known limitations
 
